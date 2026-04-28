@@ -676,9 +676,12 @@ def _emit_store_d(ctx: AsmContext, problem: GemmProblem,
 
 def _emit_descriptor(ctx: AsmContext, kernel_name: str,
                      lds_total: int, tile: TileConfig) -> None:
-    vgpr_count = (ctx._next["v"] + 3) & ~3  # must be 4-aligned
+    accum_offset = (ctx._next["v"] + 3) & ~3  # must be 4-aligned
     sgpr_count = ctx._next["s"]
     acc_count = ctx._next["acc"]
+    # gfx940+: unified VGPR/AGPR file. next_free_vgpr must include
+    # both regular VGPRs and accumulator VGPRs.
+    vgpr_count = accum_offset + acc_count
     ctx.raw("")
     ctx.raw(".rodata")
     ctx.raw(".p2align 6")
@@ -692,7 +695,7 @@ def _emit_descriptor(ctx: AsmContext, kernel_name: str,
     ctx.raw(f"    .amdhsa_system_vgpr_workitem_id 0")
     ctx.raw(f"    .amdhsa_next_free_vgpr {vgpr_count}")
     ctx.raw(f"    .amdhsa_next_free_sgpr {sgpr_count}")
-    ctx.raw(f"    .amdhsa_accum_offset {vgpr_count}")
+    ctx.raw(f"    .amdhsa_accum_offset {accum_offset}")
     ctx.raw(f"    .amdhsa_float_denorm_mode_32 3")
     ctx.raw(f"    .amdhsa_float_denorm_mode_16_64 3")
     ctx.raw(f".end_amdhsa_kernel")
