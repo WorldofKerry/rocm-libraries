@@ -23,6 +23,8 @@ from .asm_context import AsmContext
 from .addressing import AddressComputer
 from .problem import GemmProblem, TileConfig, MfmaConfig, DataType
 from .tile import TileLevel, build_gemm_tile_tree, walk_tile_tree
+from .asm_transforms import emit_affine, GemmLayouts
+from .transforms import Embed, Dim
 
 __all__ = ["AsmKernel", "emit_gemm_asm", "assemble_kernel"]
 
@@ -253,52 +255,45 @@ def _emit_global_load_cluster(ctx: AsmContext, tile: TileConfig,
 
 def _emit_lds_write_addrs(ctx: AsmContext, problem: GemmProblem,
                           tile: TileConfig,
-                          lds_b_offset: int) -> None:
-    """Compute LDS write offsets for A and B."""
-    elem = problem.element_bytes
-    log2_elem = int(math.log2(elem))
+                          layouts: GemmLayouts) -> None:
+    """Compute LDS write offsets for A and B using coordinate transforms."""
+    bindings = {
+        "row": ctx.vreg("v_gload_row"),
+        "col": ctx.vreg("v_gload_col"),
+    }
 
-    ctx.comment("LDS write offset A = (row * unroll_k + col) * elem_bytes")
-    ctx.v_mul(ctx.vreg("v_lds_wr_a"), str(tile.unroll_k),
-              ctx.vreg("v_gload_row"), comment=f"row * {tile.unroll_k}")
-    ctx.v_add(ctx.vreg("v_lds_wr_a"), ctx.vreg("v_lds_wr_a"),
-              ctx.vreg("v_gload_col"), comment="+ col")
-    ctx.v_lshl(ctx.vreg("v_lds_wr_a"), ctx.vreg("v_lds_wr_a"), log2_elem,
-               comment=f"* {elem}")
+    ctx.comment(f"LDS write A: {layouts.lds_a}")
+    emit_affine(ctx, layouts.lds_a, bindings,
+                result=ctx.vreg("v_lds_wr_a"),
+                scale=layouts.elem_bytes,
+                comment="lds_wr_a = (row * unroll_k + col) * elem")
     ctx.raw("")
 
-    ctx.comment(f"LDS write offset B = {lds_b_offset} + "
-                f"(row * {tile.unroll_k} + col) * {elem}")
-    ctx.v_mul(ctx.vreg("v_lds_wr_b"), str(tile.unroll_k),
-              ctx.vreg("v_gload_row"), comment=f"row * {tile.unroll_k}")
-    ctx.v_add(ctx.vreg("v_lds_wr_b"), ctx.vreg("v_lds_wr_b"),
-              ctx.vreg("v_gload_col"), comment="+ col")
-    ctx.v_lshl(ctx.vreg("v_lds_wr_b"), ctx.vreg("v_lds_wr_b"), log2_elem,
-               comment=f"* {elem}")
-    ctx.v_add(ctx.vreg("v_lds_wr_b"), str(lds_b_offset),
-              ctx.vreg("v_lds_wr_b"),
-              comment=f"+ lds_b_offset({lds_b_offset})")
+    ctx.comment(f"LDS write B: {layouts.lds_b} + offset {layouts.lds_b_offset}")
+    emit_affine(ctx, layouts.lds_b, bindings,
+                result=ctx.vreg("v_lds_wr_b"),
+                scale=layouts.elem_bytes,
+                base=str(layouts.lds_b_offset),
+                comment="lds_wr_b = lds_b_offset + (row * unroll_k + col) * elem")
     ctx.raw("")
 
 
 def _emit_lds_read_addrs(ctx: AsmContext, problem: GemmProblem,
-                         tile: TileConfig, lds_b_offset: int) -> None:
-    """Compute initial LDS read offsets for A and B.
+                         tile: TileConfig, layouts: GemmLayouts) -> None:
+    """Compute initial LDS read offsets for A and B using transforms.
 
-    For mfma_f32_16x16x16_f16, lane l reads:
-      row = l % 16,  k_start = (l / 16) * 4
-    So the base address must include the lane-group K-offset.
+    The MFMA lane mapping determines which elements each lane reads:
+      row = lane_id % mfma_m
+      k   = (lane_id / mfma_m) * k_per_group
+    These are combined with the wave position via the LDS layout Embed.
     """
     mfma = tile.mfma
     elem = problem.element_bytes
-    # Elements per lane group along K (for 16x16x16: 4)
-    k_per_group = mfma.k // (tile.wave_size // mfma.m)  # 16 / 4 = 4
+    k_per_group = mfma.k // (tile.wave_size // mfma.m)
 
-    ctx.comment("LDS read: lane_row = lane_id %% 16, "
-                "lane_k = (lane_id / 16) * 4")
+    ctx.comment("MFMA lane mapping: lane_row, lane_k")
     ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.m - 1,
               comment=f"lane_row = lane_id % {mfma.m}")
-    # Compute lane-group K-offset: (lane_id / 16) * k_per_group
     ctx.v_lshr(ctx.vreg("v_tmp1"), ctx.vreg("v_lane_id"),
                int(math.log2(mfma.m)),
                comment=f"lane_id / {mfma.m}")
@@ -307,65 +302,75 @@ def _emit_lds_read_addrs(ctx: AsmContext, problem: GemmProblem,
                comment=f"* {k_per_group} -> lane_k_offset")
     ctx.raw("")
 
-    ctx.comment("LDS read offset A: "
-                "((wave_m*m_per_wave + lane_row) * unroll_k "
-                "+ lane_k) * elem")
+    # Build the LDS read row: wave_m * m_per_wave + lane_row
+    # Then use LDS A Embed: offset = row * unroll_k + lane_k
+    # This is a 2-step affine: first compute row, then embed
+    lds_rd_a_embed = Embed(
+        [Dim("a_row", tile.wg_m), Dim("a_k", tile.unroll_k)],
+        Dim("lds_rd_a", tile.wg_m * tile.unroll_k),
+        [tile.unroll_k, 1],
+    )
+
+    # Compute a_row = wave_m * m_per_wave + lane_row into v_lds_rd_a
+    ctx.comment(f"LDS read A: {lds_rd_a_embed}")
     ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(tile.m_per_wave),
               ctx.vreg("v_wave_m"), comment=f"wave_m * {tile.m_per_wave}")
     ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
               ctx.vreg("v_tmp0"), comment="+ lane_row")
-    ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(tile.unroll_k),
-              ctx.vreg("v_lds_rd_a"),
-              comment=f"* {tile.unroll_k}")
-    ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
-              ctx.vreg("v_tmp1"), comment="+ lane_k_offset")
-    ctx.v_lshl(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
-               int(math.log2(elem)),
-               comment=f"* {elem} (bytes)")
+
+    emit_affine(ctx, lds_rd_a_embed,
+                bindings={"a_row": ctx.vreg("v_lds_rd_a"),
+                           "a_k": ctx.vreg("v_tmp1")},
+                result=ctx.vreg("v_lds_rd_a"),
+                scale=elem,
+                comment="lds_rd_a = (row * unroll_k + lane_k) * elem")
     ctx.raw("")
 
-    ctx.comment("LDS read offset B: "
-                "lds_b_offset + ((wave_n*n_per_wave + lane_row) "
-                "* unroll_k + lane_k) * elem")
+    # Same for B
+    lds_rd_b_embed = Embed(
+        [Dim("b_row", tile.wg_n), Dim("b_k", tile.unroll_k)],
+        Dim("lds_rd_b", tile.wg_n * tile.unroll_k),
+        [tile.unroll_k, 1],
+    )
+
+    ctx.comment(f"LDS read B: {lds_rd_b_embed} + lds_b_offset")
     ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(tile.n_per_wave),
               ctx.vreg("v_wave_n"), comment=f"wave_n * {tile.n_per_wave}")
     ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
               ctx.vreg("v_tmp0"), comment="+ lane_row")
-    ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(tile.unroll_k),
-              ctx.vreg("v_lds_rd_b"),
-              comment=f"* {tile.unroll_k}")
-    ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
-              ctx.vreg("v_tmp1"), comment="+ lane_k_offset")
-    ctx.v_lshl(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
-               int(math.log2(elem)),
-               comment=f"* {elem} (bytes)")
-    ctx.v_add(ctx.vreg("v_lds_rd_b"), str(lds_b_offset),
-              ctx.vreg("v_lds_rd_b"),
-              comment=f"+ lds_b_offset({lds_b_offset})")
+
+    emit_affine(ctx, lds_rd_b_embed,
+                bindings={"b_row": ctx.vreg("v_lds_rd_b"),
+                           "b_k": ctx.vreg("v_tmp1")},
+                result=ctx.vreg("v_lds_rd_b"),
+                scale=elem,
+                base=str(layouts.lds_b_offset),
+                comment="lds_rd_b = lds_b_off + (row * unroll_k + lane_k) * elem")
     ctx.raw("")
 
 
 def _emit_global_addr_a(ctx: AsmContext, problem: GemmProblem,
-                        tile: TileConfig) -> None:
-    """Compute 64-bit global address for A[wg_m * wg_id_x + row, col].
+                        tile: TileConfig, layouts: GemmLayouts) -> None:
+    """Compute 64-bit global address for A using transforms.
 
     A is row-major [M, K]: addr = A_ptr + (wg_base_m + row) * K + col.
+    K is a dynamic coefficient (from kernarg s_K).
     """
-    ctx.comment("Global address A = A_ptr + "
-                "(wg_id_x * wg_m + row) * K + col")
+    ctx.comment(f"Global address A: {layouts.global_a_row_major}")
+    # Compute global row = wg_id_x * wg_m + thread_row
     ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"), str(tile.wg_m),
               comment=f"wg_id_x * {tile.wg_m}")
     ctx.v_add(ctx.vreg("v_tmp0"), ctx.sreg("s_tmp0"),
-              ctx.vreg("v_gload_row"), comment="+ thread_row")
+              ctx.vreg("v_gload_row"), comment="+ thread_row -> global_m")
+    # offset = global_m * K + col (K is dynamic, use s_K register)
     ctx.v_mul(ctx.vreg("v_tmp0"), ctx.sreg("s_K"),
-              ctx.vreg("v_tmp0"), comment="* K")
+              ctx.vreg("v_tmp0"), comment="global_m * K (dynamic coeff)")
     ctx.v_add(ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"),
               ctx.vreg("v_gload_col"), comment="+ col")
-    # Convert element offset to byte offset
     ctx.v_lshl(ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"),
-               int(math.log2(problem.element_bytes)),
-               comment=f"* {problem.element_bytes} (bytes)")
-    # 64-bit add: v_addr_a = s_ptr_A + v_tmp0
+               int(math.log2(layouts.elem_bytes)),
+               comment=f"* {layouts.elem_bytes} (bytes)")
+    # 64-bit: v_addr_a = s_ptr_A + byte_offset
     ctx.inst("v_add_co_u32", ctx.vreg("v_addr_a", 0, 1), "vcc",
              ctx.sreg("s_ptr_A", 0, 1), ctx.vreg("v_tmp0"),
              comment="addr_A_lo + carry out")
@@ -378,24 +383,23 @@ def _emit_global_addr_a(ctx: AsmContext, problem: GemmProblem,
 
 
 def _emit_global_addr_b(ctx: AsmContext, problem: GemmProblem,
-                        tile: TileConfig) -> None:
-    """Compute 64-bit global address for B.
+                        tile: TileConfig, layouts: GemmLayouts) -> None:
+    """Compute 64-bit global address for B using transforms.
 
     B is [N, K] row-major (trans_b): addr = B_ptr + (wg_base_n + row) * K + col.
     """
-    ctx.comment("Global address B = B_ptr + "
-                "(wg_id_y * wg_n + row) * K + col")
+    ctx.comment(f"Global address B: {layouts.global_b_row_major}")
     ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"), str(tile.wg_n),
               comment=f"wg_id_y * {tile.wg_n}")
     ctx.v_add(ctx.vreg("v_tmp0"), ctx.sreg("s_tmp0"),
-              ctx.vreg("v_gload_row"), comment="+ thread_row")
+              ctx.vreg("v_gload_row"), comment="+ thread_row -> global_n")
     ctx.v_mul(ctx.vreg("v_tmp0"), ctx.sreg("s_K"),
-              ctx.vreg("v_tmp0"), comment="* K (B is [N,K] row-major)")
+              ctx.vreg("v_tmp0"), comment="global_n * K (dynamic coeff)")
     ctx.v_add(ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"),
               ctx.vreg("v_gload_col"), comment="+ col")
     ctx.v_lshl(ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"),
-               int(math.log2(problem.element_bytes)),
-               comment=f"* {problem.element_bytes} (bytes)")
+               int(math.log2(layouts.elem_bytes)),
+               comment=f"* {layouts.elem_bytes} (bytes)")
     ctx.inst("v_add_co_u32", ctx.vreg("v_addr_b", 0, 1), "vcc",
              ctx.sreg("s_ptr_B", 0, 1), ctx.vreg("v_tmp0"),
              comment="addr_B_lo + carry out")
@@ -641,17 +645,17 @@ def _emit_store_d(ctx: AsmContext, problem: GemmProblem,
                           ctx.vreg("v_addr_d", 1, 1),
                           comment="+ wg_base_n")
 
-                # flat_offset = row*N + col
+                # D offset = row * N + col (N is dynamic)
+                # v_addr_d[0] has row*N, v_addr_d[1] has col
                 ctx.v_add(ctx.vreg("v_addr_d", 0, 1),
                           ctx.vreg("v_addr_d", 0, 1),
                           ctx.vreg("v_addr_d", 1, 1),
-                          comment="row*N + col")
-                # To bytes
+                          comment="row*N + col (Embed transform)")
                 ctx.v_lshl(ctx.vreg("v_addr_d", 0, 1),
                            ctx.vreg("v_addr_d", 0, 1),
                            int(math.log2(elem)),
                            comment=f"* {elem} (bytes)")
-                # 64-bit: D_ptr + offset
+                # 64-bit: D_ptr + byte_offset
                 ctx.v_add(ctx.vreg("v_addr_d", 0, 1),
                           ctx.sreg("s_ptr_D", 0, 1),
                           ctx.vreg("v_addr_d", 0, 1),
@@ -774,13 +778,14 @@ def emit_gemm_asm(
     tile_tree.validate()
 
     elem = problem.element_bytes
+    layouts = GemmLayouts.build(problem, tile)
     lds_a_bytes = tile.wg_m * tile.unroll_k * elem
     lds_b_offset = lds_a_bytes
     lds_total = lds_a_bytes + tile.wg_n * tile.unroll_k * elem
 
     # Create AsmContext and allocate all registers via named bindings
     ctx = AsmContext()
-    ctx._metadata = {"tile": tile, "problem": problem}
+    ctx._metadata = {"tile": tile, "problem": problem, "layouts": layouts}
     _alloc_registers(ctx, problem, tile)
 
     # Emit the full kernel
@@ -788,11 +793,11 @@ def emit_gemm_asm(
     _emit_load_kernargs(ctx)
     _emit_thread_indexing(ctx, tile)
     _emit_global_load_cluster(ctx, tile, problem)
-    _emit_lds_write_addrs(ctx, problem, tile, lds_b_offset)
-    _emit_lds_read_addrs(ctx, problem, tile, lds_b_offset)
+    _emit_lds_write_addrs(ctx, problem, tile, layouts)
+    _emit_lds_read_addrs(ctx, problem, tile, layouts)
     _emit_init_acc(ctx, tile)
-    _emit_global_addr_a(ctx, problem, tile)
-    _emit_global_addr_b(ctx, problem, tile)
+    _emit_global_addr_a(ctx, problem, tile, layouts)
+    _emit_global_addr_b(ctx, problem, tile, layouts)
 
     # K-tile loop
     ctx.comment("K-tile loop setup")
