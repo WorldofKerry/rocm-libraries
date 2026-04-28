@@ -6,16 +6,23 @@ import sys, os, glob, importlib.util
 _dir = os.path.dirname(__file__)
 _so = glob.glob(os.path.join(_dir, "_stinkytofu.cpython-*.so"))
 if not _so:
-    raise ImportError("StinkyTofu C++ module not found")
+    import warnings as _w
+    _w.warn(
+        "StinkyTofu C++ module (_stinkytofu.*.so) not found; "
+        "only pure-Python subpackages (e.g. stinkytofu.gemm) are available.",
+        ImportWarning,
+        stacklevel=2,
+    )
+    _cpp = None
+else:
+    _spec = importlib.util.spec_from_file_location("_stinkytofu", _so[0])
+    _cpp = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_cpp)
 
-_spec = importlib.util.spec_from_file_location("_stinkytofu", _so[0])
-_cpp = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_cpp)
-
-# Export ALL C++ symbols immediately
-for _n in dir(_cpp):
-    if not _n.startswith("_"):
-        exec(f"{_n} = _cpp.{_n}")
+    # Export ALL C++ symbols immediately
+    for _n in dir(_cpp):
+        if not _n.startswith("_"):
+            exec(f"{_n} = _cpp.{_n}")
 
 # Runtime intrinsic data
 _sigs = {}
