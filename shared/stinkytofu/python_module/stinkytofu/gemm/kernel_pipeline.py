@@ -46,6 +46,7 @@ from typing import Callable, Dict, List, Optional
 from .asm_context import AsmContext
 from .asm_transforms import emit_affine, GemmLayouts
 from .problem import GemmProblem, TileConfig, MfmaConfig
+from .tiling import GemmTiling
 from .tile import TileLevel, build_gemm_tile_tree, walk_tile_tree
 from .transforms import Embed, Dim
 
@@ -226,8 +227,23 @@ class GemmKernel:
     def build(problem: GemmProblem,
               tile: Optional[TileConfig] = None,
               kernel_name: str = "gemm_kernel",
-              tile_tree: Optional[TileLevel] = None) -> GemmKernel:
-        """Build a GemmKernel with all default phases."""
+              tile_tree: Optional[TileLevel] = None,
+              tiling: Optional[GemmTiling] = None) -> GemmKernel:
+        """Build a GemmKernel with all default phases.
+
+        Args:
+            problem: GEMM problem specification.
+            tile: Legacy TileConfig (used if tiling is None).
+            tiling: GemmTiling with per-dimension TileDim chains.
+                    If provided, tile and tile_tree are derived from it.
+            kernel_name: Name for the kernel function.
+            tile_tree: Custom TileLevel tree (overrides auto-generation).
+        """
+        if tiling is not None:
+            tiling.validate()
+            tile = tiling.to_tile_config()
+            if tile_tree is None:
+                tile_tree = tiling.build_tile_tree()
         if tile is None:
             tile = TileConfig()
         problem.validate(tile)

@@ -45,6 +45,7 @@ from .context import TileContext, Binding, Lifetime
 from .asm_context import AsmContext
 from .asm_transforms import emit_affine, GemmLayouts
 from .kernel_pipeline import GemmKernel, KLoop, MemoryView
+from .tiling import TileDim, GemmTiling, ScheduleKind
 from .asm_emitter import emit_gemm_asm, assemble_kernel
 
 __all__ = [
@@ -62,6 +63,8 @@ __all__ = [
     "emit_affine", "GemmLayouts", "MemoryView",
     # pipeline
     "GemmKernel", "KLoop",
+    # tiling
+    "TileDim", "GemmTiling", "ScheduleKind",
     # assembly backend
     "emit_gemm_asm", "assemble_kernel",
 ]
