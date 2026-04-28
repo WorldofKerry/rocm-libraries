@@ -1,42 +1,34 @@
 # Copyright Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
-"""GEMM kernel generator using coordinate transforms and the StinkyTofu backend.
-
-This package provides a high-level, Python-based GEMM kernel generator that
-describes tiling via composable coordinate transforms (inspired by CK and
-rocRoller) and emits optimised GPU assembly through StinkyTofu's LogicalModule
-IR and pass pipeline.
+"""GEMM kernel generator using coordinate transforms and composable phases.
 
 Architecture
 ------------
-Five layers, each independently overridable:
-
 1. **Transforms** -- ``Dim``, ``Tile``, ``Flatten``, ``Pad``, ``Embed``,
    ``Xor``, ``TileDescriptor`` -- composable index-space mappings.
 2. **Problem** -- ``GemmProblem``, ``TileConfig``, ``MfmaConfig`` --
    mathematical problem + tiling decisions.
-3. **ThreadMapping** -- transforms -> concrete thread-to-element maps.
-4. **Emitter** -- stinkytofu instruction emission per micro-operation.
-   Subclass to hand-optimise any section (MFMA block, LDS layout, ...).
-5. **Schedule** -- macro-structure (K-loop, prefetch, barriers).
-   Subclass for software pipelining, split-K, stream-K, etc.
-
-``generate_gemm_kernel()`` ties everything together.
+3. **Tile Tree** -- ``TileLevel``, ``walk_tile_tree`` -- recursive tile
+   hierarchy that drives the MFMA compute structure.
+4. **Pipeline** -- ``GemmKernel`` with replaceable phases
+   (prologue, k_loop, epilogue). ``MemoryView`` for tensor access
+   at any tile level via coordinate transforms.
+5. **Assembly** -- ``AsmContext`` for register allocation (named bindings),
+   ``emit_affine`` for transform-based address computation,
+   ``asm_emitter`` for the full assembly backend.
 
 Quick start::
 
-    from stinkytofu.gemm import generate_gemm_kernel, GemmProblem, TileConfig
+    from stinkytofu.gemm import GemmKernel, GemmProblem, TileConfig
 
-    problem = GemmProblem(m=4096, n=4096, k=4096)
-    tile    = TileConfig(wg_m=128, wg_n=128, unroll_k=32)
+    # Default kernel
+    kernel = GemmKernel.build(GemmProblem(4096, 4096, 4096))
+    result = kernel.emit()
+    result.assemble()
 
-    # Dry run (no stinkytofu binary needed):
-    result = generate_gemm_kernel(problem, tile, dry_run=True)
-    print(result.summary())
-
-    # Full generation:
-    result = generate_gemm_kernel(problem, tile)
-    print(result.module.dump())
+    # Replace a phase
+    kernel.k_loop.global_load = my_prefetching_load
+    result = kernel.emit()
 """
 from __future__ import annotations
 
@@ -48,24 +40,30 @@ from .problem import (
     DataType, GemmProblem, TileConfig, MfmaConfig,
     SubTileConfig, PartitionConfig,
 )
-from .codegen import (
-    RegisterAllocator, ThreadMapping, Emitter, GemmSchedule, GemmCodegen,
-    VGPRTileAllocator, SubtiledSchedule,
-)
-from .kernel import KernelResult, generate_gemm_kernel
+from .tile import TileLevel, build_gemm_tile_tree, walk_tile_tree
+from .context import TileContext, Binding, Lifetime
+from .asm_context import AsmContext
+from .asm_transforms import emit_affine, GemmLayouts
+from .kernel_pipeline import GemmKernel, KLoop, MemoryView
+from .asm_emitter import emit_gemm_asm, assemble_kernel
 
 __all__ = [
     # transforms
-    "Dim", "Transform", "PassThrough", "Tile", "Flatten", "Pad", "Embed", "Xor",
-    "TileDescriptor", "tile_hierarchy",
+    "Dim", "Transform", "PassThrough", "Tile", "Flatten", "Pad",
+    "Embed", "Xor", "TileDescriptor", "tile_hierarchy",
     # problem
     "DataType", "GemmProblem", "TileConfig", "MfmaConfig",
     "SubTileConfig", "PartitionConfig",
-    # codegen layers
-    "RegisterAllocator", "ThreadMapping", "Emitter", "GemmSchedule", "GemmCodegen",
-    "VGPRTileAllocator", "SubtiledSchedule",
-    # top-level
-    "KernelResult", "generate_gemm_kernel",
+    # tile tree
+    "TileLevel", "build_gemm_tile_tree", "walk_tile_tree",
+    # context
+    "TileContext", "Binding", "Lifetime", "AsmContext",
+    # transforms -> assembly
+    "emit_affine", "GemmLayouts", "MemoryView",
+    # pipeline
+    "GemmKernel", "KLoop",
+    # assembly backend
+    "emit_gemm_asm", "assemble_kernel",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

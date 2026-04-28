@@ -5,7 +5,6 @@
 Generates a complete .s file for gfx950 using:
 - ``AsmContext`` for register allocation (named bindings, scoped lifetimes)
 - ``TileLevel`` tree + ``walk_tile_tree`` for the MFMA loop structure
-- ``AddressComputer`` formulas for offset computation
 
 No dependency on stinkytofu or rocisa -- emits raw assembly strings.
 Assembles with amdclang++ into a .co code object runnable via hipModuleLoad.
@@ -20,7 +19,6 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from .asm_context import AsmContext
-from .addressing import AddressComputer
 from .problem import GemmProblem, TileConfig, MfmaConfig, DataType
 from .tile import TileLevel, build_gemm_tile_tree, walk_tile_tree
 from .asm_transforms import emit_affine, GemmLayouts
