@@ -178,7 +178,16 @@ class TileContext:
         return start
 
     def _alloc(self, pool: str, count: int) -> int:
-        """Try to reuse a freed range, otherwise bump-allocate."""
+        """Try to reuse a freed range, otherwise bump-allocate.
+        
+        Multi-register allocations are aligned: 2-regs to even,
+        4+ regs to 4-aligned boundary.
+        """
+        # Align multi-register allocations for HW tuple requirements
+        if count >= 4:
+            self._next[pool] = (self._next[pool] + 3) & ~3
+        elif count >= 2:
+            self._next[pool] = (self._next[pool] + 1) & ~1
         for i, (start, size) in enumerate(self._free_ranges[pool]):
             if size >= count:
                 self._free_ranges[pool].pop(i)

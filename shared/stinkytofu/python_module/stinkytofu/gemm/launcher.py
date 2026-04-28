@@ -304,3 +304,154 @@ class GemmLauncher:
         hip.hipModuleUnload(module)
 
         return GemmResult(D=D_out, time_seconds=t1 - t0)
+
+    def run_asm_kernel(
+        self,
+        code_object_path: str,
+        kernel_name: str = "gemm_kernel",
+        num_warmup: int = 3,
+        num_iters: int = 10,
+    ) -> GemmResult:
+        """Launch the generated GEMM assembly kernel on the GPU.
+
+        The kernel expects these arguments packed in kernarg segment:
+          offset  0: A ptr (8 bytes)
+          offset  8: B ptr (8 bytes)
+          offset 16: D ptr (8 bytes)
+          offset 24: M     (4 bytes)
+          offset 28: N     (4 bytes)
+          offset 32: K     (4 bytes)
+        Total kernarg size: 64 bytes (padded).
+
+        Grid: (M / wg_m, N / wg_n) workgroups
+        Block: block_size threads (e.g., 256)
+        """
+        import struct
+
+        p = self.problem
+        A, B, C = self.generate_inputs()
+        elem = p.element_bytes
+
+        try:
+            hip = ctypes.CDLL("libamdhip64.so")
+        except OSError:
+            raise RuntimeError("libamdhip64.so not found; is ROCm installed?")
+
+        def _check(ret, msg="HIP error"):
+            if ret != 0:
+                raise RuntimeError(f"{msg}: error code {ret}")
+
+        # Allocate device memory
+        d_A = ctypes.c_void_p()
+        d_B = ctypes.c_void_p()
+        d_D = ctypes.c_void_p()
+        a_bytes = p.m * p.k * elem
+        b_bytes = p.n * p.k * elem  # B is [N, K] for trans_b
+        d_bytes = p.m * p.n * elem
+
+        _check(hip.hipMalloc(ctypes.byref(d_A), a_bytes), "hipMalloc A")
+        _check(hip.hipMalloc(ctypes.byref(d_B), b_bytes), "hipMalloc B")
+        _check(hip.hipMalloc(ctypes.byref(d_D), d_bytes), "hipMalloc D")
+
+        # Copy inputs to device
+        # A is [M, K] row-major
+        _check(hip.hipMemcpy(d_A, A.ctypes.data, a_bytes, 1), "H2D A")
+        # B is [N, K] row-major (trans_b=True means stored as N x K)
+        _check(hip.hipMemcpy(d_B, B.ctypes.data, b_bytes, 1), "H2D B")
+        # Zero D
+        _check(hip.hipMemset(d_D, 0, d_bytes), "memset D")
+
+        # Load module
+        module = ctypes.c_void_p()
+        _check(hip.hipModuleLoad(ctypes.byref(module),
+                                 code_object_path.encode()),
+               "hipModuleLoad")
+
+        func = ctypes.c_void_p()
+        _check(hip.hipModuleGetFunction(ctypes.byref(func), module,
+                                        kernel_name.encode()),
+               "hipModuleGetFunction")
+
+        # Pack kernel arguments into a flat buffer matching the kernarg layout
+        # struct { void* A, void* B, void* D, int M, int N, int K }
+        kernarg = struct.pack("QQQiii",
+                              d_A.value, d_B.value, d_D.value,
+                              p.m, p.n, p.k)
+        # Pad to 64 bytes
+        kernarg += b'\x00' * (64 - len(kernarg))
+        kernarg_buf = (ctypes.c_char * 64)(*kernarg)
+        kernarg_ptr = ctypes.cast(kernarg_buf, ctypes.c_void_p)
+
+        # Allocate kernarg on device
+        d_kernarg = ctypes.c_void_p()
+        _check(hip.hipMalloc(ctypes.byref(d_kernarg), 64), "hipMalloc kernarg")
+        _check(hip.hipMemcpy(d_kernarg, kernarg_ptr, 64, 1), "H2D kernarg")
+
+        # Grid/block dims
+        grid_m, grid_n = p.grid_dims(self.tile)
+        block_size = self.tile.block_size
+
+        # For hipModuleLaunchKernel with kernarg:
+        # We pass NULL for args and use the kernarg segment
+        # Actually, hipModuleLaunchKernel needs args as void** array
+        # But for assembly kernels using kernarg segment, we use
+        # hipExtModuleLaunchKernel or pass args as individual pointers.
+        # Simpler: use the args array approach with each element pointer.
+        _arg_A = d_A
+        _arg_B = d_B
+        _arg_D = d_D
+        _arg_M = ctypes.c_int(p.m)
+        _arg_N = ctypes.c_int(p.n)
+        _arg_K = ctypes.c_int(p.k)
+
+        _arg_vals = [_arg_A, _arg_B, _arg_D, _arg_M, _arg_N, _arg_K]
+        args = (ctypes.c_void_p * len(_arg_vals))()
+        for i, v in enumerate(_arg_vals):
+            args[i] = ctypes.cast(ctypes.pointer(v), ctypes.c_void_p)
+
+        lds_size = (self.tile.wg_m * self.tile.unroll_k
+                    + self.tile.wg_n * self.tile.unroll_k) * elem
+
+        # Warmup
+        for _ in range(num_warmup):
+            _check(hip.hipModuleLaunchKernel(
+                func,
+                grid_m, grid_n, 1,
+                block_size, 1, 1,
+                lds_size, None,
+                args, None,
+            ), "hipModuleLaunchKernel warmup")
+            _check(hip.hipDeviceSynchronize(), "sync warmup")
+
+        # Timed runs
+        total_time = 0.0
+        for _ in range(num_iters):
+            # Reset D to zero
+            _check(hip.hipMemset(d_D, 0, d_bytes), "memset D")
+
+            t0 = time.perf_counter()
+            _check(hip.hipModuleLaunchKernel(
+                func,
+                grid_m, grid_n, 1,
+                block_size, 1, 1,
+                lds_size, None,
+                args, None,
+            ), "hipModuleLaunchKernel")
+            _check(hip.hipDeviceSynchronize(), "sync")
+            t1 = time.perf_counter()
+            total_time += (t1 - t0)
+
+        avg_time = total_time / num_iters
+
+        # Copy result back
+        D_out = np.zeros((p.m, p.n), dtype=self._np_dtype(p.dtype))
+        _check(hip.hipMemcpy(D_out.ctypes.data, d_D, d_bytes, 2), "D2H D")
+
+        # Cleanup
+        hip.hipFree(d_A)
+        hip.hipFree(d_B)
+        hip.hipFree(d_D)
+        hip.hipFree(d_kernarg)
+        hip.hipModuleUnload(module)
+
+        return GemmResult(D=D_out, time_seconds=avg_time)
