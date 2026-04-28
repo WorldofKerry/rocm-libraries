@@ -150,10 +150,14 @@ class TestGemmTiling:
     def test_build_tile_tree(self):
         t = GemmTiling.standard()
         tree = t.build_tile_tree()
-        assert tree.name == "wave"
-        assert tree.m == 64
-        assert tree.inner.name == "mfma"
-        assert tree.inner.m == 16
+        assert tree.name == "workgroup"
+        assert tree.m == 128
+        assert tree.parallel is True
+        wave = tree.inner
+        assert wave.name == "wave"
+        assert wave.m == 64
+        assert wave.inner.name == "mfma"
+        assert wave.inner.m == 16
         tree.validate()
 
     def test_build_descriptors(self):

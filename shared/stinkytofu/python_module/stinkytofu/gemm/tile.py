@@ -1,6 +1,6 @@
 # Copyright Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
-"""Recursive tile hierarchy with scoped register lifecycle.
+"""Recursive tile hierarchy with scoped register lifecycle and phases.
 
 A ``TileLevel`` is one level in the tile decomposition.  The full GEMM
 hierarchy is just a tree of ``TileLevel`` nodes::
@@ -8,8 +8,12 @@ hierarchy is just a tree of ``TileLevel`` nodes::
     grid
       workgroup  (m=128, n=128, k=32)
         wave       (m=64,  n=64)
-          subtile    (m=16,  n=16,  partitioned=True)
-            mfma       (m=16,  n=16,  k=16,  leaf=True)
+          mfma       (m=16,  n=16,  k=16,  leaf=True)
+
+Each level can have **prologue** and **epilogue phases** -- named,
+replaceable steps that run before/after the inner tile iteration.
+For example, the workgroup level's prologue loads kernargs and sets up
+addresses; its epilogue stores the result matrix.
 
 Every level has the same interface:
   - dimensions (m, n, k -- whichever are relevant)
@@ -17,11 +21,13 @@ Every level has the same interface:
   - an optional custom ``emit`` callable
   - register allocation scope (auto-freed when the level completes)
 
+Phases make each sub-step independently replaceable.  A researcher
+calls ``tree.replace_phase("global_load", my_func)`` to swap one step.
+
 The codegen walks the tree top-down.  At each level it:
-  1. Computes how many inner tiles fit (``repeats_m``, ``repeats_n``, ...)
-  2. Allocates operand registers (scoped -- auto-freed on exit)
-  3. Loops over inner tiles, calling ``inner.execute()``
-  4. Frees operand registers
+  1. Runs prologue phases (setup for this level)
+  2. Iterates over inner tiles, calling ``inner.execute()``
+  3. Runs epilogue phases (teardown for this level)
 
 A researcher overrides ``emit`` at one level to inject hand-tuned code.
 Everything above and below stays auto-generated.
@@ -35,7 +41,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 __all__ = [
-    "TileLevel", "ScopedAllocator", "Lifetime",
+    "TilePhase", "TileLevel", "ScopedAllocator", "Lifetime",
     "build_gemm_tile_tree", "walk_tile_tree",
 ]
 
@@ -245,6 +251,25 @@ class ScopedAllocator:
 
 
 # ===================================================================
+# TilePhase: a named, replaceable step at a tile level
+# ===================================================================
+
+@dataclass
+class TilePhase:
+    """A named, replaceable step at a tile level.
+
+    Phases run before (prologue) or after (epilogue) the inner tile
+    iteration.  Signature: ``emit(level: TileLevel, ctx) -> None``.
+
+    Replace a phase to customize one step without touching the rest::
+
+        tree = tree.replace_phase("global_load", my_custom_load)
+    """
+    name: str
+    emit: Callable  # (level: TileLevel, ctx) -> None
+
+
+# ===================================================================
 # Recursive tile level
 # ===================================================================
 
@@ -263,23 +288,36 @@ class TileLevel:
         k:      K-dimension tile size (for levels that iterate over K).
         inner:  Child tile level, or None for leaf (MFMA instruction).
         emit:   Optional custom emitter.  Signature:
-                ``(module, level, context) -> None``.
+                ``(level, context) -> None``.
                 When set, replaces the default recursive codegen for
                 this level.  Everything above and below is unaffected.
+        prologue_phases: Named steps that run before the body.
+        epilogue_phases: Named steps that run after the body.
+        parallel: If True, inner tiles are HW-mapped (waves); the walker
+                walks inner once instead of iterating repeats.
         partitioned: If True, inner tiles are grouped into partitions
                 and executed sequentially (enabling VGPR reuse).
         partition_m, partition_n: Inner tiles per partition along M/N.
         comment: Annotation for generated labels.
 
-    Example -- building the hierarchy manually::
+    Example -- building the hierarchy with phases::
 
         mfma = TileLevel("mfma", m=16, n=16, k=16)
-        subtile = TileLevel("subtile", m=16, n=16, inner=mfma,
-                            partitioned=True, partition_m=2, partition_n=2)
-        wave = TileLevel("wave", m=64, n=64, inner=subtile)
-        wg = TileLevel("workgroup", m=128, n=128, k=32, inner=wave)
+        wave = TileLevel("wave", m=64, n=64, k=32, inner=mfma,
+                         prologue_phases=[
+                             TilePhase("global_load", my_load),
+                             TilePhase("lds_write", my_write),
+                         ],
+                         epilogue_phases=[
+                             TilePhase("k_advance", my_advance),
+                         ])
+        wg = TileLevel("workgroup", m=128, n=128, k=32,
+                       inner=wave, parallel=True,
+                       prologue_phases=[...], epilogue_phases=[...])
 
-    Or use ``build_gemm_tile_tree()`` for the common case.
+    Replace a single phase::
+
+        tree = tree.replace_phase("global_load", my_custom_load)
     """
     name: str
     m: Optional[int] = None
@@ -287,6 +325,14 @@ class TileLevel:
     k: Optional[int] = None
     inner: Optional[TileLevel] = None
     emit: Optional[Callable] = None  # custom emitter override
+
+    # Phases: named steps that run before/after the inner tile iteration.
+    prologue_phases: List[TilePhase] = field(default_factory=list)
+    epilogue_phases: List[TilePhase] = field(default_factory=list)
+
+    # If True, inner tiles are mapped to HW parallelism (e.g. waves).
+    # The walker walks inner once instead of iterating repeats_m * repeats_n.
+    parallel: bool = False
 
     # Partitioning (for VGPR reuse at this level)
     partitioned: bool = False
@@ -407,6 +453,9 @@ class TileLevel:
                 "partitioned": self.partitioned,
                 "partition_m": self.partition_m,
                 "partition_n": self.partition_n,
+                "prologue_phases": list(self.prologue_phases),
+                "epilogue_phases": list(self.epilogue_phases),
+                "parallel": self.parallel,
                 "comment": self.comment,
             }
             d.update(kwargs)
@@ -418,8 +467,73 @@ class TileLevel:
                 emit=self.emit, partitioned=self.partitioned,
                 partition_m=self.partition_m, partition_n=self.partition_n,
                 comment=self.comment,
+                prologue_phases=list(self.prologue_phases),
+                epilogue_phases=list(self.epilogue_phases),
+                parallel=self.parallel,
             )
         return self  # not found, return unchanged
+
+    def replace_phase(self, phase_name: str,
+                      new_emit: Callable) -> TileLevel:
+        """Return a copy of the tree with the named phase's emit replaced.
+
+        Searches this level's phases first, then recursively into inner.
+        """
+        def _replace_in_list(phases):
+            found = False
+            result = []
+            for p in phases:
+                if p.name == phase_name:
+                    result.append(TilePhase(p.name, new_emit))
+                    found = True
+                else:
+                    result.append(p)
+            return result, found
+
+        new_pro, found_pro = _replace_in_list(self.prologue_phases)
+        new_epi, found_epi = _replace_in_list(self.epilogue_phases)
+
+        if found_pro or found_epi:
+            return TileLevel(
+                name=self.name, m=self.m, n=self.n, k=self.k,
+                inner=self.inner, emit=self.emit,
+                prologue_phases=new_pro, epilogue_phases=new_epi,
+                partitioned=self.partitioned,
+                partition_m=self.partition_m, partition_n=self.partition_n,
+                parallel=self.parallel, comment=self.comment,
+            )
+        # Not found at this level -- recurse into inner
+        if self.inner:
+            return TileLevel(
+                name=self.name, m=self.m, n=self.n, k=self.k,
+                inner=self.inner.replace_phase(phase_name, new_emit),
+                emit=self.emit,
+                prologue_phases=list(self.prologue_phases),
+                epilogue_phases=list(self.epilogue_phases),
+                partitioned=self.partitioned,
+                partition_m=self.partition_m, partition_n=self.partition_n,
+                parallel=self.parallel, comment=self.comment,
+            )
+        return self
+
+    def get_phase(self, phase_name: str) -> Optional[TilePhase]:
+        """Find a phase by name in this subtree."""
+        for p in self.prologue_phases + self.epilogue_phases:
+            if p.name == phase_name:
+                return p
+        if self.inner:
+            return self.inner.get_phase(phase_name)
+        return None
+
+    def phase_names(self) -> List[str]:
+        """All phase names in the entire subtree, depth-first."""
+        names = [p.name for p in self.prologue_phases + self.epilogue_phases]
+        if self.inner:
+            names.extend(self.inner.phase_names())
+        return names
+
+    def __repr__(self) -> str:
+        return self.summary()
 
     def summary(self, indent: int = 0) -> str:
         pad = "  " * indent
@@ -450,6 +564,14 @@ class TileLevel:
             )
         if self.emit:
             parts[0] += "  [custom emit]"
+        if self.parallel:
+            parts[0] += "  [parallel/HW-mapped]"
+        if self.prologue_phases:
+            phase_str = ", ".join(p.name for p in self.prologue_phases)
+            parts.append(f"{pad}  prologue: [{phase_str}]")
+        if self.epilogue_phases:
+            phase_str = ", ".join(p.name for p in self.epilogue_phases)
+            parts.append(f"{pad}  epilogue: [{phase_str}]")
         if self.inner:
             parts.append(self.inner.summary(indent + 1))
         return "\n".join(parts)
@@ -511,19 +633,22 @@ def build_gemm_tile_tree(
 def walk_tile_tree(
     root: TileLevel,
     ctx,
-    visitor: Callable,
+    visitor: Callable = None,
 ) -> None:
-    """Walk the tile tree, calling *visitor* at each level with scoped alloc.
+    """Walk the tile tree, calling phases and *visitor* at each level.
 
-    The visitor receives ``(level, ctx)`` where *ctx* is a ``TileContext``.
-    The visitor can:
-    - Read bindings from outer levels via ``ctx.get(name)``
-    - Allocate registers via ``ctx.alloc_vgpr(count, name)``
-    - Emit instructions
-    - Publish bindings for inner levels via ``ctx.bind(name, ...)``
+    At each level:
+      1. Run prologue phases
+      2. Call visitor (if provided) -- backward-compat hook
+      3. Iterate inner tiles (body)
+      4. Run epilogue phases
 
     If ``level.emit`` is set, it is called instead of the default
     recursive walk for that level's subtree.
+
+    The *visitor* receives ``(level, ctx)`` and is called at every
+    level that doesn't have a custom ``emit``.  It can read bindings
+    from outer levels via ``ctx.get(name)``.
     """
     if root.emit is not None:
         # Validate contract before calling custom emitter
@@ -539,13 +664,27 @@ def walk_tile_tree(
         ctx.validate_requires(root.requires, root.name)
 
     with ctx.scope(root.name):
-        visitor(root, ctx)
+        # Prologue phases
+        for phase in root.prologue_phases:
+            phase.emit(root, ctx)
 
+        # Visitor callback (backward compat / general hook)
+        if visitor is not None:
+            visitor(root, ctx)
+
+        # Body: iterate inner tiles
         if root.inner is not None:
-            if root.partitioned:
+            if root.parallel:
+                # HW-mapped: walk inner once (HW handles parallelism)
+                walk_tile_tree(root.inner, ctx, visitor)
+            elif root.partitioned:
                 _walk_partitioned(root, ctx, visitor)
             else:
                 _walk_flat(root, ctx, visitor)
+
+        # Epilogue phases
+        for phase in root.epilogue_phases:
+            phase.emit(root, ctx)
 
     # Validate provides
     if root.provides:

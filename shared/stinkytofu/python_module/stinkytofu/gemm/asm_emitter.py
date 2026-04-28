@@ -16,15 +16,15 @@ import os
 import subprocess
 import tempfile
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from .asm_context import AsmContext
 from .problem import GemmProblem, TileConfig, MfmaConfig, DataType
-from .tile import TileLevel, build_gemm_tile_tree, walk_tile_tree
+from .tile import TileLevel, TilePhase, build_gemm_tile_tree, walk_tile_tree
 from .asm_transforms import emit_affine, GemmLayouts
 from .transforms import Embed, Dim
 
-__all__ = ["AsmKernel", "emit_gemm_asm", "assemble_kernel"]
+__all__ = ["AsmKernel", "emit_gemm_asm", "assemble_kernel", "build_full_gemm_tree"]
 
 
 @dataclass
@@ -858,3 +858,172 @@ def emit_gemm_asm(
         ctx=ctx,
         lds_bytes=lds_total,
     )
+
+
+# ===================================================================
+# Phase wrappers: adapt _emit_* functions to phase signature (level, ctx)
+# ===================================================================
+
+def _phase_load_kernargs(level, ctx):
+    """Phase: load kernel arguments from kernarg segment."""
+    _emit_load_kernargs(ctx)
+
+def _phase_thread_indexing(level, ctx):
+    """Phase: compute wave_id, lane_id, wave_m, wave_n."""
+    _emit_thread_indexing(ctx, ctx._metadata["tile"])
+
+def _phase_load_cluster_setup(level, ctx):
+    """Phase: compute global-load thread cluster coordinates."""
+    _emit_global_load_cluster(ctx, ctx._metadata["tile"],
+                               ctx._metadata["problem"])
+
+def _phase_lds_write_addrs(level, ctx):
+    """Phase: compute LDS write offsets using coordinate transforms."""
+    _emit_lds_write_addrs(ctx, ctx._metadata["problem"],
+                           ctx._metadata["tile"], ctx._metadata["layouts"])
+
+def _phase_lds_read_addrs(level, ctx):
+    """Phase: compute LDS read offsets using transforms + MFMA lane mapping."""
+    _emit_lds_read_addrs(ctx, ctx._metadata["problem"],
+                          ctx._metadata["tile"], ctx._metadata["layouts"])
+
+def _phase_init_acc(level, ctx):
+    """Phase: zero-initialize accumulator registers."""
+    _emit_init_acc(ctx, ctx._metadata["tile"])
+
+def _phase_global_addr_a(level, ctx):
+    """Phase: compute 64-bit global address for A."""
+    _emit_global_addr_a(ctx, ctx._metadata["problem"],
+                         ctx._metadata["tile"], ctx._metadata["layouts"])
+
+def _phase_global_addr_b(level, ctx):
+    """Phase: compute 64-bit global address for B."""
+    _emit_global_addr_b(ctx, ctx._metadata["problem"],
+                         ctx._metadata["tile"], ctx._metadata["layouts"])
+
+def _phase_k_loop_init(level, ctx):
+    """Phase: compute K-tile loop counter."""
+    tile = ctx._metadata["tile"]
+    log2_uk = int(math.log2(tile.unroll_k))
+    ctx.s_lshr(ctx.sreg("s_k_tiles"), ctx.sreg("s_K"), log2_uk,
+               comment=f"k_tiles = K / {tile.unroll_k}")
+    ctx.raw("")
+
+def _phase_k_loop_label(level, ctx):
+    """Phase: emit the K-loop label."""
+    ctx.label("k_loop")
+    ctx.raw("")
+
+def _phase_global_load(level, ctx):
+    """Phase: load A/B tiles from global memory into VGPRs."""
+    _emit_global_load(ctx, ctx._metadata["problem"], ctx._metadata["tile"])
+
+def _phase_lds_write(level, ctx):
+    """Phase: write A/B data from VGPRs into LDS + barrier."""
+    _emit_lds_write(ctx, ctx._metadata["tile"])
+
+def _phase_k_advance(level, ctx):
+    """Phase: advance A/B global pointers by unroll_k + barrier."""
+    tile = ctx._metadata["tile"]
+    problem = ctx._metadata["problem"]
+    k_stride = tile.unroll_k * problem.element_bytes
+    ctx.comment("Advance A, B pointers by unroll_k")
+    ctx.inst("v_add_co_u32", ctx.vreg("v_addr_a", 0, 1), "vcc",
+             str(k_stride), ctx.vreg("v_addr_a", 0, 1),
+             comment=f"A += {k_stride}")
+    ctx.inst("v_addc_co_u32", ctx.vreg("v_addr_a", 1, 1), "vcc",
+             ctx.vreg("v_addr_a", 1, 1), "0", "vcc",
+             comment="carry")
+    ctx.inst("v_add_co_u32", ctx.vreg("v_addr_b", 0, 1), "vcc",
+             str(k_stride), ctx.vreg("v_addr_b", 0, 1),
+             comment=f"B += {k_stride}")
+    ctx.inst("v_addc_co_u32", ctx.vreg("v_addr_b", 1, 1), "vcc",
+             ctx.vreg("v_addr_b", 1, 1), "0", "vcc",
+             comment="carry")
+    ctx.raw("")
+    ctx.s_barrier(comment="sync before next K-tile LDS write")
+
+def _phase_k_loop_control(level, ctx):
+    """Phase: decrement K-tile counter and branch."""
+    ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
+              comment="k_tiles--")
+    ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
+             comment="SCC = (k_tiles != 0)")
+    ctx.inst("s_cbranch_scc1", "k_loop",
+             comment="branch if k_tiles > 0")
+    ctx.raw("")
+
+def _phase_store_d(level, ctx):
+    """Phase: store accumulators to D."""
+    _emit_store_d(ctx, ctx._metadata["problem"], ctx._metadata["tile"])
+
+
+# ===================================================================
+# Build the full GEMM tile tree with all phases
+# ===================================================================
+
+def build_full_gemm_tree(
+    problem: GemmProblem,
+    tile: TileConfig,
+    layouts: GemmLayouts,
+    mfma_visitor: Callable = None,
+) -> TileLevel:
+    """Build the complete tile tree including workgroup level with phases.
+
+    The tree structure::
+
+        workgroup(m=wg_m, n=wg_n, parallel=True)
+          prologue: [load_kernargs, thread_indexing, load_cluster_setup,
+                     lds_write_addrs, lds_read_addrs, init_acc,
+                     global_addr_a, global_addr_b, k_loop_init, k_loop_label]
+          inner: wave(m=m_per_wave, n=n_per_wave, k=unroll_k)
+            prologue: [global_load, lds_write]
+            inner: mfma(m=16, n=16, k=16)
+            epilogue: [k_advance, k_loop_control]
+          epilogue: [store_d]
+
+    The K-loop is expressed as assembly phases: ``k_loop_label`` emits
+    the loop label in the workgroup prologue, ``k_loop_control`` emits
+    the decrement + branch in the wave epilogue.  The tree walker
+    produces one iteration; the branch creates the runtime loop.
+    """
+    mfma_level = TileLevel(
+        "mfma", m=tile.mfma.m, n=tile.mfma.n, k=tile.mfma.k)
+
+    wave_level = TileLevel(
+        "wave",
+        m=tile.m_per_wave, n=tile.n_per_wave, k=tile.unroll_k,
+        inner=mfma_level,
+        prologue_phases=[
+            TilePhase("global_load", _phase_global_load),
+            TilePhase("lds_write", _phase_lds_write),
+        ],
+        epilogue_phases=[
+            TilePhase("k_advance", _phase_k_advance),
+            TilePhase("k_loop_control", _phase_k_loop_control),
+        ],
+    )
+
+    workgroup_level = TileLevel(
+        "workgroup",
+        m=tile.wg_m, n=tile.wg_n, k=tile.unroll_k,
+        inner=wave_level,
+        parallel=True,
+        prologue_phases=[
+            TilePhase("load_kernargs", _phase_load_kernargs),
+            TilePhase("thread_indexing", _phase_thread_indexing),
+            TilePhase("load_cluster_setup", _phase_load_cluster_setup),
+            TilePhase("lds_write_addrs", _phase_lds_write_addrs),
+            TilePhase("lds_read_addrs", _phase_lds_read_addrs),
+            TilePhase("init_acc", _phase_init_acc),
+            TilePhase("global_addr_a", _phase_global_addr_a),
+            TilePhase("global_addr_b", _phase_global_addr_b),
+            TilePhase("k_loop_init", _phase_k_loop_init),
+            TilePhase("k_loop_label", _phase_k_loop_label),
+        ],
+        epilogue_phases=[
+            TilePhase("store_d", _phase_store_d),
+        ],
+    )
+
+    return workgroup_level

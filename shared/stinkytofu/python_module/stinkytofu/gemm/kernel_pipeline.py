@@ -1,39 +1,50 @@
 # Copyright Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
-"""GEMM kernel as a composable pipeline of replaceable phases.
+"""GEMM kernel as a composable pipeline driven by the tile tree.
 
 This is the middle-ground abstraction between Triton/CK (high-level,
 can't touch assembly) and TensileLite (low-level, hard to modify one
 piece without understanding everything).
 
 Key ideas:
-- The kernel is a pipeline of **Phases** (prologue, k_loop, epilogue)
-- Each phase is a callable that can be replaced independently
+- The kernel is a **tile tree** with **phases** at each level
+- Each phase is a named callable that can be replaced independently
 - **MemoryViews** describe how to access tensors at each tile level
-  via coordinate transforms -- the same mechanism works at workgroup,
-  wave, or MFMA level
-- The tile tree drives the MFMA compute structure
+  via coordinate transforms
+- The tree drives the full codegen: prologue, K-loop, and epilogue
+  are all phases on tree nodes
 - Named register bindings (never raw register numbers)
+
+The tree structure::
+
+    workgroup(m=wg_m, n=wg_n, parallel=True)
+      prologue: [load_kernargs, thread_indexing, ..., k_loop_init, k_loop_label]
+      inner: wave(m=m_per_wave, n=n_per_wave, k=unroll_k)
+        prologue: [global_load, lds_write]
+        inner: mfma(m=16, n=16, k=16)
+        epilogue: [k_advance, k_loop_control]
+      epilogue: [store_d]
 
 Usage::
 
     # Default kernel -- just works
-    kernel = GemmKernel.build(problem, tile)
+    kernel = GemmKernel.build(problem)
     result = kernel.emit()
     result.assemble()
 
-    # Replace the K-loop for software pipelining
-    kernel = GemmKernel.build(problem, tile)
-    kernel.k_loop.global_load = my_prefetching_load
+    # Replace a single phase (e.g., custom global load for prefetching)
+    kernel = GemmKernel.build(problem)
+    kernel.tile_tree = kernel.tile_tree.replace_phase(
+        "global_load", my_prefetching_load)
     result = kernel.emit()
 
     # Replace the MFMA leaf for custom scheduling
-    kernel = GemmKernel.build(problem, tile)
+    kernel = GemmKernel.build(problem)
     kernel.tile_tree = kernel.tile_tree.replace("mfma", emit=my_mfma)
     result = kernel.emit()
 
     # Access tensor data at any level via MemoryView
-    def my_custom_compute(ctx, kernel):
+    def my_custom_compute(level, ctx):
         a_view = ctx.get_view("A")  # LDS view at this level
         a_view.emit_read(ctx, dst="v_a", m=mi*16, k=ki*16)
 """
@@ -47,7 +58,7 @@ from .asm_context import AsmContext
 from .asm_transforms import emit_affine, GemmLayouts
 from .problem import GemmProblem, TileConfig, MfmaConfig
 from .tiling import GemmTiling
-from .tile import TileLevel, build_gemm_tile_tree, walk_tile_tree
+from .tile import TileLevel, TilePhase, build_gemm_tile_tree, walk_tile_tree
 from .transforms import Embed, Dim
 
 __all__ = ["MemoryView", "GemmKernel", "AsmKernel"]
@@ -119,49 +130,6 @@ AsmContext.get_view = _get_view
 
 
 # ===================================================================
-# KLoop: the K-tile loop with replaceable sub-phases
-# ===================================================================
-
-@dataclass
-class KLoop:
-    """K-tile loop with independently replaceable sub-phases.
-
-    Default structure per iteration:
-      1. global_load: fetch A/B from global memory into VGPRs
-      2. lds_write:   write VGPRs to LDS + barrier
-      3. compute:     walk tile tree (LDS read + MFMA)
-      4. k_advance:   advance global pointers + barrier
-
-    Replace any sub-phase for software pipelining, double buffering, etc.
-    """
-    global_load: Callable = None
-    lds_write: Callable = None
-    compute: Callable = None
-    k_advance: Callable = None
-    loop_control: Callable = None
-
-    def emit(self, ctx: AsmContext, kernel: GemmKernel) -> None:
-        """Emit the full K-loop."""
-        tile = kernel.tile
-        elem = kernel.problem.element_bytes
-
-        # Loop setup
-        log2_uk = int(math.log2(tile.unroll_k))
-        ctx.s_lshr(ctx.sreg("s_k_tiles"), ctx.sreg("s_K"), log2_uk,
-                   comment=f"k_tiles = K / {tile.unroll_k}")
-        ctx.raw("")
-        ctx.label("k_loop")
-        ctx.raw("")
-
-        # Sub-phases
-        self.global_load(ctx, kernel)
-        self.lds_write(ctx, kernel)
-        self.compute(ctx, kernel)
-        self.k_advance(ctx, kernel)
-        self.loop_control(ctx, kernel)
-
-
-# ===================================================================
 # GemmKernel: the full kernel pipeline
 # ===================================================================
 
@@ -200,25 +168,28 @@ class AsmKernel:
 
 @dataclass
 class GemmKernel:
-    """A GEMM kernel described as a composable pipeline.
+    """A GEMM kernel described as a tile tree with phases.
 
-    Each phase is independently replaceable. The kernel structure is::
+    The entire kernel structure is encoded in the tile tree::
 
-        prologue  -> k_loop [global_load -> lds_write -> compute -> advance] -> epilogue
+        workgroup
+          prologue: [load_kernargs, thread_indexing, ..., k_loop_init, k_loop_label]
+          inner: wave
+            prologue: [global_load, lds_write]
+            inner: mfma (leaf)
+            epilogue: [k_advance, k_loop_control]
+          epilogue: [store_d]
 
-    At each level, MemoryViews describe how to access tensor data
-    through coordinate transforms.
+    Replace any phase to customize one step::
+
+        kernel.tile_tree = kernel.tile_tree.replace_phase(
+            "global_load", my_prefetching_load)
     """
     problem: GemmProblem
     tile: TileConfig
     layouts: GemmLayouts
     tile_tree: TileLevel
     kernel_name: str = "gemm_kernel"
-
-    # Replaceable phases
-    prologue: Callable = None       # (ctx, kernel) -> None
-    k_loop: KLoop = field(default_factory=KLoop)
-    epilogue: Callable = None       # (ctx, kernel) -> None
 
     # MFMA visitor for the tile tree walk
     mfma_visitor: Callable = None
@@ -229,7 +200,7 @@ class GemmKernel:
               kernel_name: str = "gemm_kernel",
               tile_tree: Optional[TileLevel] = None,
               tiling: Optional[GemmTiling] = None) -> GemmKernel:
-        """Build a GemmKernel with all default phases.
+        """Build a GemmKernel with the full tile tree.
 
         Args:
             problem: GEMM problem specification.
@@ -251,11 +222,9 @@ class GemmKernel:
         layouts = GemmLayouts.build(problem, tile)
 
         if tile_tree is None:
-            tile_tree = build_gemm_tile_tree(
-                wg_m=tile.wg_m, wg_n=tile.wg_n, unroll_k=tile.unroll_k,
-                waves_m=tile.waves_m, waves_n=tile.waves_n,
-                mfma_m=tile.mfma.m, mfma_n=tile.mfma.n, mfma_k=tile.mfma.k,
-            )
+            from .asm_emitter import build_full_gemm_tree
+            tile_tree = build_full_gemm_tree(problem, tile, layouts)
+
         tile_tree.validate()
 
         kernel = GemmKernel(
@@ -264,24 +233,18 @@ class GemmKernel:
             layouts=layouts,
             tile_tree=tile_tree,
             kernel_name=kernel_name,
-            prologue=default_prologue,
-            k_loop=KLoop(
-                global_load=default_global_load,
-                lds_write=default_lds_write,
-                compute=default_compute,
-                k_advance=default_k_advance,
-                loop_control=default_loop_control,
-            ),
-            epilogue=default_epilogue,
             mfma_visitor=default_mfma_visitor,
         )
         return kernel
 
     def emit(self) -> AsmKernel:
-        """Generate the full kernel assembly."""
+        """Generate the full kernel assembly.
+
+        Walks the tile tree which handles everything: prologue phases,
+        K-loop (via phases), MFMA compute (via visitor), and epilogue.
+        """
         from .asm_emitter import (
             _alloc_registers, _emit_header, _emit_descriptor,
-            assemble_kernel,
         )
 
         tile = self.tile
@@ -314,10 +277,8 @@ class GemmKernel:
 
         _emit_header(ctx, self.kernel_name)
 
-        # Pipeline: prologue -> k_loop -> epilogue
-        self.prologue(ctx, self)
-        self.k_loop.emit(ctx, self)
-        self.epilogue(ctx, self)
+        # Walk the full tile tree -- phases handle everything
+        walk_tile_tree(self.tile_tree, ctx, visitor=self.mfma_visitor)
 
         ctx.inst("s_endpgm", comment="end of kernel")
         _emit_descriptor(ctx, self.kernel_name, lds_total, tile)
@@ -333,83 +294,10 @@ class GemmKernel:
 
 
 # ===================================================================
-# Default phase implementations
+# Default MFMA visitor (backward-compat hook for the tile tree walk)
 # ===================================================================
 
-def default_prologue(ctx: AsmContext, kernel: GemmKernel) -> None:
-    """Load kernargs, compute thread/wave indices, set up addresses."""
-    from .asm_emitter import (
-        _emit_load_kernargs, _emit_thread_indexing,
-        _emit_global_load_cluster, _emit_lds_write_addrs,
-        _emit_lds_read_addrs, _emit_init_acc,
-        _emit_global_addr_a, _emit_global_addr_b,
-    )
-    _emit_load_kernargs(ctx)
-    _emit_thread_indexing(ctx, kernel.tile)
-    _emit_global_load_cluster(ctx, kernel.tile, kernel.problem)
-    _emit_lds_write_addrs(ctx, kernel.problem, kernel.tile, kernel.layouts)
-    _emit_lds_read_addrs(ctx, kernel.problem, kernel.tile, kernel.layouts)
-    _emit_init_acc(ctx, kernel.tile)
-    _emit_global_addr_a(ctx, kernel.problem, kernel.tile, kernel.layouts)
-    _emit_global_addr_b(ctx, kernel.problem, kernel.tile, kernel.layouts)
-
-
-def default_global_load(ctx: AsmContext, kernel: GemmKernel) -> None:
-    """Load A/B tiles from global memory into VGPRs."""
-    from .asm_emitter import _emit_global_load
-    _emit_global_load(ctx, kernel.problem, kernel.tile)
-
-
-def default_lds_write(ctx: AsmContext, kernel: GemmKernel) -> None:
-    """Write A/B data from VGPRs into LDS + barrier."""
-    from .asm_emitter import _emit_lds_write
-    _emit_lds_write(ctx, kernel.tile)
-
-
-def default_compute(ctx: AsmContext, kernel: GemmKernel) -> None:
-    """Walk the tile tree for LDS read + MFMA."""
-    walk_tile_tree(kernel.tile_tree, ctx, kernel.mfma_visitor)
-
-
-def default_k_advance(ctx: AsmContext, kernel: GemmKernel) -> None:
-    """Advance A/B global pointers by unroll_k."""
-    tile = kernel.tile
-    k_stride = tile.unroll_k * kernel.problem.element_bytes
-    ctx.comment("Advance A, B pointers by unroll_k")
-    ctx.inst("v_add_co_u32", ctx.vreg("v_addr_a", 0, 1), "vcc",
-             str(k_stride), ctx.vreg("v_addr_a", 0, 1),
-             comment=f"A += {k_stride}")
-    ctx.inst("v_addc_co_u32", ctx.vreg("v_addr_a", 1, 1), "vcc",
-             ctx.vreg("v_addr_a", 1, 1), "0", "vcc",
-             comment="carry")
-    ctx.inst("v_add_co_u32", ctx.vreg("v_addr_b", 0, 1), "vcc",
-             str(k_stride), ctx.vreg("v_addr_b", 0, 1),
-             comment=f"B += {k_stride}")
-    ctx.inst("v_addc_co_u32", ctx.vreg("v_addr_b", 1, 1), "vcc",
-             ctx.vreg("v_addr_b", 1, 1), "0", "vcc",
-             comment="carry")
-    ctx.raw("")
-    ctx.s_barrier(comment="sync before next K-tile LDS write")
-
-
-def default_loop_control(ctx: AsmContext, kernel: GemmKernel) -> None:
-    """Decrement k_tiles counter and branch."""
-    ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
-              comment="k_tiles--")
-    ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
-             comment="SCC = (k_tiles != 0)")
-    ctx.inst("s_cbranch_scc1", "k_loop",
-             comment="branch if k_tiles > 0")
-    ctx.raw("")
-
-
-def default_epilogue(ctx: AsmContext, kernel: GemmKernel) -> None:
-    """Store accumulators to D."""
-    from .asm_emitter import _emit_store_d
-    _emit_store_d(ctx, kernel.problem, kernel.tile)
-
-
 def default_mfma_visitor(level: TileLevel, ctx: AsmContext) -> None:
-    """Tile-tree visitor: emit LDS reads + MFMAs."""
+    """Tile-tree visitor: emit LDS reads + MFMAs at the mfma leaf level."""
     from .asm_emitter import _mfma_visitor
     _mfma_visitor(level, ctx)

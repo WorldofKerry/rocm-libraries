@@ -1,23 +1,42 @@
 # Copyright Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
-"""Tests for the GemmKernel pipeline with replaceable phases."""
+"""Tests for the GemmKernel pipeline with tree-driven phases."""
 import pytest
 from stinkytofu.gemm.kernel_pipeline import (
-    GemmKernel, MemoryView, default_prologue, default_epilogue,
-    default_global_load, default_lds_write, default_compute,
-    default_k_advance, default_loop_control, default_mfma_visitor,
+    GemmKernel, MemoryView, default_mfma_visitor,
 )
+from stinkytofu.gemm.tile import TilePhase
 from stinkytofu.gemm.problem import GemmProblem, TileConfig, MfmaConfig
 
 
 class TestGemmKernelBuild:
     def test_build_default(self):
         kernel = GemmKernel.build(GemmProblem(4096, 4096, 4096))
-        assert kernel.prologue is default_prologue
-        assert kernel.epilogue is default_epilogue
-        assert kernel.k_loop.global_load is default_global_load
-        assert kernel.k_loop.compute is default_compute
         assert kernel.mfma_visitor is default_mfma_visitor
+        assert kernel.tile_tree is not None
+        assert kernel.tile_tree.name == "workgroup"
+
+    def test_build_has_phases(self):
+        kernel = GemmKernel.build(GemmProblem(4096, 4096, 4096))
+        tree = kernel.tile_tree
+        # Workgroup level has prologue and epilogue phases
+        pro_names = [p.name for p in tree.prologue_phases]
+        assert "load_kernargs" in pro_names
+        assert "thread_indexing" in pro_names
+        assert "k_loop_label" in pro_names
+        epi_names = [p.name for p in tree.epilogue_phases]
+        assert "store_d" in epi_names
+
+    def test_build_wave_phases(self):
+        kernel = GemmKernel.build(GemmProblem(4096, 4096, 4096))
+        wave = kernel.tile_tree.inner
+        assert wave.name == "wave"
+        pro_names = [p.name for p in wave.prologue_phases]
+        assert "global_load" in pro_names
+        assert "lds_write" in pro_names
+        epi_names = [p.name for p in wave.epilogue_phases]
+        assert "k_advance" in epi_names
+        assert "k_loop_control" in epi_names
 
     def test_build_custom_tile(self):
         tile = TileConfig(wg_m=256, wg_n=128, unroll_k=64,
@@ -35,6 +54,20 @@ class TestGemmKernelBuild:
     def test_tile_tree_valid(self):
         kernel = GemmKernel.build(GemmProblem(4096, 4096, 4096))
         kernel.tile_tree.validate()  # should not raise
+
+    def test_all_phase_names(self):
+        kernel = GemmKernel.build(GemmProblem(4096, 4096, 4096))
+        names = kernel.tile_tree.phase_names()
+        expected = [
+            "load_kernargs", "thread_indexing", "load_cluster_setup",
+            "lds_write_addrs", "lds_read_addrs", "init_acc",
+            "global_addr_a", "global_addr_b", "k_loop_init", "k_loop_label",
+            "store_d",
+            "global_load", "lds_write",
+            "k_advance", "k_loop_control",
+        ]
+        for name in expected:
+            assert name in names, f"Phase '{name}' not found in tree"
 
 
 class TestGemmKernelEmit:
@@ -72,19 +105,40 @@ class TestGemmKernelEmit:
                     kernel.tile.k_iterations)
         assert len(mfma_lines) == expected
 
+    def test_emit_has_k_loop(self):
+        """Assembly should contain k_loop label and branch."""
+        kernel = GemmKernel.build(GemmProblem(128, 128, 32))
+        result = kernel.emit()
+        assert any("k_loop:" in l for l in result.ctx.lines)
+        assert any("s_cbranch_scc1" in l and "k_loop" in l
+                    for l in result.ctx.lines)
+
+    def test_emit_has_global_load(self):
+        kernel = GemmKernel.build(GemmProblem(128, 128, 32))
+        result = kernel.emit()
+        loads = [l for l in result.ctx.lines if 'global_load_' in l]
+        assert len(loads) > 0
+
+    def test_emit_has_store(self):
+        kernel = GemmKernel.build(GemmProblem(128, 128, 32))
+        result = kernel.emit()
+        stores = [l for l in result.ctx.lines if 'global_store' in l]
+        assert len(stores) > 0
+
 
 class TestPhaseReplacement:
-    def test_replace_epilogue(self):
-        """Skip epilogue entirely."""
-        def noop_epilogue(ctx, kernel):
-            ctx.comment("epilogue replaced")
+    def test_replace_store_phase(self):
+        """Replace the store_d phase -- no stores emitted."""
+        def noop_store(level, ctx):
+            ctx.comment("store replaced")
 
         kernel = GemmKernel.build(GemmProblem(128, 128, 32))
-        kernel.epilogue = noop_epilogue
+        kernel.tile_tree = kernel.tile_tree.replace_phase(
+            "store_d", noop_store)
         result = kernel.emit()
         stores = [l for l in result.ctx.lines if 'global_store' in l]
         assert len(stores) == 0
-        assert any("epilogue replaced" in l for l in result.ctx.lines)
+        assert any("store replaced" in l for l in result.ctx.lines)
 
     def test_replace_mfma_visitor(self):
         """Count MFMA invocations via custom visitor."""
@@ -104,16 +158,19 @@ class TestPhaseReplacement:
 
     def test_replace_k_advance(self):
         """Custom K-advance adds a marker comment."""
-        def custom_advance(ctx, kernel):
+        from stinkytofu.gemm.asm_emitter import _phase_k_advance
+
+        def custom_advance(level, ctx):
             ctx.comment("CUSTOM_MARKER")
-            default_k_advance(ctx, kernel)
+            _phase_k_advance(level, ctx)
 
         kernel = GemmKernel.build(GemmProblem(128, 128, 32))
-        kernel.k_loop.k_advance = custom_advance
+        kernel.tile_tree = kernel.tile_tree.replace_phase(
+            "k_advance", custom_advance)
         result = kernel.emit()
         assert any("CUSTOM_MARKER" in l for l in result.ctx.lines)
 
-    def test_replace_tile_tree(self):
+    def test_replace_tile_tree_mfma(self):
         """Replace the MFMA leaf via tile tree."""
         emit_count = [0]
         def my_mfma(level, ctx):
@@ -124,6 +181,31 @@ class TestPhaseReplacement:
         kernel.tile_tree = kernel.tile_tree.replace("mfma", emit=my_mfma)
         kernel.emit()
         assert emit_count[0] > 0
+
+    def test_replace_global_load(self):
+        """Replace global_load phase with a marker."""
+        def custom_load(level, ctx):
+            ctx.comment("CUSTOM_LOAD")
+            # Still need to do the actual load for correctness
+            from stinkytofu.gemm.asm_emitter import _phase_global_load
+            _phase_global_load(level, ctx)
+
+        kernel = GemmKernel.build(GemmProblem(128, 128, 32))
+        kernel.tile_tree = kernel.tile_tree.replace_phase(
+            "global_load", custom_load)
+        result = kernel.emit()
+        assert any("CUSTOM_LOAD" in l for l in result.ctx.lines)
+
+    def test_get_phase(self):
+        kernel = GemmKernel.build(GemmProblem(128, 128, 32))
+        phase = kernel.tile_tree.get_phase("global_load")
+        assert phase is not None
+        assert phase.name == "global_load"
+
+    def test_get_phase_not_found(self):
+        kernel = GemmKernel.build(GemmProblem(128, 128, 32))
+        phase = kernel.tile_tree.get_phase("nonexistent")
+        assert phase is None
 
 
 class TestMemoryViews:
@@ -140,15 +222,17 @@ class TestMemoryViews:
     def test_view_in_custom_phase(self):
         """Access MemoryView from a custom compute phase."""
         views_found = []
-        def custom_compute(ctx, kernel):
-            views_found.append(ctx.get_view("A").name)
-            views_found.append(ctx.get_view("B").name)
-            default_compute(ctx, kernel)
+        def custom_visitor(level, ctx):
+            if level.name == "mfma":
+                views_found.append(ctx.get_view("A").name)
+                views_found.append(ctx.get_view("B").name)
+            default_mfma_visitor(level, ctx)
 
         kernel = GemmKernel.build(GemmProblem(128, 128, 32))
-        kernel.k_loop.compute = custom_compute
+        kernel.mfma_visitor = custom_visitor
         kernel.emit()
-        assert views_found == ["A", "B"]
+        assert "A" in views_found
+        assert "B" in views_found
 
     def test_view_layout_matches(self):
         kernel = GemmKernel.build(GemmProblem(128, 128, 32))
@@ -164,3 +248,34 @@ class TestMemoryViews:
         result = kernel.emit()
         with pytest.raises(KeyError, match="No MemoryView 'C'"):
             result.ctx.get_view("C")
+
+
+class TestTreeStructure:
+    """Test the tree structure produced by GemmKernel.build()."""
+
+    def test_workgroup_parallel(self):
+        kernel = GemmKernel.build(GemmProblem(128, 128, 32))
+        assert kernel.tile_tree.parallel is True
+
+    def test_wave_not_parallel(self):
+        kernel = GemmKernel.build(GemmProblem(128, 128, 32))
+        assert kernel.tile_tree.inner.parallel is False
+
+    def test_tree_depth(self):
+        kernel = GemmKernel.build(GemmProblem(128, 128, 32))
+        assert kernel.tile_tree.depth == 2  # workgroup -> wave -> mfma
+
+    def test_mfma_is_leaf(self):
+        kernel = GemmKernel.build(GemmProblem(128, 128, 32))
+        mfma = kernel.tile_tree.find("mfma")
+        assert mfma is not None
+        assert mfma.is_leaf is True
+
+    def test_summary_shows_phases(self):
+        kernel = GemmKernel.build(GemmProblem(128, 128, 32))
+        s = kernel.tile_tree.summary()
+        assert "prologue:" in s
+        assert "epilogue:" in s
+        assert "parallel/HW-mapped" in s
+        assert "global_load" in s
+        assert "store_d" in s

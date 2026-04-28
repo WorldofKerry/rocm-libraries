@@ -267,13 +267,21 @@ class GemmTiling:
         )
 
     def build_tile_tree(self) -> TileLevel:
-        """Auto-generate codegen TileLevel tree from dimension chains."""
+        """Auto-generate codegen TileLevel tree from dimension chains.
+
+        Returns a workgroup->wave->mfma tree (no phases).  Use
+        build_full_gemm_tree() from asm_emitter for a complete tree
+        with workgroup/wave phases for assembly emission.
+        """
         mfma_level = TileLevel(
             "mfma", m=self.mfma.m, n=self.mfma.n, k=self.mfma.k)
         wave_level = TileLevel(
             "wave", m=self.m_per_wave, n=self.n_per_wave,
             k=self.unroll_k, inner=mfma_level)
-        return wave_level
+        workgroup_level = TileLevel(
+            "workgroup", m=self.wg_m, n=self.wg_n, k=self.unroll_k,
+            inner=wave_level, parallel=True)
+        return workgroup_level
 
     def build_m_descriptor(self) -> TileDescriptor:
         return self.dim_m.build_descriptor()
