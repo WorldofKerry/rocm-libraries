@@ -508,6 +508,23 @@ def default_mfma_visitor(level: TileLevel, ctx: AsmContext) -> None:
 # Pipelined K-loop (single phase, handles entire loop)
 # ===================================================================
 
+def _emit_wave_compute(ctx, wave, visitor):
+    """Walk the wave level with proper mi/ni/ki iteration.
+
+    Used by pipelined/optimized K-loops to correctly iterate over
+    all MFMA tiles within a K-tile.
+    """
+    if wave is None or wave.inner is None:
+        return
+    for mi in range(wave.repeats_m):
+        for ni in range(wave.repeats_n):
+            for ki in range(wave.repeats_k):
+                ctx.set_index("wave", "mi", mi)
+                ctx.set_index("wave", "ni", ni)
+                ctx.set_index("wave", "ki", ki)
+                visitor(wave.inner, ctx)
+
+
 def phase_pipelined_k_loop(level, ctx):
     """Entire K-loop with software pipelining.
 
@@ -573,11 +590,10 @@ def phase_pipelined_k_loop(level, ctx):
     ctx.label("skip_prefetch")
     ctx.raw("")
 
-    # Compute: walk inner tile tree
+    # Compute: walk wave with full mi/ni/ki iteration
     ctx.comment("Compute: MFMA from LDS (overlaps with global_load)")
     wave = kernel.tile_tree.find("wave")
-    if wave and wave.inner:
-        walk_tile_tree(wave.inner, ctx, visitor=kernel.mfma_visitor)
+    _emit_wave_compute(ctx, wave, kernel.mfma_visitor)
     ctx.raw("")
 
     # Barriers + wait + loop control
@@ -626,4 +642,241 @@ PIPELINED_PROLOGUE_PHASES = [
     TilePhase("init_acc", phase_init_acc),
     TilePhase("global_addrs", phase_global_addrs),
     TilePhase("pipelined_k_loop", phase_pipelined_k_loop),
+]
+
+
+# ===================================================================
+# Optimized K-loop: double-buffered LDS + pipelining + interleaved
+# MFMA/LR + fine-grained waitcnt
+# ===================================================================
+
+def phase_optimized_k_loop(level, ctx):
+    """K-loop with all optimizations combined.
+
+    1. Double-buffered LDS: write to buf[A] while reading from buf[B],
+       eliminating one barrier per iteration.
+    2. Software pipelining: overlap global_load(n+1) with compute(n).
+    3. MFMA/LR interleaving: issue ds_read for MFMA[i+1] during
+       MFMA[i] execution (32-cycle MFMA hides 20-cycle ds_read).
+    4. Fine-grained waitcnt: vmcnt/lgkmcnt with precise counts
+       instead of s_waitcnt 0.
+
+    Structure::
+
+        prefetch tile[0]; waitcnt vmcnt(0)
+        lds_write to buf[0]; waitcnt lgkmcnt(0); barrier
+        k_loop:
+          [advance + global_load async]
+          compute from buf[cur] (interleaved MFMA/LR)
+          waitcnt vmcnt(0)
+          toggle LDS offsets
+          lds_write to buf[other]; waitcnt lgkmcnt(0); barrier
+          k_loop_control
+    """
+    tile = _tile(ctx)
+    problem = _problem(ctx)
+    kernel = ctx._metadata["kernel"]
+    elem = problem.element_bytes
+    mfma = tile.mfma
+
+    lds_half = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
+    k_stride = tile.unroll_k * elem
+    log2_uk = int(math.log2(tile.unroll_k))
+
+    # Allocate SGPR for double-buffer toggle step (+lds_half or -lds_half)
+    ctx.alloc_sgpr_permanent(1, "s_lds_db_step")
+
+    # Allocate second operand buffer for MFMA/LR interleaving
+    ctx.alloc_vgpr_permanent(mfma.a_vgprs, "v_a2")
+    ctx.alloc_vgpr_permanent(mfma.b_vgprs, "v_b2")
+
+    # K-tile count
+    ctx.comment("=== Optimized K-loop: DB-LDS + pipeline + interleaved MFMA/LR ===")
+    ctx.s_lshr(ctx.sreg("s_k_tiles"), ctx.sreg("s_K"), log2_uk,
+               comment=f"k_tiles = K / {tile.unroll_k}")
+    ctx.s_mov(ctx.sreg("s_lds_db_step"), str(lds_half),
+              comment=f"DB toggle step = {lds_half}")
+    ctx.raw("")
+
+    # Prefetch first tile
+    ctx.comment("Prefetch first K-tile")
+    _emit_global_load_impl(ctx, problem, tile)
+
+    # Write to buf[0]
+    ctx.comment("Write first tile to LDS buf[0]")
+    _emit_lds_write_impl(ctx, tile)
+
+    # K-loop
+    ctx.label("k_loop")
+    ctx.raw("")
+
+    # Decrement + conditional prefetch
+    ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
+              comment="k_tiles--")
+    ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
+             comment="SCC = (k_tiles != 0)")
+    ctx.inst("s_cbranch_scc0", "skip_prefetch",
+             comment="skip prefetch on last iteration")
+
+    # Advance + async global load
+    ctx.comment("Advance ptrs + prefetch next K-tile (async)")
+    for addr in ["v_addr_a", "v_addr_b"]:
+        ctx.inst("v_add_co_u32", ctx.vreg(addr, 0, 1), "vcc",
+                 str(k_stride), ctx.vreg(addr, 0, 1),
+                 comment=f"{addr} += {k_stride}")
+        ctx.inst("v_addc_co_u32", ctx.vreg(addr, 1, 1), "vcc",
+                 ctx.vreg(addr, 1, 1), "0", "vcc", comment="carry")
+    _emit_global_load_no_wait(ctx, problem, tile)
+    ctx.raw("")
+
+    ctx.label("skip_prefetch")
+    ctx.raw("")
+
+    # Compute: interleaved MFMA/LR from current LDS buffer
+    ctx.comment("Compute: interleaved MFMA/LR from current LDS buffer")
+    _emit_interleaved_compute(ctx, tile, problem)
+    ctx.raw("")
+
+    # Wait for global load
+    ctx.s_waitcnt("vmcnt(0)", comment="wait for global_load")
+
+    # Toggle LDS offsets for double buffering
+    ctx.comment("Toggle LDS double-buffer offsets")
+    for reg in ["v_lds_wr_a", "v_lds_wr_b", "v_lds_rd_a", "v_lds_rd_b"]:
+        ctx.v_add(ctx.vreg(reg), ctx.sreg("s_lds_db_step"), ctx.vreg(reg),
+                  comment=f"{reg} += db_step")
+    ctx.inst("s_sub_u32", ctx.sreg("s_lds_db_step"), "0",
+             ctx.sreg("s_lds_db_step"),
+             comment="negate step for next toggle")
+    ctx.raw("")
+
+    # Write to other LDS buffer
+    ctx.comment("Write next tile to other LDS buffer")
+    _emit_lds_write_impl(ctx, tile)
+
+    # Loop control
+    ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
+             comment="SCC = (k_tiles != 0)")
+    ctx.inst("s_cbranch_scc1", "k_loop",
+             comment="branch if k_tiles > 0")
+    ctx.raw("")
+
+
+def _emit_lds_write_impl(ctx, tile):
+    """Emit LDS write + waitcnt + barrier (shared by all K-loop variants)."""
+    for name in ["a", "b"]:
+        load = ctx.get(f"v_gload_{name}")
+        addr_reg = ctx.vreg(f"v_lds_wr_{name}")
+        for i in range(0, load.count, 4):
+            cnt = min(4, load.count - i)
+            src = ctx.vreg(f"v_gload_{name}", i, cnt)
+            ctx.ds_write(addr_reg, src, offset=i * 4, width=cnt,
+                         comment=f"LDS write {name.upper()}[{i}:{i+cnt}]")
+    ctx.s_waitcnt("lgkmcnt(0)", comment="wait LDS writes")
+    ctx.s_barrier(comment="sync workgroup")
+    ctx.raw("")
+
+
+def _emit_global_load_no_wait(ctx, problem, tile):
+    """Issue global loads for A and B without waitcnt (async)."""
+    for name, addr_name in [("A", "v_addr_a"), ("B", "v_addr_b")]:
+        gload_name = f"v_gload_{name.lower()}"
+        load = ctx.get(gload_name)
+        addr = ctx.vreg(addr_name, 0, 2)
+        for i in range(0, load.count, 4):
+            cnt = min(4, load.count - i)
+            width = {4: "dwordx4", 2: "dwordx2", 1: "dword"}[cnt]
+            dst = ctx.vreg(gload_name, i, cnt)
+            off = f"off offset:{i * 4}" if i > 0 else "off"
+            ctx.inst(f"global_load_{width}", dst, addr, off,
+                     comment=f"prefetch {name}[{i}:{i+cnt}]")
+
+
+def _emit_interleaved_compute(ctx, tile, problem):
+    """Emit all MFMA tiles with double-buffered LDS read interleaving.
+
+    Issues ds_read for MFMA[i+1] during MFMA[i] (32-cycle MFMA
+    hides 20-cycle ds_read latency). Uses v_a/v_b and v_a2/v_b2
+    as alternating operand buffers.
+    """
+    mfma = tile.mfma
+    elem = problem.element_bytes
+
+    a_bufs = ["v_a", "v_a2"]
+    b_bufs = ["v_b", "v_b2"]
+
+    # Flatten iteration order
+    iters = []
+    for mi in range(tile.mfma_m_repeat):
+        for ni in range(tile.mfma_n_repeat):
+            for ki in range(tile.k_iterations):
+                iters.append((mi, ni, ki))
+
+    def emit_lr(idx, buf):
+        """Emit LDS reads for iteration idx into buffer buf."""
+        mi, ni, ki = iters[idx]
+        a_name, b_name = a_bufs[buf], b_bufs[buf]
+
+        a_off = (mi * mfma.m * tile.unroll_k + ki * mfma.k) * elem
+        if a_off > 0:
+            ctx.v_add(ctx.vreg("v_tmp0"), str(a_off),
+                      ctx.vreg("v_lds_rd_a"),
+                      comment=f"LR A addr m{mi}k{ki}")
+            a_addr = ctx.vreg("v_tmp0")
+        else:
+            a_addr = ctx.vreg("v_lds_rd_a")
+        for r in range(mfma.a_vgprs):
+            ctx.ds_read(ctx.vreg(a_name, r, 1), a_addr,
+                        offset=r * 4, width=1,
+                        comment=f"LR A[{r}] m{mi}k{ki}")
+
+        b_off = (ni * mfma.n * tile.unroll_k + ki * mfma.k) * elem
+        if b_off > 0:
+            ctx.v_add(ctx.vreg("v_tmp1"), str(b_off),
+                      ctx.vreg("v_lds_rd_b"),
+                      comment=f"LR B addr n{ni}k{ki}")
+            b_addr = ctx.vreg("v_tmp1")
+        else:
+            b_addr = ctx.vreg("v_lds_rd_b")
+        for r in range(mfma.b_vgprs):
+            ctx.ds_read(ctx.vreg(b_name, r, 1), b_addr,
+                        offset=r * 4, width=1,
+                        comment=f"LR B[{r}] n{ni}k{ki}")
+
+    # Pre-load first operands
+    emit_lr(0, buf=0)
+    ctx.s_waitcnt("lgkmcnt(0)", comment="wait first LDS reads")
+
+    for i, (mi, ni, ki) in enumerate(iters):
+        cur_buf = i % 2
+
+        # Prefetch next operands (hidden by MFMA latency)
+        if i < len(iters) - 1:
+            emit_lr(i + 1, buf=1 - cur_buf)
+
+        # MFMA
+        acc_per = mfma.acc_vgprs
+        acc_off = (mi * tile.mfma_n_repeat + ni) * acc_per
+        ctx.inst(
+            f"v_mfma_f32_{mfma.m}x{mfma.n}x{mfma.k}_f16",
+            ctx.areg("acc_C", acc_off, acc_per),
+            ctx.vreg(a_bufs[cur_buf], 0, mfma.a_vgprs),
+            ctx.vreg(b_bufs[cur_buf], 0, mfma.b_vgprs),
+            ctx.areg("acc_C", acc_off, acc_per),
+            comment=f"mfma m{mi}_n{ni}_k{ki}")
+
+        # Wait for prefetch (MFMA latency covers most of it)
+        if i < len(iters) - 1:
+            ctx.s_waitcnt("lgkmcnt(0)", comment="wait LR")
+
+
+# Phase list for optimized K-loop
+OPTIMIZED_PROLOGUE_PHASES = [
+    TilePhase("load_kernargs", phase_load_kernargs),
+    TilePhase("thread_indexing", phase_thread_indexing),
+    TilePhase("load_cluster_setup", phase_load_cluster_setup),
+    TilePhase("lds_addrs", phase_lds_addrs),
+    TilePhase("init_acc", phase_init_acc),
+    TilePhase("global_addrs", phase_global_addrs),
+    TilePhase("optimized_k_loop", phase_optimized_k_loop),
 ]

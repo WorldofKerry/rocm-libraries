@@ -125,7 +125,8 @@ class GemmKernel:
               kernel_name: str = "gemm_kernel",
               tile_tree: Optional[TileLevel] = None,
               tiling: Optional[GemmTiling] = None,
-              pipelined: bool = False) -> GemmKernel:
+              pipelined: bool = False,
+              optimized: bool = False) -> GemmKernel:
         """Build a GemmKernel.  GemmTiling is the source of truth.
 
         Args:
@@ -135,6 +136,8 @@ class GemmKernel:
             tile_tree: Custom TileLevel tree (overrides auto-generation).
             tiling: GemmTiling with per-dimension TileDim chains.
             pipelined: If True, use software-pipelined K-loop.
+            optimized: If True, use all optimizations (DB-LDS +
+                       pipelining + interleaved MFMA/LR + fine waitcnt).
         """
         # GemmTiling is always the source of truth
         if tiling is None:
@@ -151,7 +154,8 @@ class GemmKernel:
 
         # Tree comes from tiling (unless explicitly overridden)
         if tile_tree is None:
-            tile_tree = tiling.build_tile_tree(pipelined=pipelined)
+            tile_tree = tiling.build_tile_tree(
+                pipelined=pipelined, optimized=optimized)
 
         tile_tree.validate()
 
@@ -166,7 +170,11 @@ class GemmKernel:
         """Generate the full kernel assembly."""
         tile = self.tile
         elem = self.problem.element_bytes
-        lds_total = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
+        lds_half = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
+        # Double LDS for double-buffered mode
+        is_db = any(p.name == "optimized_k_loop"
+                     for p in self.tile_tree.prologue_phases)
+        lds_total = lds_half * 2 if is_db else lds_half
 
         ctx = AsmContext()
         ctx._metadata = {

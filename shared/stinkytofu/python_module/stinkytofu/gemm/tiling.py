@@ -44,6 +44,11 @@ from typing import List, Optional
 
 from .problem import MfmaConfig, TileConfig
 from .tile import TileLevel
+
+
+def _noop_wave_emit(level, ctx):
+    """No-op: compute is handled by the K-loop phase."""
+    pass
 from .transforms import Dim, Tile, TileDescriptor
 
 __all__ = [
@@ -282,7 +287,8 @@ class GemmTiling:
             mfma=self.mfma, wave_size=self.wave_size,
         )
 
-    def build_tile_tree(self, pipelined: bool = False) -> TileLevel:
+    def build_tile_tree(self, pipelined: bool = False,
+                       optimized: bool = False) -> TileLevel:
         """Build the full tile tree with phases from TileDim chains.
 
         The chain structure determines the tree levels:
@@ -303,7 +309,7 @@ class GemmTiling:
         from .phases import (
             WORKGROUP_PROLOGUE_PHASES, WORKGROUP_EPILOGUE_PHASES,
             WAVE_PROLOGUE_PHASES, WAVE_EPILOGUE_PHASES,
-            PIPELINED_PROLOGUE_PHASES,
+            PIPELINED_PROLOGUE_PHASES, OPTIMIZED_PROLOGUE_PHASES,
         )
 
         # Leaf: MFMA instruction (from HARDWARE TileDim leaves)
@@ -313,11 +319,14 @@ class GemmTiling:
 
         # Wave: per-wave compute tile
         # K-loop data movement phases go here (non-pipelined)
-        if pipelined:
+        if pipelined or optimized:
+            # Pipelined/optimized: K-loop phase handles compute internally.
+            # Wave gets a no-op emit so the tree walker skips it.
             wave_level = TileLevel(
                 "wave", m=self.m_per_wave,
                 n=self.n_per_wave, k=self.unroll_k,
-                inner=mfma_level)
+                inner=mfma_level,
+                emit=_noop_wave_emit)
         else:
             wave_level = TileLevel(
                 "wave", m=self.m_per_wave,
@@ -327,8 +336,12 @@ class GemmTiling:
                 epilogue_phases=list(WAVE_EPILOGUE_PHASES))
 
         # Workgroup: setup + K-loop structure + store
-        wg_pro = list(PIPELINED_PROLOGUE_PHASES if pipelined
-                      else WORKGROUP_PROLOGUE_PHASES)
+        if optimized:
+            wg_pro = list(OPTIMIZED_PROLOGUE_PHASES)
+        elif pipelined:
+            wg_pro = list(PIPELINED_PROLOGUE_PHASES)
+        else:
+            wg_pro = list(WORKGROUP_PROLOGUE_PHASES)
         workgroup_level = TileLevel(
             "workgroup", m=self.wg_m, n=self.wg_n,
             k=self.unroll_k, inner=wave_level, parallel=True,
