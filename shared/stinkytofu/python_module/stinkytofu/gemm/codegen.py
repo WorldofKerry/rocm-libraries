@@ -636,3 +636,202 @@ class GemmCodegen:
             "n_desc": repr(self.mapping.n_desc),
             "k_desc": repr(self.mapping.k_desc),
         }
+
+
+# ===================================================================
+# VGPR tile allocator  (per-subtile alloc / free for register reuse)
+# ===================================================================
+
+class VGPRTileAllocator:
+    """Allocates and recycles VGPR operand tiles across partitions.
+
+    In the classic (non-subtiled) approach, all MFMA operand registers
+    for the entire wave tile are live simultaneously.  With subtiling,
+    only one partition's operands need to be live at a time.
+
+    Usage::
+
+        alloc = VGPRTileAllocator(regs, tile)
+        # Partition 0
+        a_idx = alloc.acquire_a()   # get a free A-tile VGPR range
+        b_idx = alloc.acquire_b()
+        # ... emit LDS reads + MFMAs using these ...
+        alloc.release_a(a_idx)      # return to free pool
+        alloc.release_b(b_idx)
+        # Partition 1 can now reuse the same VGPRs
+    """
+
+    def __init__(self, regs: RegisterAllocator, tile: TileConfig) -> None:
+        self.tile = tile
+        self.regs = regs
+
+        if tile.subtiling_enabled and tile.partition:
+            # Allocate only enough tiles for one partition
+            self._a_count = tile.partition.partition_m
+            self._b_count = tile.partition.partition_n
+        else:
+            self._a_count = tile.mfma_m_repeat
+            self._b_count = tile.mfma_n_repeat
+
+        a_per = tile.vgpr_a_per_subtile
+        b_per = tile.vgpr_b_per_subtile
+
+        # Pre-allocate all tile slots
+        self._a_tiles = []
+        for i in range(self._a_count):
+            start = regs.alloc_vgpr(a_per, f"v_atile_{i}")
+            self._a_tiles.append(start)
+
+        self._b_tiles = []
+        for i in range(self._b_count):
+            start = regs.alloc_vgpr(b_per, f"v_btile_{i}")
+            self._b_tiles.append(start)
+
+        # Free lists (indices into _a_tiles / _b_tiles)
+        self._free_a = list(range(self._a_count))
+        self._free_b = list(range(self._b_count))
+
+    def acquire_a(self) -> int:
+        """Return index of a free A-tile slot (into _a_tiles)."""
+        if not self._free_a:
+            raise RuntimeError("No free A-tile VGPRs; need more partitions or fewer subtiles")
+        return self._free_a.pop(0)
+
+    def acquire_b(self) -> int:
+        if not self._free_b:
+            raise RuntimeError("No free B-tile VGPRs")
+        return self._free_b.pop(0)
+
+    def release_a(self, idx: int) -> None:
+        """Return A-tile slot to the free pool."""
+        self._free_a.append(idx)
+
+    def release_b(self, idx: int) -> None:
+        self._free_b.append(idx)
+
+    def a_vgpr_start(self, idx: int) -> int:
+        """VGPR start index for A-tile slot *idx*."""
+        return self._a_tiles[idx]
+
+    def b_vgpr_start(self, idx: int) -> int:
+        return self._b_tiles[idx]
+
+    @property
+    def a_tile_vgprs(self) -> int:
+        return self.tile.vgpr_a_per_subtile
+
+    @property
+    def b_tile_vgprs(self) -> int:
+        return self.tile.vgpr_b_per_subtile
+
+    def summary(self) -> str:
+        return (
+            f"VGPRTileAllocator: {self._a_count} A-tiles x {self.a_tile_vgprs} VGPRs, "
+            f"{self._b_count} B-tiles x {self.b_tile_vgprs} VGPRs"
+        )
+
+
+# ===================================================================
+# Subtiled schedule  (partition-ordered K-loop)
+# ===================================================================
+
+class SubtiledSchedule(GemmSchedule):
+    """K-loop with partition-ordered subtile scheduling.
+
+    Replaces the flat K-loop with a structure that processes one
+    partition at a time, enabling VGPR reuse across partitions::
+
+        for each partition p in [0, num_partitions):
+            LDS_read  all subtiles in partition p
+            MFMA      all subtiles in partition p
+            (VGPRs from partition p are now free)
+
+    Override ``emit_partition`` for custom intra-partition scheduling
+    (e.g., interleaving LDS reads with MFMAs for latency hiding).
+    """
+
+    def __init__(self, emitter: Emitter) -> None:
+        super().__init__(emitter)
+        self._tile_alloc: Optional[VGPRTileAllocator] = None
+
+    @property
+    def tile_alloc(self) -> Optional[VGPRTileAllocator]:
+        return self._tile_alloc
+
+    @tile_alloc.setter
+    def tile_alloc(self, alloc: VGPRTileAllocator) -> None:
+        self._tile_alloc = alloc
+
+    def emit_k_loop(self, module) -> None:
+        """Partition-ordered K-loop.
+
+        For each K-iteration, iterate over partitions sequentially.
+        Within each partition: LDS reads -> MFMAs, then release VGPRs.
+        """
+        import stinkytofu as st
+        tile = self.tile
+
+        if not tile.subtiling_enabled or not tile.partition:
+            # Fall back to flat schedule
+            super().emit_k_loop(module)
+            return
+
+        sub = tile.subtile
+        part = tile.partition
+        n_st_m = tile.num_subtiles_m
+        n_st_n = tile.num_subtiles_n
+        parts_m = n_st_m // part.partition_m
+        parts_n = n_st_n // part.partition_n
+
+        module.add(st.Label("k_loop_subtiled"))
+
+        for ki in range(tile.k_iterations):
+            module.add(st.Label(f"k_iter_{ki}"))
+
+            part_idx = 0
+            for pm in range(parts_m):
+                for pn in range(parts_n):
+                    self.emit_partition(
+                        module, ki, part_idx,
+                        m_start=pm * part.partition_m,
+                        n_start=pn * part.partition_n,
+                    )
+                    part_idx += 1
+
+    def emit_partition(self, module, k_iter: int, part_idx: int,
+                       m_start: int, n_start: int) -> None:
+        """Emit one partition: LDS reads then MFMAs for a subtile group.
+
+        Override this to interleave LDS reads with MFMAs within the
+        partition for latency hiding.
+        """
+        import stinkytofu as st
+        tile = self.tile
+        part = tile.partition
+        mfma = tile.mfma
+
+        module.add(st.Label(f"partition_{part_idx}_k{k_iter}"))
+
+        # LDS reads for this partition's subtiles
+        for sm in range(part.partition_m):
+            self.emitter.emit_lds_read(module, k_iter)
+        for sn in range(part.partition_n):
+            self.emitter.emit_lds_read(module, k_iter)
+
+        # MFMAs for this partition's subtiles
+        acc_per = mfma.acc_vgprs
+        for sm in range(part.partition_m):
+            for sn in range(part.partition_n):
+                global_m = m_start + sm
+                global_n = n_start + sn
+                acc_off = (global_m * tile.mfma_n_repeat + global_n) * acc_per
+                module.add(st.MFMA(
+                    instType=mfma.input_type,
+                    accType=mfma.acc_type,
+                    m=mfma.m, n=mfma.n, k=mfma.k,
+                    blocks=mfma.blocks, mfma1k=False,
+                    acc=self.emitter._acc("acc_C", acc_off, acc_per),
+                    a=self.emitter._v("v_a", 0, mfma.a_vgprs),
+                    b=self.emitter._v("v_b", 0, mfma.b_vgprs),
+                    comment=f"MFMA st_m{global_m}_n{global_n} k{k_iter} p{part_idx}",
+                ))

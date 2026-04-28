@@ -22,7 +22,10 @@ from typing import List, Optional, Tuple
 
 from .transforms import Dim, Tile, Flatten, TileDescriptor, tile_hierarchy
 
-__all__ = ["DataType", "GemmProblem", "MfmaConfig", "TileConfig"]
+__all__ = [
+    "DataType", "GemmProblem", "MfmaConfig", "SubTileConfig",
+    "PartitionConfig", "TileConfig",
+]
 
 
 class DataType(Enum):
@@ -78,6 +81,79 @@ class MfmaConfig:
 
 
 # ---------------------------------------------------------------------------
+# Sub-tile configuration
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SubTileConfig:
+    """Defines a sub-tile: the fundamental scheduling unit within a wave tile.
+
+    A sub-tile groups a small number of MFMA instructions along M and K.
+    The key property: VGPR operand registers are allocated per-subtile
+    and can be **recycled** across partitions, reducing peak VGPR pressure.
+
+    Dimensions (data-type-independent in bytes):
+        ``subtile_m``      -- elements per sub-tile in M/N (typically = mfma.m)
+        ``subtile_k_bytes`` -- bytes per sub-tile in K (typically 128 = 1 cache line)
+
+    The shape ``[subtile_m_mfmas, subtile_k_mfmas]`` describes how many
+    MFMA tiles fit in one sub-tile::
+
+        subtile_m_mfmas = subtile_m / mfma.m   (usually 1)
+        subtile_k_mfmas = subtile_k_elems / mfma.k  (usually 1-2)
+
+    See ``shared/rocroller/docs/subtile_dimensions.md`` for diagrams.
+    """
+    subtile_m: int = 16        # elements per sub-tile in M/N
+    subtile_k_bytes: int = 128 # bytes per sub-tile in K
+
+    def subtile_k_elems(self, element_bytes: int) -> int:
+        """K-dimension elements per sub-tile for a given data type."""
+        return self.subtile_k_bytes // element_bytes
+
+    def num_subtiles_m(self, wave_m: int) -> int:
+        """Number of sub-tiles along M within one wave tile."""
+        return wave_m // self.subtile_m
+
+    def num_subtiles_k(self, unroll_k: int, element_bytes: int) -> int:
+        """Number of sub-tiles along K within one unroll tile."""
+        return unroll_k // self.subtile_k_elems(element_bytes)
+
+    def subtile_k_mfmas(self, mfma_k: int, element_bytes: int) -> int:
+        """MFMA K-iterations within one sub-tile's K span."""
+        return self.subtile_k_elems(element_bytes) // mfma_k
+
+
+@dataclass(frozen=True)
+class PartitionConfig:
+    """Groups of sub-tiles that are scheduled together.
+
+    Within one partition, all LDS reads happen before all MFMAs.
+    Across partitions, execution is strictly sequential::
+
+        LDS_read_p0 -> MFMA_p0 -> LDS_read_p1 -> MFMA_p1 -> ...
+
+    This enables VGPR reuse: operand registers from partition 0 are
+    freed before partition 1 allocates its operands.
+
+    ``partition_m x partition_n`` is the number of *sub-tiles* per
+    partition along M and N.
+    """
+    partition_m: int = 2  # sub-tiles per partition along M
+    partition_n: int = 2  # sub-tiles per partition along N
+
+    @property
+    def subtiles_per_partition(self) -> int:
+        return self.partition_m * self.partition_n
+
+    def num_partitions(self, num_subtiles_m: int, num_subtiles_n: int) -> int:
+        """Total partitions covering the full wave tile."""
+        pm = math.ceil(num_subtiles_m / self.partition_m)
+        pn = math.ceil(num_subtiles_n / self.partition_n)
+        return pm * pn
+
+
+# ---------------------------------------------------------------------------
 # Tile configuration
 # ---------------------------------------------------------------------------
 
@@ -104,6 +180,66 @@ class TileConfig:
     lds_pad: int = 0         # LDS padding per row (bytes)
     prefetch_stages: int = 1 # number of software-pipeline stages
     vector_width: int = 8    # elements per global load (fp16: 8 = 16 B)
+    subtile: Optional[SubTileConfig] = None     # None = subtiling disabled
+    partition: Optional[PartitionConfig] = None  # None = no partitioning
+
+    # -- subtile-derived quantities -----------------------------------------
+
+    @property
+    def subtiling_enabled(self) -> bool:
+        return self.subtile is not None
+
+    @property
+    def num_subtiles_m(self) -> int:
+        """Sub-tiles along M within one wave tile."""
+        if not self.subtile:
+            return self.mfma_m_repeat
+        return self.subtile.num_subtiles_m(self.m_per_wave)
+
+    @property
+    def num_subtiles_n(self) -> int:
+        if not self.subtile:
+            return self.mfma_n_repeat
+        return self.subtile.num_subtiles_m(self.n_per_wave)  # same formula
+
+    @property
+    def num_partitions(self) -> int:
+        """Total partitions per wave (1 if partitioning disabled)."""
+        if not self.partition:
+            return 1
+        return self.partition.num_partitions(
+            self.num_subtiles_m, self.num_subtiles_n,
+        )
+
+    @property
+    def vgpr_a_per_subtile(self) -> int:
+        """VGPR operand registers for A per sub-tile."""
+        if not self.subtile:
+            return self.mfma.a_vgprs
+        k_mfmas = self.subtile.subtile_k_mfmas(self.mfma.k, 2)  # 2 = f16 bytes
+        return self.mfma.a_vgprs * k_mfmas
+
+    @property
+    def vgpr_b_per_subtile(self) -> int:
+        if not self.subtile:
+            return self.mfma.b_vgprs
+        k_mfmas = self.subtile.subtile_k_mfmas(self.mfma.k, 2)
+        return self.mfma.b_vgprs * k_mfmas
+
+    @property
+    def live_vgprs_per_partition(self) -> int:
+        """Peak VGPR operand pressure within one partition.
+
+        This is what subtiling reduces: only one partition's operands
+        are live at a time.
+        """
+        if not self.partition:
+            # Without partitioning, all operands are live simultaneously
+            return (self.mfma_m_repeat * self.mfma.a_vgprs
+                    + self.mfma_n_repeat * self.mfma.b_vgprs)
+        st = self.partition
+        return (st.partition_m * self.vgpr_a_per_subtile
+                + st.partition_n * self.vgpr_b_per_subtile)
 
     # -- derived quantities -------------------------------------------------
 
@@ -157,6 +293,22 @@ class TileConfig:
             raise ValueError("n_per_wave must be divisible by mfma.n")
         if self.unroll_k % self.mfma.k != 0:
             raise ValueError("unroll_k must be divisible by mfma.k")
+        if self.subtile:
+            if self.m_per_wave % self.subtile.subtile_m != 0:
+                raise ValueError("m_per_wave must be divisible by subtile_m")
+            if self.n_per_wave % self.subtile.subtile_m != 0:
+                raise ValueError("n_per_wave must be divisible by subtile_m")
+        if self.partition and not self.subtile:
+            raise ValueError("partition requires subtile to be set")
+        if self.partition:
+            if self.num_subtiles_m % self.partition.partition_m != 0:
+                raise ValueError(
+                    "num_subtiles_m must be divisible by partition_m"
+                )
+            if self.num_subtiles_n % self.partition.partition_n != 0:
+                raise ValueError(
+                    "num_subtiles_n must be divisible by partition_n"
+                )
 
     # -- tile descriptors ---------------------------------------------------
 
@@ -213,6 +365,19 @@ class TileConfig:
             f"x {self.k_iterations}  "
             f"({self.total_mfma_per_wave} per wave per unroll)",
         ]
+        if self.subtile:
+            lines.append(
+                f"Subtile        : {self.subtile.subtile_m} elems M, "
+                f"{self.subtile.subtile_k_bytes} bytes K  "
+                f"({self.num_subtiles_m}x{self.num_subtiles_n} per wave)"
+            )
+        if self.partition:
+            lines.append(
+                f"Partitions     : {self.partition.partition_m}x"
+                f"{self.partition.partition_n} subtiles/part  "
+                f"({self.num_partitions} total, "
+                f"{self.live_vgprs_per_partition} operand VGPRs live)"
+            )
         return "\n".join(lines)
 
 

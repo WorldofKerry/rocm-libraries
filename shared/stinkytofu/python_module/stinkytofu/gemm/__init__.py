@@ -44,9 +44,13 @@ from .transforms import (
     Dim, Transform, PassThrough, Tile, Flatten, Pad, Embed, Xor,
     TileDescriptor, tile_hierarchy,
 )
-from .problem import DataType, GemmProblem, TileConfig, MfmaConfig
+from .problem import (
+    DataType, GemmProblem, TileConfig, MfmaConfig,
+    SubTileConfig, PartitionConfig,
+)
 from .codegen import (
     RegisterAllocator, ThreadMapping, Emitter, GemmSchedule, GemmCodegen,
+    VGPRTileAllocator, SubtiledSchedule,
 )
 from .kernel import KernelResult, generate_gemm_kernel
 
@@ -56,8 +60,10 @@ __all__ = [
     "TileDescriptor", "tile_hierarchy",
     # problem
     "DataType", "GemmProblem", "TileConfig", "MfmaConfig",
+    "SubTileConfig", "PartitionConfig",
     # codegen layers
     "RegisterAllocator", "ThreadMapping", "Emitter", "GemmSchedule", "GemmCodegen",
+    "VGPRTileAllocator", "SubtiledSchedule",
     # top-level
     "KernelResult", "generate_gemm_kernel",
 ]
