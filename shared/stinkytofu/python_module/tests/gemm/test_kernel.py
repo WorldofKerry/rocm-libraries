@@ -190,10 +190,13 @@ class TestFullGeneration:
             mfma=MfmaConfig.f16_16x16x16(),
         )
         result = generate_gemm_kernel(p, t)
-        n_mfma = st.countMFMA(result.module)
         # Expected: mfma_m_repeat * mfma_n_repeat * k_iterations
         expected = t.mfma_m_repeat * t.mfma_n_repeat * t.k_iterations
-        assert n_mfma == expected
+        # Count MFMA instructions in the IR dump
+        dump = result.module.dump()
+        # Each MFMA shows as "MFMA" in the logical IR dump
+        n_mfma = dump.count("MFMA m")  # matches "MFMA m0_n0", "MFMA m1_n0", etc.
+        assert n_mfma == expected, f"Expected {expected} MFMAs, got {n_mfma}"
 
     def test_has_barrier(self):
         import stinkytofu as st

@@ -475,13 +475,16 @@ def build_gemm_tile_tree(
 ) -> TileLevel:
     """Build the standard GEMM tile tree.
 
-    Without subtiling (subtile_m=None)::
+    The tree represents what **one wave** executes.  Waves run in
+    parallel on the hardware; the tree is the per-wave codegen scope.
 
-        workgroup(m, n, k) -> wave(m/wm, n/wn) -> mfma(mm, mn, mk)
+    Without subtiling::
+
+        wave(m_per_wave, n_per_wave, k=unroll_k) -> mfma(mm, mn, mk)
 
     With subtiling::
 
-        workgroup -> wave -> subtile(sm, sn) [partitioned] -> mfma
+        wave -> subtile(sm, sn) [partitioned] -> mfma
     """
     mfma = TileLevel("mfma", m=mfma_m, n=mfma_n, k=mfma_k)
 
@@ -496,14 +499,13 @@ def build_gemm_tile_tree(
             partitioned=True,
             partition_m=partition_m, partition_n=partition_n,
         )
-        wave = TileLevel("wave", m=wave_m, n=wave_n, inner=subtile)
+        wave = TileLevel("wave", m=wave_m, n=wave_n, k=unroll_k,
+                         inner=subtile)
     else:
-        wave = TileLevel("wave", m=wave_m, n=wave_n, inner=mfma)
+        wave = TileLevel("wave", m=wave_m, n=wave_n, k=unroll_k,
+                         inner=mfma)
 
-    workgroup = TileLevel(
-        "workgroup", m=wg_m, n=wg_n, k=unroll_k, inner=wave,
-    )
-    return workgroup
+    return wave
 
 
 def walk_tile_tree(

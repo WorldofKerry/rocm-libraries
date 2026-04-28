@@ -392,8 +392,10 @@ class Emitter:
                     self._v("v_store_tmp"), self._v("v_store_tmp"),
                     comment="cvt f32->f16",
                 ))
-                module.add(st.FlatStoreB16(
-                    self._v("v_addr_d", 0, 2), self._v("v_store_tmp"),
+                module.add(st.FlatStoreB32(
+                    self._v("v_addr_d", 0, 2),
+                    self._v("v_store_tmp"),
+                    self._v("v_store_tmp"),
                     comment=f"store D tile{t_idx}[{r}]",
                 ))
 
