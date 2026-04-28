@@ -60,8 +60,8 @@ class TestGemmKernelBuild:
         names = kernel.tile_tree.phase_names()
         expected = [
             "load_kernargs", "thread_indexing", "load_cluster_setup",
-            "lds_write_addrs", "lds_read_addrs", "init_acc",
-            "global_addr_a", "global_addr_b", "k_loop_init", "k_loop_label",
+            "lds_addrs", "init_acc",
+            "global_addrs", "k_loop_init", "k_loop_label",
             "store_d",
             "global_load", "lds_write",
             "k_advance", "k_loop_control",
@@ -158,11 +158,11 @@ class TestPhaseReplacement:
 
     def test_replace_k_advance(self):
         """Custom K-advance adds a marker comment."""
-        from stinkytofu.gemm.asm_emitter import _phase_k_advance
+        from stinkytofu.gemm.phases import phase_k_advance
 
         def custom_advance(level, ctx):
             ctx.comment("CUSTOM_MARKER")
-            _phase_k_advance(level, ctx)
+            phase_k_advance(level, ctx)
 
         kernel = GemmKernel.build(GemmProblem(128, 128, 32))
         kernel.tile_tree = kernel.tile_tree.replace_phase(
@@ -187,8 +187,8 @@ class TestPhaseReplacement:
         def custom_load(level, ctx):
             ctx.comment("CUSTOM_LOAD")
             # Still need to do the actual load for correctness
-            from stinkytofu.gemm.asm_emitter import _phase_global_load
-            _phase_global_load(level, ctx)
+            from stinkytofu.gemm.phases import phase_global_load
+            phase_global_load(level, ctx)
 
         kernel = GemmKernel.build(GemmProblem(128, 128, 32))
         kernel.tile_tree = kernel.tile_tree.replace_phase(

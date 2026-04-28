@@ -302,18 +302,11 @@ class TestPipelinedKernel:
         (1024, 1024, 1024),
     ])
     def test_pipelined_correct(self, M, N, K):
-        from stinkytofu.gemm.asm_emitter import build_pipelined_gemm_tree
-        from stinkytofu.gemm.asm_transforms import GemmLayouts
-        from stinkytofu.gemm.problem import TileConfig
-
         hip = HIP
         problem = GemmProblem(m=M, n=N, k=K)
-        tile = TileConfig()
-        problem.validate(tile)
-        layouts = GemmLayouts.build(problem, tile)
-        tree = build_pipelined_gemm_tree(problem, tile, layouts)
-        kernel = GemmKernel.build(problem, tile_tree=tree)
+        kernel = GemmKernel.build(problem, pipelined=True)
         result = kernel.emit()
+        tile = kernel.tile
         co = result.assemble(output_path=f"/tmp/test_pipe_{M}_{N}_{K}.co")
 
         elem = 2
@@ -361,10 +354,6 @@ class TestPipelinedKernel:
     def test_pipelined_faster(self):
         """Pipelined kernel should be faster than baseline at 4096^3."""
         import time
-        from stinkytofu.gemm.asm_emitter import build_pipelined_gemm_tree
-        from stinkytofu.gemm.asm_transforms import GemmLayouts
-        from stinkytofu.gemm.problem import TileConfig
-
         hip = HIP
         M = N = K = 4096
         problem = GemmProblem(m=M, n=N, k=K)
@@ -406,9 +395,7 @@ class TestPipelinedKernel:
         base_tflops = bench(base_kernel)
 
         # Pipelined
-        layouts = GemmLayouts.build(problem, tile)
-        tree = build_pipelined_gemm_tree(problem, tile, layouts)
-        pipe_kernel = GemmKernel.build(problem, tile_tree=tree)
+        pipe_kernel = GemmKernel.build(problem, pipelined=True)
         pipe_tflops = bench(pipe_kernel)
 
         assert pipe_tflops > base_tflops * 2, \

@@ -138,16 +138,10 @@ def bench_our_kernel(
 ) -> float:
     """Generate, assemble, and benchmark our GEMM kernel. Returns TFLOPS."""
     from .kernel_pipeline import GemmKernel
-    from .problem import GemmProblem, TileConfig
-    from .asm_emitter import build_pipelined_gemm_tree
-    from .asm_transforms import GemmLayouts
+    from .problem import GemmProblem
 
     problem = GemmProblem(m=M, n=N, k=K)
-    tile = TileConfig()
-    problem.validate(tile)
-    layouts = GemmLayouts.build(problem, tile)
-    tree = build_pipelined_gemm_tree(problem, tile, layouts)
-    kernel = GemmKernel.build(problem, tile_tree=tree)
+    kernel = GemmKernel.build(problem, pipelined=True)
     result = kernel.emit()
 
     with tempfile.TemporaryDirectory(prefix="stinkytofu_bench_") as tmpdir:

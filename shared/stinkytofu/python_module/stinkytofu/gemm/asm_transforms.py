@@ -7,27 +7,27 @@ assembly emitter (asm_context.py).  The key function ``emit_affine``
 takes an ``Embed`` transform plus register bindings and emits the
 multiply-accumulate chain as assembly instructions.
 
-This replaces hardcoded offset formulas in asm_emitter.py with
-composable, inspectable transform-based address computation.
+Supports both static coefficients (compile-time constants) and
+**dynamic coefficients** (runtime values in registers, e.g. K, N
+from kernel arguments).  This lets ALL address computation -- LDS,
+global load, store -- go through the same transform system.
 
 Example::
 
-    from .transforms import Dim, Embed
-    from .asm_transforms import emit_affine
+    # Static coefficients (LDS layout)
+    lds_layout = Embed([Dim("row", 128), Dim("col", 32)],
+                       Dim("offset", 4096), [32, 1])
+    emit_affine(ctx, lds_layout,
+                bindings={"row": "v5", "col": "v6"},
+                result="v7", scale=2)
 
-    # Declare: lds_offset = row * unroll_k + col
-    layout = Embed(
-        [Dim("row", 128), Dim("col", 32)],
-        Dim("lds_offset", 128 * 32),
-        [32, 1],
-    )
-
-    # Emit assembly
-    emit_affine(ctx, layout,
-                bindings={"row": ctx.vreg("v_gload_row"),
-                           "col": ctx.vreg("v_gload_col")},
-                result="v_lds_wr_a",
-                scale=2)  # * elem_bytes
+    # Dynamic coefficient (global address: offset = m * K + k)
+    global_layout = Embed([Dim("m", M), Dim("k", K)],
+                          Dim("offset", M*K), [K, 1])
+    emit_affine(ctx, global_layout,
+                bindings={"m": "v5", "k": "v6"},
+                result="v7", scale=2,
+                dynamic_coefficients={"m": "s4"})  # K is in s4
 """
 from __future__ import annotations
 
@@ -55,34 +55,50 @@ def emit_affine(
     result: str,
     scale: int = 1,
     base: Optional[str] = None,
+    dynamic_coefficients: Optional[Dict[str, str]] = None,
     comment: str = "",
 ) -> None:
-    """Emit assembly for an affine offset: ``result = sum(dim_i * coeff_i) * scale + base``.
+    """Emit assembly for an affine offset.
+
+    Computes: ``result = sum(dim_i * coeff_i) * scale + base``
 
     Args:
         ctx:      AsmContext to emit into.
         embed:    Embed transform describing the affine combination.
         bindings: Maps dimension names to assembly operands (vreg/sreg
-                  names like ``"v5"`` or ``"s14"``).  These come from
-                  ``ctx.vreg("name")`` / ``ctx.sreg("name")``.
-        result:   Destination vreg name (e.g. ``ctx.vreg("v_lds_wr_a")``).
+                  names like ``"v5"`` or ``"s14"``).
+        result:   Destination vreg name.
         scale:    Multiply the final sum by this (typically elem_bytes).
                   Must be a power of 2 (emitted as shift).
         base:     Optional base operand to add after scaling.
+        dynamic_coefficients:
+                  Maps dimension names to register operands for runtime
+                  coefficients.  When set, the coefficient for that dim
+                  comes from the register instead of the static Embed
+                  value.  E.g. ``{"m": ctx.sreg("s_K")}`` means the
+                  coefficient of "m" is the runtime value of K.
         comment:  Comment for the first instruction.
     """
     dims = embed.upper_dims
     coeffs = embed._coefficients
+    dyn = dynamic_coefficients or {}
     first = True
 
     for dim, coeff in zip(dims, coeffs):
-        if coeff == 0:
+        if coeff == 0 and dim.name not in dyn:
             continue
         operand = bindings[dim.name]
 
+        # Use dynamic coefficient register if provided, else static
+        is_dynamic = dim.name in dyn
+        coeff_reg = dyn.get(dim.name)
+
         if first:
-            # First term: result = operand * coeff
-            if coeff == 1:
+            if is_dynamic:
+                # result = operand * coeff_reg (runtime multiply)
+                ctx.v_mul(result, coeff_reg, operand,
+                          comment=comment or f"{dim.name} * {dim.name}_coeff")
+            elif coeff == 1:
                 ctx.v_mov(result, operand,
                           comment=comment or f"{dim.name}")
             elif _is_pow2(coeff):
@@ -93,12 +109,16 @@ def emit_affine(
                           comment=comment or f"{dim.name} * {coeff}")
             first = False
         else:
-            # Subsequent terms: result += operand * coeff
-            if coeff == 1:
+            if is_dynamic:
+                tmp = ctx.vreg("v_tmp0")
+                ctx.v_mul(tmp, coeff_reg, operand,
+                          comment=f"{dim.name} * {dim.name}_coeff")
+                ctx.v_add(result, result, tmp,
+                          comment=f"+ {dim.name} * dyn")
+            elif coeff == 1:
                 ctx.v_add(result, result, operand,
                           comment=f"+ {dim.name}")
             else:
-                # Need a temp register for the multiply
                 tmp = ctx.vreg("v_tmp0")
                 if _is_pow2(coeff):
                     ctx.v_lshl(tmp, operand, _log2(coeff),
@@ -110,7 +130,6 @@ def emit_affine(
                           comment=f"+ {dim.name} * {coeff}")
 
     if first:
-        # All coefficients were 0
         ctx.v_mov(result, "0", comment=comment or "zero offset")
 
     # Scale by element size
@@ -146,21 +165,24 @@ class GemmLayouts:
     calls ``emit_affine()`` with the appropriate register bindings
     to produce the actual address computation instructions.
 
-    These are the *same* transforms from ``transforms.py``, now
-    wired into the assembly pipeline.
+    For global memory layouts, some coefficients are **dynamic** --
+    they depend on runtime values (K, N) loaded from kernel arguments.
+    The ``dynamic_dims`` dict maps dimension names to the SGPR that
+    holds the runtime coefficient.  Codegen passes this to
+    ``emit_affine(dynamic_coefficients=...)``.
     """
     # LDS layouts: (row, col) -> element offset within LDS region
-    lds_a: Embed
-    lds_b: Embed
+    lds_a: Embed     # A[row, col]: offset = row * unroll_k + col
+    lds_b: Embed     # B[row, col]: offset = row * unroll_k + col
 
-    # Global memory: (row, col) -> element offset from base pointer
-    # Coefficients for "col" are dynamic (= K from kernarg)
-    global_a_row_major: Embed  # A[m, k]: offset = m * K + k
-    global_b_row_major: Embed  # B[n, k]: offset = n * K + k
+    # Global memory layouts (some coefficients are dynamic)
+    global_a: Embed  # A[m, k]: offset = m * K + k  (K is dynamic)
+    global_b: Embed  # B[n, k]: offset = n * K + k  (K is dynamic)
+    global_d: Embed  # D[m, n]: offset = m * N + n  (N is dynamic)
 
-    # Output: (row, col) -> element offset from D base pointer
-    # Coefficient for "col" is dynamic (= N from kernarg)
-    global_d_row_major: Embed  # D[m, n]: offset = m * N + n
+    # Which dimensions have dynamic (runtime) coefficients.
+    # Maps: dim_name -> sgpr_name (set after kernarg load).
+    dynamic_dims: Dict[str, str]
 
     # LDS byte offset where B region starts
     lds_b_offset: int
@@ -188,32 +210,51 @@ class GemmLayouts:
                 Dim("lds_b_offset", tile.wg_n * uk),
                 [uk, 1],
             ),
-            global_a_row_major=Embed(
+            global_a=Embed(
                 [Dim("m", problem.m), Dim("k", problem.k)],
                 Dim("a_offset", problem.m * problem.k),
-                [problem.k, 1],  # K is dynamic at runtime
+                [problem.k, 1],
             ),
-            global_b_row_major=Embed(
+            global_b=Embed(
                 [Dim("n", problem.n), Dim("k", problem.k)],
                 Dim("b_offset", problem.n * problem.k),
                 [problem.k, 1],
             ),
-            global_d_row_major=Embed(
+            global_d=Embed(
                 [Dim("m", problem.m), Dim("n", problem.n)],
                 Dim("d_offset", problem.m * problem.n),
                 [problem.n, 1],
             ),
+            dynamic_dims={
+                "m_for_a": "s_K",  # A's m-coefficient is K (runtime)
+                "n_for_b": "s_K",  # B's n-coefficient is K (runtime)
+                "m_for_d": "s_N",  # D's m-coefficient is N (runtime)
+            },
             lds_b_offset=lds_b_offset,
             elem_bytes=elem,
         )
+
+    # -- Backward compat aliases (used by existing code) --
+
+    @property
+    def global_a_row_major(self) -> Embed:
+        return self.global_a
+
+    @property
+    def global_b_row_major(self) -> Embed:
+        return self.global_b
+
+    @property
+    def global_d_row_major(self) -> Embed:
+        return self.global_d
 
     def summary(self) -> str:
         lines = [
             f"LDS A: {self.lds_a}",
             f"LDS B: {self.lds_b} (offset={self.lds_b_offset})",
-            f"Global A: {self.global_a_row_major}",
-            f"Global B: {self.global_b_row_major}",
-            f"Global D: {self.global_d_row_major}",
+            f"Global A: {self.global_a}  [m coeff is dynamic: K]",
+            f"Global B: {self.global_b}  [n coeff is dynamic: K]",
+            f"Global D: {self.global_d}  [m coeff is dynamic: N]",
             f"elem_bytes: {self.elem_bytes}",
         ]
         return "\n".join(lines)
