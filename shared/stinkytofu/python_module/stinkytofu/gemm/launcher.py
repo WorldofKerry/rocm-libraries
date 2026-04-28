@@ -253,20 +253,13 @@ class GemmLauncher:
         alpha = ctypes.c_float(p.alpha)
         beta = ctypes.c_float(p.beta)
 
-        # Pack args as void** array
-        args = (ctypes.c_void_p * 11)(
-            ctypes.cast(ctypes.byref(d_A), ctypes.c_void_p),
-            ctypes.cast(ctypes.byref(d_B), ctypes.c_void_p),
-            ctypes.cast(ctypes.byref(d_D), ctypes.c_void_p),
-            ctypes.cast(ctypes.byref(M), ctypes.c_void_p),
-            ctypes.cast(ctypes.byref(N), ctypes.c_void_p),
-            ctypes.cast(ctypes.byref(K), ctypes.c_void_p),
-            ctypes.cast(ctypes.byref(lda), ctypes.c_void_p),
-            ctypes.cast(ctypes.byref(ldb), ctypes.c_void_p),
-            ctypes.cast(ctypes.byref(ldd), ctypes.c_void_p),
-            ctypes.cast(ctypes.byref(alpha), ctypes.c_void_p),
-            ctypes.cast(ctypes.byref(beta), ctypes.c_void_p),
-        )
+        # Pack args for hipModuleLaunchKernel.
+        # Each element must be a pointer to the argument value.
+        # We keep references alive by storing them in a list first.
+        _arg_vals = [d_A, d_B, d_D, M, N, K, lda, ldb, ldd, alpha, beta]
+        args = (ctypes.c_void_p * len(_arg_vals))()
+        for i, v in enumerate(_arg_vals):
+            args[i] = ctypes.cast(ctypes.pointer(v), ctypes.c_void_p)
 
         # Grid / block dims
         grid_m, grid_n = p.grid_dims(self.tile)

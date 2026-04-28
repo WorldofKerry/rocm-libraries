@@ -257,6 +257,11 @@ def _emit_workgroup_prologue(ctx: TileContext, tile: TileConfig) -> None:
     _emit_thread_indices(ctx, tile)
     _emit_init_acc(ctx)
 
+    # Compute real addresses using coordinate transforms
+    from .addressing import AddressComputer
+    addr = AddressComputer(ctx._metadata["problem"], tile)
+    addr.emit_all_prologue(ctx)
+
     _label(ctx, "global_load")
     _emit_buffer_loads(ctx, "v_gload_a", "v_addr_a", "A")
     _emit_buffer_loads(ctx, "v_gload_b", "v_addr_b", "B")
