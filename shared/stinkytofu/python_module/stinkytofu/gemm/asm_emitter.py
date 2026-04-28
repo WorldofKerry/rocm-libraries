@@ -24,7 +24,7 @@ from .tile import TileLevel, TilePhase, build_gemm_tile_tree, walk_tile_tree
 from .asm_transforms import emit_affine, GemmLayouts
 from .transforms import Embed, Dim
 
-__all__ = ["AsmKernel", "emit_gemm_asm", "assemble_kernel", "build_full_gemm_tree"]
+__all__ = ["AsmKernel", "emit_gemm_asm", "assemble_kernel", "build_full_gemm_tree", "build_pipelined_gemm_tree"]
 
 
 @dataclass
@@ -953,9 +953,128 @@ def _phase_k_loop_control(level, ctx):
              comment="branch if k_tiles > 0")
     ctx.raw("")
 
+def _emit_store_d_optimized(ctx, problem, tile):
+    """Optimized store: compute address once per (mi,ni), stride for ai.
+
+    For v_mfma_f32_16x16x16_f16, within one MFMA tile each lane has
+    4 acc values at consecutive M-rows (same N-column).  Address
+    difference between ai and ai+1 is N * elem_bytes (one row stride).
+    We compute the full address once per (mi, ni, ai=0) and add
+    N * elem_bytes for each subsequent ai.
+    """
+    mfma = tile.mfma
+    acc_per = mfma.acc_vgprs
+    elem = problem.element_bytes
+
+    ctx.comment("Optimized epilogue: store D")
+
+    # MFMA 16x16x16 output mapping:
+    #   d_m = (lane_id/16)*4 + acc_index
+    #   d_n = lane_id % 16
+    ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.m - 1,
+              comment="lane_n = lane_id % 16")
+    ctx.v_lshr(ctx.vreg("v_tmp1"), ctx.vreg("v_lane_id"),
+               int(math.log2(mfma.m)),
+               comment="lane_id / 16")
+    ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_tmp1"), 2,
+               comment="* 4 -> lane_m_base")
+
+    # Compute row stride in bytes: N * elem_bytes
+    # N is dynamic (in s_N), so: row_stride_bytes = s_N << log2(elem)
+    ctx.s_lshl(ctx.sreg("s_tmp0"), ctx.sreg("s_N"),
+               int(math.log2(elem)),
+               comment=f"row_stride = N * {elem} bytes")
+
+    for mi in range(tile.mfma_m_repeat):
+        for ni in range(tile.mfma_n_repeat):
+            acc_base = (mi * tile.mfma_n_repeat + ni) * acc_per
+
+            # Compute base address for (mi, ni, ai=0)
+            # row = wg_base_m + wave_m*m_per_wave + mi*mfma_m + lane_m_base
+            ctx.v_mul(ctx.vreg("v_addr_d", 0, 1),
+                      str(tile.m_per_wave), ctx.vreg("v_wave_m"),
+                      comment=f"wave_m * {tile.m_per_wave}")
+            ctx.v_add(ctx.vreg("v_addr_d", 0, 1),
+                      ctx.vreg("v_addr_d", 0, 1), ctx.vreg("v_tmp1"),
+                      comment="+ lane_m_base")
+            row_imm = mi * mfma.m
+            if row_imm:
+                ctx.v_add(ctx.vreg("v_addr_d", 0, 1), str(row_imm),
+                          ctx.vreg("v_addr_d", 0, 1),
+                          comment=f"+ mi*mfma_m ({row_imm})")
+            ctx.s_mul(ctx.sreg("s_tmp1"), ctx.sreg("s_wg_id_x"),
+                      str(tile.wg_m), comment=f"wg_id_x * {tile.wg_m}")
+            ctx.v_add(ctx.vreg("v_addr_d", 0, 1), ctx.sreg("s_tmp1"),
+                      ctx.vreg("v_addr_d", 0, 1), comment="+ wg_base_m")
+            # row * N
+            ctx.v_mul(ctx.vreg("v_addr_d", 0, 1), ctx.sreg("s_N"),
+                      ctx.vreg("v_addr_d", 0, 1), comment="* N")
+
+            # col = wg_base_n + wave_n*n_per_wave + ni*mfma_n + lane_n
+            col_imm = ni * mfma.n
+            ctx.v_mul(ctx.vreg("v_addr_d", 1, 1),
+                      str(tile.n_per_wave), ctx.vreg("v_wave_n"),
+                      comment=f"wave_n * {tile.n_per_wave}")
+            ctx.v_add(ctx.vreg("v_addr_d", 1, 1),
+                      ctx.vreg("v_addr_d", 1, 1), ctx.vreg("v_tmp0"),
+                      comment="+ lane_n")
+            if col_imm:
+                ctx.v_add(ctx.vreg("v_addr_d", 1, 1), str(col_imm),
+                          ctx.vreg("v_addr_d", 1, 1),
+                          comment=f"+ ni*mfma_n ({col_imm})")
+            ctx.s_mul(ctx.sreg("s_tmp1"), ctx.sreg("s_wg_id_y"),
+                      str(tile.wg_n), comment=f"wg_id_y * {tile.wg_n}")
+            ctx.v_add(ctx.vreg("v_addr_d", 1, 1), ctx.sreg("s_tmp1"),
+                      ctx.vreg("v_addr_d", 1, 1), comment="+ wg_base_n")
+
+            # offset = row*N + col
+            ctx.v_add(ctx.vreg("v_addr_d", 0, 1),
+                      ctx.vreg("v_addr_d", 0, 1),
+                      ctx.vreg("v_addr_d", 1, 1),
+                      comment="row*N + col")
+            ctx.v_lshl(ctx.vreg("v_addr_d", 0, 1),
+                       ctx.vreg("v_addr_d", 0, 1),
+                       int(math.log2(elem)), comment=f"* {elem} bytes")
+            # 64-bit: D_ptr + byte_offset
+            ctx.inst("v_add_co_u32", ctx.vreg("v_addr_d", 0, 1), "vcc",
+                     ctx.sreg("s_ptr_D", 0, 1), ctx.vreg("v_addr_d", 0, 1),
+                     comment="D_lo + offset")
+            ctx.v_mov(ctx.vreg("v_addr_d", 1, 1),
+                      ctx.sreg("s_ptr_D", 1, 1), comment="D_hi")
+            ctx.inst("v_addc_co_u32", ctx.vreg("v_addr_d", 1, 1), "vcc",
+                     ctx.vreg("v_addr_d", 1, 1), "0", "vcc",
+                     comment="D_hi + carry")
+
+            # Store 4 acc values using row stride
+            for ai in range(acc_per):
+                ctx.inst("v_accvgpr_read_b32", ctx.vreg("v_store_tmp"),
+                         ctx.areg("acc_C", acc_base + ai, 1),
+                         comment=f"acc[{acc_base+ai}]")
+                ctx.inst("v_cvt_f16_f32_e32", ctx.vreg("v_store_tmp"),
+                         ctx.vreg("v_store_tmp"), comment="f32->f16")
+                ctx.inst("global_store_short",
+                         ctx.vreg("v_addr_d", 0, 2),
+                         ctx.vreg("v_store_tmp"), "off",
+                         comment=f"store D m{mi}_n{ni}_a{ai}")
+                # Advance to next row (add row stride)
+                if ai < acc_per - 1:
+                    ctx.inst("v_add_co_u32",
+                             ctx.vreg("v_addr_d", 0, 1), "vcc",
+                             ctx.sreg("s_tmp0"),
+                             ctx.vreg("v_addr_d", 0, 1),
+                             comment="next row (+N*elem)")
+                    ctx.inst("v_addc_co_u32",
+                             ctx.vreg("v_addr_d", 1, 1), "vcc",
+                             ctx.vreg("v_addr_d", 1, 1), "0", "vcc",
+                             comment="carry")
+
+    ctx.s_waitcnt("vmcnt(0)", comment="wait for stores")
+    ctx.raw("")
+
+
 def _phase_store_d(level, ctx):
-    """Phase: store accumulators to D."""
-    _emit_store_d(ctx, ctx._metadata["problem"], ctx._metadata["tile"])
+    """Phase: store accumulators to D (optimized)."""
+    _emit_store_d_optimized(ctx, ctx._metadata["problem"], ctx._metadata["tile"])
 
 
 # ===================================================================
@@ -1026,4 +1145,340 @@ def build_full_gemm_tree(
         ],
     )
 
+    return workgroup_level
+
+
+# ===================================================================
+# Software-pipelined K-loop
+# ===================================================================
+
+def _phase_pipelined_k_loop(level, ctx):
+    """Phase: entire K-loop with software pipelining.
+
+    Overlaps global_load(n+1) with compute(n)::
+
+        prefetch tile[0]; wait
+        k_loop:
+          lds_write + barrier        (current tile VGPRs -> LDS)
+          k_tiles--
+          if k_tiles > 0:
+            advance ptrs
+            global_load tile[next]   (async, overlaps with compute)
+          compute                    (MFMA from LDS)
+          barrier                    (sync before next LDS write)
+          waitcnt 0                  (ensure any pending load done)
+          branch k_loop if k_tiles > 0
+
+    This is a single phase because the pipelining logic (conditional
+    prefetch, proper last-iteration handling) doesn't decompose well
+    into independent sub-phases.
+    """
+    tile = ctx._metadata["tile"]
+    problem = ctx._metadata["problem"]
+    kernel = ctx._metadata["kernel"]
+    elem = problem.element_bytes
+    k_stride = tile.unroll_k * elem
+
+    log2_uk = int(math.log2(tile.unroll_k))
+
+    # K-tile count
+    ctx.comment("Pipelined K-loop setup")
+    ctx.s_lshr(ctx.sreg("s_k_tiles"), ctx.sreg("s_K"), log2_uk,
+               comment=f"k_tiles = K / {tile.unroll_k}")
+    ctx.raw("")
+
+    # Prefetch first tile
+    ctx.comment("Prefetch first K-tile")
+    _emit_global_load(ctx, problem, tile)
+
+    # Loop start
+    ctx.label("k_loop")
+    ctx.raw("")
+
+    # Write current VGPRs to LDS
+    _emit_lds_write(ctx, tile)
+
+    # Decrement k_tiles BEFORE the conditional prefetch
+    ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
+              comment="k_tiles--")
+    ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
+             comment="SCC = (k_tiles != 0)")
+    ctx.inst("s_cbranch_scc0", "skip_prefetch",
+             comment="skip prefetch on last iteration")
+    ctx.raw("")
+
+    # Advance pointers + start async global load for next tile
+    ctx.comment("Advance ptrs + start loading next K-tile (async)")
+    ctx.inst("v_add_co_u32", ctx.vreg("v_addr_a", 0, 1), "vcc",
+             str(k_stride), ctx.vreg("v_addr_a", 0, 1),
+             comment=f"A += {k_stride}")
+    ctx.inst("v_addc_co_u32", ctx.vreg("v_addr_a", 1, 1), "vcc",
+             ctx.vreg("v_addr_a", 1, 1), "0", "vcc", comment="carry")
+    ctx.inst("v_add_co_u32", ctx.vreg("v_addr_b", 0, 1), "vcc",
+             str(k_stride), ctx.vreg("v_addr_b", 0, 1),
+             comment=f"B += {k_stride}")
+    ctx.inst("v_addc_co_u32", ctx.vreg("v_addr_b", 1, 1), "vcc",
+             ctx.vreg("v_addr_b", 1, 1), "0", "vcc", comment="carry")
+
+    # Issue global loads (no waitcnt -- overlaps with compute below)
+    a_load = ctx.get("v_gload_a")
+    b_load = ctx.get("v_gload_b")
+    addr_a = ctx.vreg("v_addr_a", 0, 2)
+    addr_b = ctx.vreg("v_addr_b", 0, 2)
+    for i in range(0, a_load.count, 4):
+        cnt = min(4, a_load.count - i)
+        width = {4: "dwordx4", 2: "dwordx2", 1: "dword"}[cnt]
+        dst = ctx.vreg("v_gload_a", i, cnt)
+        off = f"off offset:{i * 4}" if i > 0 else "off"
+        ctx.inst(f"global_load_{width}", dst, addr_a, off,
+                 comment=f"prefetch A[{i}:{i+cnt}]")
+    for i in range(0, b_load.count, 4):
+        cnt = min(4, b_load.count - i)
+        width = {4: "dwordx4", 2: "dwordx2", 1: "dword"}[cnt]
+        dst = ctx.vreg("v_gload_b", i, cnt)
+        off = f"off offset:{i * 4}" if i > 0 else "off"
+        ctx.inst(f"global_load_{width}", dst, addr_b, off,
+                 comment=f"prefetch B[{i}:{i+cnt}]")
+    ctx.raw("")
+
+    ctx.label("skip_prefetch")
+    ctx.raw("")
+
+    # Compute: walk tile tree for LDS read + MFMA
+    ctx.comment("Compute: MFMA from LDS (overlaps with global_load)")
+    tile_tree = kernel.tile_tree
+    wave = tile_tree.find("wave")
+    if wave and wave.inner:
+        walk_tile_tree(wave.inner, ctx,
+                       visitor=kernel.mfma_visitor)
+    ctx.raw("")
+
+    # Barrier: all waves done reading LDS before next write
+    ctx.s_barrier(comment="sync before next K-tile LDS write")
+
+    # Wait for any pending global load
+    ctx.s_waitcnt("0", comment="wait for any pending global_load")
+
+    # Loop control
+    ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
+             comment="SCC = (k_tiles != 0)")
+    ctx.inst("s_cbranch_scc1", "k_loop",
+             comment="branch if k_tiles > 0")
+    ctx.raw("")
+
+
+def build_pipelined_gemm_tree(
+    problem: GemmProblem,
+    tile: TileConfig,
+    layouts: GemmLayouts,
+) -> TileLevel:
+    """Build a tile tree with a software-pipelined K-loop.
+
+    The pipeline overlaps global_load(n+1) with compute(n).
+    The entire K-loop is a single phase because the pipelining
+    logic (conditional prefetch, last-iteration handling) doesn't
+    decompose into independent sub-phases.
+
+    Tree structure::
+
+        workgroup(parallel=True)
+          prologue: [load_kernargs, thread_indexing, ...,
+                     init_acc, global_addr_a, global_addr_b,
+                     pipelined_k_loop]
+          inner: wave -> mfma  (for tree queries, not walked directly)
+          epilogue: [store_d]
+    """
+    mfma_level = TileLevel(
+        "mfma", m=tile.mfma.m, n=tile.mfma.n, k=tile.mfma.k)
+
+    wave_level = TileLevel(
+        "wave",
+        m=tile.m_per_wave, n=tile.n_per_wave, k=tile.unroll_k,
+        inner=mfma_level,
+    )
+
+    workgroup_level = TileLevel(
+        "workgroup",
+        m=tile.wg_m, n=tile.wg_n, k=tile.unroll_k,
+        inner=wave_level,
+        parallel=True,
+        prologue_phases=[
+            TilePhase("load_kernargs", _phase_load_kernargs),
+            TilePhase("thread_indexing", _phase_thread_indexing),
+            TilePhase("load_cluster_setup", _phase_load_cluster_setup),
+            TilePhase("lds_write_addrs", _phase_lds_write_addrs),
+            TilePhase("lds_read_addrs", _phase_lds_read_addrs),
+            TilePhase("init_acc", _phase_init_acc),
+            TilePhase("global_addr_a", _phase_global_addr_a),
+            TilePhase("global_addr_b", _phase_global_addr_b),
+            TilePhase("pipelined_k_loop", _phase_pipelined_k_loop),
+        ],
+        epilogue_phases=[
+            TilePhase("store_d", _phase_store_d),
+        ],
+    )
+
+    return workgroup_level
+
+
+# ===================================================================
+# MFMA/LR interleaving: hide ds_read latency under MFMA execution
+# ===================================================================
+
+def _emit_interleaved_mfma_loop(ctx: AsmContext, tile: TileConfig,
+                                problem: GemmProblem) -> None:
+    """Emit all MFMA tiles with double-buffered LDS read interleaving.
+
+    Pattern per iteration:
+      1. Issue ds_read for MFMA[n+1] into buffer B
+      2. Execute MFMA[n] using buffer A (32 cycles hides ds_read)
+      3. Wait for ds_read to complete
+      4. Swap buffers
+
+    Uses 2 sets of operand VGPRs (v_a/v_b and v_a2/v_b2).
+    """
+    mfma = tile.mfma
+    elem = problem.element_bytes
+
+    # Allocate second operand buffer for double-buffering
+    ctx.alloc_vgpr_permanent(mfma.a_vgprs, "v_a2")
+    ctx.alloc_vgpr_permanent(mfma.b_vgprs, "v_b2")
+
+    # Buffer names for alternation
+    a_bufs = ["v_a", "v_a2"]
+    b_bufs = ["v_b", "v_b2"]
+
+    # Flatten iteration order
+    iters = []
+    for mi in range(tile.mfma_m_repeat):
+        for ni in range(tile.mfma_n_repeat):
+            for ki in range(tile.k_iterations):
+                iters.append((mi, ni, ki))
+
+    def emit_lds_read(idx, buf):
+        """Emit LDS reads for iteration idx into buffer buf."""
+        mi, ni, ki = iters[idx]
+        a_name = a_bufs[buf]
+        b_name = b_bufs[buf]
+
+        mi_byte_off = mi * mfma.m * tile.unroll_k * elem
+        k_byte_off = ki * mfma.k * elem
+        total_a_off = mi_byte_off + k_byte_off
+        if total_a_off > 0:
+            ctx.v_add(ctx.vreg("v_tmp0"), str(total_a_off),
+                      ctx.vreg("v_lds_rd_a"),
+                      comment=f"lds_rd_a + mi={mi} ki={ki}")
+            a_addr = ctx.vreg("v_tmp0")
+        else:
+            a_addr = ctx.vreg("v_lds_rd_a")
+        for r in range(mfma.a_vgprs):
+            ctx.ds_read(ctx.vreg(a_name, r, 1), a_addr,
+                        offset=r * 4, width=1,
+                        comment=f"LR A[{r}] m{mi}k{ki} buf{buf}")
+
+        ni_byte_off = ni * mfma.n * tile.unroll_k * elem
+        total_b_off = ni_byte_off + k_byte_off
+        if total_b_off > 0:
+            ctx.v_add(ctx.vreg("v_tmp1"), str(total_b_off),
+                      ctx.vreg("v_lds_rd_b"),
+                      comment=f"lds_rd_b + ni={ni} ki={ki}")
+            b_addr = ctx.vreg("v_tmp1")
+        else:
+            b_addr = ctx.vreg("v_lds_rd_b")
+        for r in range(mfma.b_vgprs):
+            ctx.ds_read(ctx.vreg(b_name, r, 1), b_addr,
+                        offset=r * 4, width=1,
+                        comment=f"LR B[{r}] n{ni}k{ki} buf{buf}")
+
+    # Pre-load first operands into buffer 0
+    ctx.comment("Interleaved MFMA/LR: pre-load first operands")
+    emit_lds_read(0, buf=0)
+    ctx.s_waitcnt("lgkmcnt(0)", comment="wait for first LDS reads")
+    ctx.raw("")
+
+    # Main loop: for each MFMA tile, prefetch next then compute current
+    for i, (mi, ni, ki) in enumerate(iters):
+        cur_buf = i % 2
+        next_buf = 1 - cur_buf
+
+        # Prefetch next operands (if not last iteration)
+        if i < len(iters) - 1:
+            emit_lds_read(i + 1, buf=next_buf)
+
+        # MFMA with current buffer
+        acc_per = mfma.acc_vgprs
+        acc_off = (mi * tile.mfma_n_repeat + ni) * acc_per
+        ctx.inst(
+            f"v_mfma_f32_{mfma.m}x{mfma.n}x{mfma.k}_f16",
+            ctx.areg("acc_C", acc_off, acc_per),
+            ctx.vreg(a_bufs[cur_buf], 0, mfma.a_vgprs),
+            ctx.vreg(b_bufs[cur_buf], 0, mfma.b_vgprs),
+            ctx.areg("acc_C", acc_off, acc_per),
+            comment=f"mfma m{mi}_n{ni}_k{ki} buf{cur_buf}",
+        )
+
+        # Wait for prefetch to complete (MFMA latency hides most/all of it)
+        if i < len(iters) - 1:
+            ctx.s_waitcnt("lgkmcnt(0)", comment="wait LR (hidden by MFMA)")
+
+        ctx.raw("")
+
+
+def _interleaved_mfma_visitor(level: TileLevel, ctx: AsmContext) -> None:
+    """Tile-tree visitor that uses interleaved MFMA/LR.
+
+    Unlike _mfma_visitor which is called per-tile, this emits the
+    ENTIRE interleaved loop when called at the wave level, and skips
+    individual mfma-level calls.
+    """
+    if level.name == "wave":
+        # Emit the full interleaved loop at the wave level
+        tile = ctx._metadata["tile"]
+        problem = ctx._metadata["problem"]
+        _emit_interleaved_mfma_loop(ctx, tile, problem)
+        # Set a flag so mfma-level visitor does nothing
+        ctx._interleaved_done = True
+        return
+
+    if level.name == "mfma":
+        # Already handled at wave level
+        if getattr(ctx, '_interleaved_done', False):
+            return
+        # Fallback: use default visitor if not interleaved
+        _mfma_visitor(level, ctx)
+
+
+def build_pipelined_interleaved_gemm_tree(
+    problem: GemmProblem,
+    tile: TileConfig,
+    layouts: GemmLayouts,
+) -> TileLevel:
+    """Build tile tree with pipelined K-loop AND interleaved MFMA/LR.
+
+    Combines both optimizations for maximum performance.
+    """
+    mfma_level = TileLevel(
+        "mfma", m=tile.mfma.m, n=tile.mfma.n, k=tile.mfma.k)
+    wave_level = TileLevel(
+        "wave", m=tile.m_per_wave, n=tile.n_per_wave, k=tile.unroll_k,
+        inner=mfma_level)
+
+    workgroup_level = TileLevel(
+        "workgroup", m=tile.wg_m, n=tile.wg_n, k=tile.unroll_k,
+        inner=wave_level, parallel=True,
+        prologue_phases=[
+            TilePhase("load_kernargs", _phase_load_kernargs),
+            TilePhase("thread_indexing", _phase_thread_indexing),
+            TilePhase("load_cluster_setup", _phase_load_cluster_setup),
+            TilePhase("lds_write_addrs", _phase_lds_write_addrs),
+            TilePhase("lds_read_addrs", _phase_lds_read_addrs),
+            TilePhase("init_acc", _phase_init_acc),
+            TilePhase("global_addr_a", _phase_global_addr_a),
+            TilePhase("global_addr_b", _phase_global_addr_b),
+            TilePhase("pipelined_k_loop", _phase_pipelined_k_loop),
+        ],
+        epilogue_phases=[
+            TilePhase("store_d", _phase_store_d),
+        ],
+    )
     return workgroup_level

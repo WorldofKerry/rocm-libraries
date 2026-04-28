@@ -288,3 +288,128 @@ class TestGPUPerformance:
         hip.hipModuleUnload(module)
 
         assert tflops > 50, f"Only {tflops:.1f} TFLOPS, expected > 50"
+
+
+@requires_gpu
+class TestPipelinedKernel:
+    """Test the software-pipelined K-loop variant."""
+
+    @pytest.mark.parametrize("M,N,K", [
+        (128, 128, 32),
+        (128, 128, 128),
+        (256, 256, 256),
+        (512, 512, 512),
+        (1024, 1024, 1024),
+    ])
+    def test_pipelined_correct(self, M, N, K):
+        from stinkytofu.gemm.asm_emitter import build_pipelined_gemm_tree
+        from stinkytofu.gemm.asm_transforms import GemmLayouts
+        from stinkytofu.gemm.problem import TileConfig
+
+        hip = HIP
+        problem = GemmProblem(m=M, n=N, k=K)
+        tile = TileConfig()
+        problem.validate(tile)
+        layouts = GemmLayouts.build(problem, tile)
+        tree = build_pipelined_gemm_tree(problem, tile, layouts)
+        kernel = GemmKernel.build(problem, tile_tree=tree)
+        result = kernel.emit()
+        co = result.assemble(output_path=f"/tmp/test_pipe_{M}_{N}_{K}.co")
+
+        elem = 2
+        d_A, d_B, d_D = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+        hip.hipMalloc(ctypes.byref(d_A), M * K * elem)
+        hip.hipMalloc(ctypes.byref(d_B), N * K * elem)
+        hip.hipMalloc(ctypes.byref(d_D), M * N * elem)
+
+        rng = np.random.RandomState(42)
+        scale = 1.0 / np.sqrt(K)
+        A = (rng.randn(M, K) * scale).astype(np.float16)
+        B = (rng.randn(N, K) * scale).astype(np.float16)
+        hip.hipMemcpy(d_A, A.ctypes.data_as(ctypes.c_void_p), M * K * elem, 1)
+        hip.hipMemcpy(d_B, B.ctypes.data_as(ctypes.c_void_p), N * K * elem, 1)
+        hip.hipMemset(d_D, 0, M * N * elem)
+
+        module = ctypes.c_void_p()
+        hip.hipModuleLoad(ctypes.byref(module), co.encode())
+        func = ctypes.c_void_p()
+        hip.hipModuleGetFunction(ctypes.byref(func), module, b"gemm_kernel")
+
+        _a = [ctypes.c_void_p(d_A.value), ctypes.c_void_p(d_B.value),
+              ctypes.c_void_p(d_D.value),
+              ctypes.c_int(M), ctypes.c_int(N), ctypes.c_int(K)]
+        args = (ctypes.c_void_p * len(_a))()
+        for i, v in enumerate(_a):
+            args[i] = ctypes.cast(ctypes.pointer(v), ctypes.c_void_p)
+
+        lds = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
+        gm, gn = M // tile.wg_m, N // tile.wg_n
+        ret = hip.hipModuleLaunchKernel(
+            func, gm, gn, 1, tile.block_size, 1, 1, lds, None, args, None)
+        assert ret == 0, f"Launch failed: {ret}"
+        hip.hipDeviceSynchronize()
+
+        D_gpu = np.zeros((M, N), dtype=np.float16)
+        hip.hipMemcpy(D_gpu.ctypes.data_as(ctypes.c_void_p), d_D, M * N * elem, 2)
+        hip.hipFree(d_A); hip.hipFree(d_B); hip.hipFree(d_D)
+        hip.hipModuleUnload(module)
+
+        D_ref = (A.astype(np.float32) @ B.astype(np.float32).T).astype(np.float16)
+        assert np.allclose(D_gpu, D_ref, atol=1.0, rtol=0.05), \
+            f"Max error: {np.max(np.abs(D_gpu.astype(np.float32) - D_ref.astype(np.float32)))}"
+
+    def test_pipelined_faster(self):
+        """Pipelined kernel should be faster than baseline at 4096^3."""
+        import time
+        from stinkytofu.gemm.asm_emitter import build_pipelined_gemm_tree
+        from stinkytofu.gemm.asm_transforms import GemmLayouts
+        from stinkytofu.gemm.problem import TileConfig
+
+        hip = HIP
+        M = N = K = 4096
+        problem = GemmProblem(m=M, n=N, k=K)
+        tile = TileConfig()
+        problem.validate(tile)
+        elem = 2
+
+        def bench(kernel):
+            result = kernel.emit()
+            co = result.assemble(output_path=f"/tmp/test_perf_cmp.co")
+            d_A, d_B, d_D = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+            hip.hipMalloc(ctypes.byref(d_A), M*K*elem)
+            hip.hipMalloc(ctypes.byref(d_B), N*K*elem)
+            hip.hipMalloc(ctypes.byref(d_D), M*N*elem)
+            module = ctypes.c_void_p()
+            hip.hipModuleLoad(ctypes.byref(module), co.encode())
+            func = ctypes.c_void_p()
+            hip.hipModuleGetFunction(ctypes.byref(func), module, b"gemm_kernel")
+            _a = [ctypes.c_void_p(d_A.value),ctypes.c_void_p(d_B.value),
+                  ctypes.c_void_p(d_D.value),ctypes.c_int(M),ctypes.c_int(N),ctypes.c_int(K)]
+            args = (ctypes.c_void_p*len(_a))()
+            for i,v in enumerate(_a): args[i] = ctypes.cast(ctypes.pointer(v), ctypes.c_void_p)
+            lds = (tile.wg_m+tile.wg_n)*tile.unroll_k*elem
+            gm, gn = M//tile.wg_m, N//tile.wg_n
+            for _ in range(3):
+                hip.hipModuleLaunchKernel(func, gm, gn, 1, tile.block_size, 1, 1, lds, None, args, None)
+            hip.hipDeviceSynchronize()
+            iters = 10; t0 = time.perf_counter()
+            for _ in range(iters):
+                hip.hipModuleLaunchKernel(func, gm, gn, 1, tile.block_size, 1, 1, lds, None, args, None)
+            hip.hipDeviceSynchronize()
+            tflops = 2*M*N*K/(time.perf_counter()-t0)*iters/1e12
+            hip.hipFree(d_A); hip.hipFree(d_B); hip.hipFree(d_D)
+            hip.hipModuleUnload(module)
+            return tflops
+
+        # Baseline
+        base_kernel = GemmKernel.build(problem)
+        base_tflops = bench(base_kernel)
+
+        # Pipelined
+        layouts = GemmLayouts.build(problem, tile)
+        tree = build_pipelined_gemm_tree(problem, tile, layouts)
+        pipe_kernel = GemmKernel.build(problem, tile_tree=tree)
+        pipe_tflops = bench(pipe_kernel)
+
+        assert pipe_tflops > base_tflops * 2, \
+            f"Pipelined ({pipe_tflops:.1f}) should be >2x baseline ({base_tflops:.1f})"
