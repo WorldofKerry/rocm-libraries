@@ -153,6 +153,9 @@ class TestGemmTiling:
         assert tree.name == "workgroup"
         assert tree.m == 128
         assert tree.parallel is True
+        # Tree now has phases (GemmTiling is the source of truth)
+        assert len(tree.prologue_phases) > 0
+        assert len(tree.epilogue_phases) > 0
         wave = tree.inner
         assert wave.name == "wave"
         assert wave.m == 64

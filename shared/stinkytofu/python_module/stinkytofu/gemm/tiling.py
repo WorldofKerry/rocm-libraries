@@ -100,6 +100,22 @@ class TileDim:
     def leaf_size(self) -> int:
         return self.size if self.inner is None else self.inner.leaf_size
 
+    @property
+    def leaf_name(self) -> str:
+        """Name of the innermost (HARDWARE) level."""
+        if self.inner is None:
+            return self.name
+        return self.inner.leaf_name
+
+    @property
+    def wave_name(self) -> str:
+        """Name of the level just above the leaf (typically wave)."""
+        if self.inner is None:
+            return self.name
+        if self.inner.inner is None:
+            return self.name  # we are the parent of the leaf
+        return self.inner.wave_name
+
     def levels(self) -> List[TileDim]:
         """All levels outermost-first."""
         result = [self]
@@ -266,22 +282,69 @@ class GemmTiling:
             mfma=self.mfma, wave_size=self.wave_size,
         )
 
-    def build_tile_tree(self) -> TileLevel:
-        """Auto-generate codegen TileLevel tree from dimension chains.
+    def build_tile_tree(self, pipelined: bool = False) -> TileLevel:
+        """Build the full tile tree with phases from TileDim chains.
 
-        Returns a workgroup->wave->mfma tree (no phases).  Use
-        build_full_gemm_tree() from asm_emitter for a complete tree
-        with workgroup/wave phases for assembly emission.
+        The chain structure determines the tree levels:
+        - HARDWARE leaf (mfma) from the innermost TileDim levels
+        - PARALLEL levels (workgroup, wave) from outer TileDim levels
+        - SEQUENTIAL K dimension drives K-loop phase placement
+
+        Phase assignment:
+        - Workgroup: setup (kernargs, thread indexing, addresses)
+                     + K-loop control + store epilogue
+        - Wave: data movement (global_load, lds_write, k_advance)
+        - MFMA leaf: visitor handles LDS read + MFMA
+
+        Args:
+            pipelined: If True, use software-pipelined K-loop
+                       (overlaps global_load(n+1) with compute(n)).
         """
+        from .phases import (
+            WORKGROUP_PROLOGUE_PHASES, WORKGROUP_EPILOGUE_PHASES,
+            WAVE_PROLOGUE_PHASES, WAVE_EPILOGUE_PHASES,
+            PIPELINED_PROLOGUE_PHASES,
+        )
+
+        # Leaf: MFMA instruction (from HARDWARE TileDim leaves)
         mfma_level = TileLevel(
-            "mfma", m=self.mfma.m, n=self.mfma.n, k=self.mfma.k)
-        wave_level = TileLevel(
-            "wave", m=self.m_per_wave, n=self.n_per_wave,
-            k=self.unroll_k, inner=mfma_level)
+            "mfma", m=self.mfma.m,
+            n=self.mfma.n, k=self.mfma.k)
+
+        # Wave: per-wave compute tile
+        # K-loop data movement phases go here (non-pipelined)
+        if pipelined:
+            wave_level = TileLevel(
+                "wave", m=self.m_per_wave,
+                n=self.n_per_wave, k=self.unroll_k,
+                inner=mfma_level)
+        else:
+            wave_level = TileLevel(
+                "wave", m=self.m_per_wave,
+                n=self.n_per_wave, k=self.unroll_k,
+                inner=mfma_level,
+                prologue_phases=list(WAVE_PROLOGUE_PHASES),
+                epilogue_phases=list(WAVE_EPILOGUE_PHASES))
+
+        # Workgroup: setup + K-loop structure + store
+        wg_pro = list(PIPELINED_PROLOGUE_PHASES if pipelined
+                      else WORKGROUP_PROLOGUE_PHASES)
         workgroup_level = TileLevel(
-            "workgroup", m=self.wg_m, n=self.wg_n, k=self.unroll_k,
-            inner=wave_level, parallel=True)
+            "workgroup", m=self.wg_m, n=self.wg_n,
+            k=self.unroll_k, inner=wave_level, parallel=True,
+            prologue_phases=wg_pro,
+            epilogue_phases=list(WORKGROUP_EPILOGUE_PHASES))
+
         return workgroup_level
+
+    @staticmethod
+    def from_tile_config(tile: TileConfig) -> GemmTiling:
+        """Create a GemmTiling from a legacy TileConfig."""
+        return GemmTiling.standard(
+            wg_m=tile.wg_m, wg_n=tile.wg_n,
+            unroll_k=tile.unroll_k,
+            waves_m=tile.waves_m, waves_n=tile.waves_n,
+            mfma=tile.mfma, wave_size=tile.wave_size)
 
     def build_m_descriptor(self) -> TileDescriptor:
         return self.dim_m.build_descriptor()

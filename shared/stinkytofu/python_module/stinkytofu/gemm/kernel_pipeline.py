@@ -2,16 +2,22 @@
 # SPDX-License-Identifier: MIT
 """GEMM kernel pipeline: build tree, emit assembly, assemble.
 
+GemmTiling is the source of truth.  The TileDim chains determine the
+tree structure, and build_tile_tree() attaches the right phases at
+each level.
+
 Usage::
 
     kernel = GemmKernel.build(GemmProblem(4096, 4096, 4096))
     result = kernel.emit()
     co = result.assemble()
 
+    # Pipelined K-loop (10x faster)
+    kernel = GemmKernel.build(problem, pipelined=True)
+
     # Replace a phase
     kernel.tile_tree = kernel.tile_tree.replace_phase(
         "global_load", my_prefetching_load)
-    result = kernel.emit()
 """
 from __future__ import annotations
 
@@ -21,12 +27,7 @@ from typing import Callable, Dict, Optional
 from .asm_context import AsmContext
 from .asm_emitter import alloc_registers, emit_header, emit_descriptor, assemble_kernel
 from .asm_transforms import emit_affine, GemmLayouts
-from .phases import (
-    WORKGROUP_PROLOGUE_PHASES, WORKGROUP_EPILOGUE_PHASES,
-    WAVE_PROLOGUE_PHASES, WAVE_EPILOGUE_PHASES,
-    PIPELINED_PROLOGUE_PHASES,
-    default_mfma_visitor,
-)
+from .phases import default_mfma_visitor
 from .problem import GemmProblem, TileConfig
 from .tiling import GemmTiling
 from .tile import TileLevel, TilePhase, walk_tile_tree
@@ -101,7 +102,10 @@ class AsmKernel:
 class GemmKernel:
     """A GEMM kernel described as a tile tree with phases.
 
-    The entire kernel structure is encoded in the tile tree.
+    The tile tree is built from GemmTiling (TileDim chains).
+    The chains determine the tree structure; phases are assigned
+    based on the ScheduleKind at each level.
+
     Replace any phase to customize one step::
 
         kernel.tile_tree = kernel.tile_tree.replace_phase(
@@ -111,6 +115,7 @@ class GemmKernel:
     tile: TileConfig
     layouts: GemmLayouts
     tile_tree: TileLevel
+    tiling: GemmTiling
     kernel_name: str = "gemm_kernel"
     mfma_visitor: Callable = None
 
@@ -121,33 +126,39 @@ class GemmKernel:
               tile_tree: Optional[TileLevel] = None,
               tiling: Optional[GemmTiling] = None,
               pipelined: bool = False) -> GemmKernel:
-        """Build a GemmKernel with the full tile tree.
+        """Build a GemmKernel.  GemmTiling is the source of truth.
 
         Args:
             problem: GEMM problem specification.
-            tile: TileConfig (derived from tiling if not provided).
+            tile: TileConfig (if no tiling provided, converted to GemmTiling).
             kernel_name: Name for the kernel function.
             tile_tree: Custom TileLevel tree (overrides auto-generation).
             tiling: GemmTiling with per-dimension TileDim chains.
             pipelined: If True, use software-pipelined K-loop.
         """
-        if tiling is not None:
-            tiling.validate()
-            tile = tiling.to_tile_config()
-        if tile is None:
-            tile = TileConfig()
+        # GemmTiling is always the source of truth
+        if tiling is None:
+            if tile is not None:
+                tiling = GemmTiling.from_tile_config(tile)
+            else:
+                tiling = GemmTiling.standard()
+
+        tiling.validate()
+        tile = tiling.to_tile_config()
         problem.validate(tile)
 
         layouts = GemmLayouts.build(problem, tile)
 
+        # Tree comes from tiling (unless explicitly overridden)
         if tile_tree is None:
-            tile_tree = build_default_tree(tile, pipelined=pipelined)
+            tile_tree = tiling.build_tile_tree(pipelined=pipelined)
 
         tile_tree.validate()
 
         return GemmKernel(
             problem=problem, tile=tile, layouts=layouts,
-            tile_tree=tile_tree, kernel_name=kernel_name,
+            tile_tree=tile_tree, tiling=tiling,
+            kernel_name=kernel_name,
             mfma_visitor=default_mfma_visitor,
         )
 
@@ -182,44 +193,3 @@ class GemmKernel:
         return AsmKernel(
             asm_text=ctx.asm_text(), kernel_name=self.kernel_name,
             problem=self.problem, tile=tile, ctx=ctx, lds_bytes=lds_total)
-
-
-# ===================================================================
-# Tree builders
-# ===================================================================
-
-def build_default_tree(tile: TileConfig,
-                       pipelined: bool = False) -> TileLevel:
-    """Build the standard GEMM tile tree with all phases.
-
-    Args:
-        tile: TileConfig with tile dimensions.
-        pipelined: If True, use software-pipelined K-loop.
-    """
-    mfma_level = TileLevel(
-        "mfma", m=tile.mfma.m, n=tile.mfma.n, k=tile.mfma.k)
-
-    if pipelined:
-        # Pipelined: K-loop is a single workgroup prologue phase
-        wave_level = TileLevel(
-            "wave", m=tile.m_per_wave, n=tile.n_per_wave,
-            k=tile.unroll_k, inner=mfma_level)
-        workgroup_level = TileLevel(
-            "workgroup", m=tile.wg_m, n=tile.wg_n, k=tile.unroll_k,
-            inner=wave_level, parallel=True,
-            prologue_phases=list(PIPELINED_PROLOGUE_PHASES),
-            epilogue_phases=list(WORKGROUP_EPILOGUE_PHASES))
-    else:
-        # Standard: separate global_load/lds_write/k_advance phases
-        wave_level = TileLevel(
-            "wave", m=tile.m_per_wave, n=tile.n_per_wave,
-            k=tile.unroll_k, inner=mfma_level,
-            prologue_phases=list(WAVE_PROLOGUE_PHASES),
-            epilogue_phases=list(WAVE_EPILOGUE_PHASES))
-        workgroup_level = TileLevel(
-            "workgroup", m=tile.wg_m, n=tile.wg_n, k=tile.unroll_k,
-            inner=wave_level, parallel=True,
-            prologue_phases=list(WORKGROUP_PROLOGUE_PHASES),
-            epilogue_phases=list(WORKGROUP_EPILOGUE_PHASES))
-
-    return workgroup_level
