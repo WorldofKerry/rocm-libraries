@@ -141,7 +141,21 @@ class AsmContext(TileContext):
                 return
         except (ValueError, TypeError):
             pass
+        s0 = self._ensure_not_literal(s0)
+        s1 = self._ensure_not_literal(s1)
         self.inst("v_mul_lo_u32", dst, s0, s1, comment=comment)
+    def _ensure_not_literal(self, val_str: str) -> str:
+        """If val_str is a large literal, move it to s_tmp0 first.
+        gfx950 v_mul_lo_u32 doesn't support literal operands > 64."""
+        try:
+            v = int(val_str)
+            if v > 64 or v < -16:
+                self.s_mov(self.sreg("s_tmp0"), val_str,
+                           comment=f"literal {v} -> SGPR")
+                return self.sreg("s_tmp0")
+        except (ValueError, TypeError):
+            pass
+        return val_str
 
     def v_lshr(self, dst: str, src, shift: int, comment: str = "") -> None:
         self.inst("v_lshrrev_b32", dst, str(shift), str(src), comment=comment)
