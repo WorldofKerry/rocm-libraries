@@ -75,9 +75,9 @@ def phase_auto_scheduled_k_loop(level, ctx):
             a_reg[(buf, ki)] = name
 
     def a_off(mi, ki):
-        return (mi * mfma.m * tile.unroll_k + ki * mfma.k) * elem
+        pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (mi * mfma.m * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
     def b_off(ni, ki):
-        return (ni * mfma.n * tile.unroll_k + ki * mfma.k) * elem
+        pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (ni * mfma.n * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
 
     # Build compute-only graph (ds_reads + MFMAs, no global loads/ds_writes)
     g = ScheduleGraph()

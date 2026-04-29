@@ -195,20 +195,24 @@ class GemmLayouts:
         """Build all layout descriptors from problem + tile config."""
         elem = problem.element_bytes
         uk = tile.unroll_k
+        # LDS padding: lds_pad bytes per row for bank conflict avoidance.
+        # pad_elems = lds_pad / elem (e.g., 4 bytes / 2 = 2 fp16 elements)
+        pad_elems = tile.lds_pad // elem if tile.lds_pad > 0 else 0
+        lds_row_stride = uk + pad_elems  # elements per LDS row including padding
 
-        lds_a_elems = tile.wg_m * uk
+        lds_a_elems = tile.wg_m * lds_row_stride
         lds_b_offset = lds_a_elems * elem
 
         return GemmLayouts(
             lds_a=Embed(
                 [Dim("row", tile.wg_m), Dim("col", uk)],
                 Dim("lds_a_offset", lds_a_elems),
-                [uk, 1],
+                [lds_row_stride, 1],
             ),
             lds_b=Embed(
                 [Dim("row", tile.wg_n), Dim("col", uk)],
-                Dim("lds_b_offset", tile.wg_n * uk),
-                [uk, 1],
+                Dim("lds_b_offset", tile.wg_n * lds_row_stride),
+                [lds_row_stride, 1],
             ),
             global_a=Embed(
                 [Dim("m", problem.m), Dim("k", problem.k)],

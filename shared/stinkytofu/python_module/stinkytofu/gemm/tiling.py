@@ -205,6 +205,7 @@ class GemmTiling:
     dim_k: TileDim
     mfma: MfmaConfig
     wave_size: int = 64
+    lds_pad: int = 0  # LDS padding bytes per row for bank conflict avoidance
 
     @staticmethod
     def standard(
@@ -237,6 +238,7 @@ class GemmTiling:
         waves_m: int = 2, waves_n: int = 2,
         mfma: Optional[MfmaConfig] = None,
         wave_size: int = 64,
+        lds_pad: int = 4,  # 4 bytes padding eliminates 8-way bank conflicts
     ) -> GemmTiling:
         """High-performance tiling for gfx950.
 
@@ -250,11 +252,13 @@ class GemmTiling:
         """
         if mfma is None:
             mfma = MfmaConfig.f16_16x16x32()
-        return GemmTiling.standard(
+        t = GemmTiling.standard(
             wg_m=wg_m, wg_n=wg_n, unroll_k=unroll_k,
             waves_m=waves_m, waves_n=waves_n,
             mfma=mfma, wave_size=wave_size,
         )
+        t.lds_pad = lds_pad
+        return t
 
     # -- Derived quantities (same interface as TileConfig) -----------
 
@@ -310,6 +314,7 @@ class GemmTiling:
             wg_m=self.wg_m, wg_n=self.wg_n, unroll_k=self.unroll_k,
             waves_m=self.waves_m, waves_n=self.waves_n,
             mfma=self.mfma, wave_size=self.wave_size,
+            lds_pad=self.lds_pad,
         )
 
     def build_tile_tree(self, pipelined: bool = False,
@@ -401,11 +406,13 @@ class GemmTiling:
     @staticmethod
     def from_tile_config(tile: TileConfig) -> GemmTiling:
         """Create a GemmTiling from a legacy TileConfig."""
-        return GemmTiling.standard(
+        t = GemmTiling.standard(
             wg_m=tile.wg_m, wg_n=tile.wg_n,
             unroll_k=tile.unroll_k,
             waves_m=tile.waves_m, waves_n=tile.waves_n,
             mfma=tile.mfma, wave_size=tile.wave_size)
+        t.lds_pad = tile.lds_pad
+        return t
 
     def build_m_descriptor(self) -> TileDescriptor:
         return self.dim_m.build_descriptor()

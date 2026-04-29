@@ -188,7 +188,9 @@ class GemmKernel:
         """Generate the full kernel assembly."""
         tile = self.tile
         elem = self.problem.element_bytes
-        lds_half = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
+        pad_elems = tile.lds_pad // elem if tile.lds_pad > 0 else 0
+        lds_row_stride = tile.unroll_k + pad_elems
+        lds_half = (tile.wg_m + tile.wg_n) * lds_row_stride * elem
         # Double LDS for double-buffered mode
         is_db = any(p.name in ("optimized_k_loop", "scheduled_k_loop", "fully_interleaved_k_loop", "pgr2_k_loop", "dtl_k_loop", "interleaved_large_k_loop", "auto_scheduled_k_loop")
                      for p in self.tile_tree.prologue_phases)

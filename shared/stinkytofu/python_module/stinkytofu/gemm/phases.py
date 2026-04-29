@@ -185,11 +185,15 @@ def phase_lds_addrs(level, ctx):
                comment=f"* {k_per_group} -> lane_k_offset")
     ctx.raw("")
 
+    # LDS row stride matches the write layout (includes padding)
+    pad_e = tile.lds_pad // elem if tile.lds_pad > 0 else 0
+    lds_row_stride = tile.unroll_k + pad_e
+
     # LDS read A: a_row = wave_m * m_per_wave + lane_row
     lds_rd_a = Embed(
         [Dim("a_row", tile.wg_m), Dim("a_k", tile.unroll_k)],
-        Dim("lds_rd_a", tile.wg_m * tile.unroll_k),
-        [tile.unroll_k, 1],
+        Dim("lds_rd_a", tile.wg_m * lds_row_stride),
+        [lds_row_stride, 1],
     )
     ctx.comment(f"LDS read A: {lds_rd_a}")
     ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(tile.m_per_wave),
@@ -206,8 +210,8 @@ def phase_lds_addrs(level, ctx):
     # LDS read B: b_row = wave_n * n_per_wave + lane_row
     lds_rd_b = Embed(
         [Dim("b_row", tile.wg_n), Dim("b_k", tile.unroll_k)],
-        Dim("lds_rd_b", tile.wg_n * tile.unroll_k),
-        [tile.unroll_k, 1],
+        Dim("lds_rd_b", tile.wg_n * lds_row_stride),
+        [lds_row_stride, 1],
     )
     ctx.comment(f"LDS read B: {lds_rd_b} + lds_b_offset")
     ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(tile.n_per_wave),
@@ -694,7 +698,8 @@ def phase_optimized_k_loop(level, ctx):
     elem = problem.element_bytes
     mfma = tile.mfma
 
-    lds_half = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
+    pad_e = tile.lds_pad // elem if tile.lds_pad > 0 else 0
+    lds_half = (tile.wg_m + tile.wg_n) * (tile.unroll_k + pad_e) * elem
     k_stride = tile.unroll_k * elem
     log2_uk = int(math.log2(tile.unroll_k))
 
@@ -909,7 +914,8 @@ def phase_scheduled_k_loop(level, ctx):
     elem = problem.element_bytes
     mfma = tile.mfma
 
-    lds_half = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
+    pad_e = tile.lds_pad // elem if tile.lds_pad > 0 else 0
+    lds_half = (tile.wg_m + tile.wg_n) * (tile.unroll_k + pad_e) * elem
     k_stride = tile.unroll_k * elem
     log2_uk = int(math.log2(tile.unroll_k))
 
@@ -1047,10 +1053,10 @@ def _emit_subtile_compute_legacy(ctx, tile, problem):
             a_names[(buf, ki)] = name
 
     def a_off(mi, ki):
-        return (mi * mfma.m * tile.unroll_k + ki * mfma.k) * elem
+        pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (mi * mfma.m * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
 
     def b_off(ni, ki):
-        return (ni * mfma.n * tile.unroll_k + ki * mfma.k) * elem
+        pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (ni * mfma.n * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
 
     def read_a(mi, ki, buf):
         name = a_names[(buf, ki)]
@@ -1157,10 +1163,10 @@ def _emit_scheduled_compute(ctx, tile, problem):
             a_names[(buf, ki)] = name
 
     def a_off(mi, ki):
-        return (mi * mfma.m * tile.unroll_k + ki * mfma.k) * elem
+        pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (mi * mfma.m * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
 
     def b_off(ni, ki):
-        return (ni * mfma.n * tile.unroll_k + ki * mfma.k) * elem
+        pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (ni * mfma.n * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
 
     total = mr * nr * ki_count
     ctx.comment(f"Scheduled: {total} MFMAs ({mr}m x {nr}n x {ki_count}k)")
@@ -1250,7 +1256,8 @@ def phase_fully_interleaved_k_loop(level, ctx):
     av = mfma.a_vgprs
     bv = mfma.b_vgprs
 
-    lds_half = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
+    pad_e = tile.lds_pad // elem if tile.lds_pad > 0 else 0
+    lds_half = (tile.wg_m + tile.wg_n) * (tile.unroll_k + pad_e) * elem
     k_stride = tile.unroll_k * elem
     log2_uk = int(math.log2(tile.unroll_k))
 
@@ -1288,10 +1295,10 @@ def phase_fully_interleaved_k_loop(level, ctx):
             a_names[(buf, ki)] = name
 
     def a_off(mi, ki):
-        return (mi * mfma.m * tile.unroll_k + ki * mfma.k) * elem
+        pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (mi * mfma.m * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
 
     def b_off(ni, ki):
-        return (ni * mfma.n * tile.unroll_k + ki * mfma.k) * elem
+        pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (ni * mfma.n * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
 
     def read_a(mi, ki, buf):
         name = a_names[(buf, ki)]
@@ -1554,7 +1561,8 @@ def phase_pgr2_k_loop(level, ctx):
     av = mfma.a_vgprs
     bv = mfma.b_vgprs
 
-    lds_half = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
+    pad_e = tile.lds_pad // elem if tile.lds_pad > 0 else 0
+    lds_half = (tile.wg_m + tile.wg_n) * (tile.unroll_k + pad_e) * elem
     k_stride = tile.unroll_k * elem
     log2_uk = int(math.log2(tile.unroll_k))
 
@@ -1624,10 +1632,10 @@ def phase_pgr2_k_loop(level, ctx):
             a_names[(buf, ki)] = name
 
     def a_off(mi, ki):
-        return (mi * mfma.m * tile.unroll_k + ki * mfma.k) * elem
+        pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (mi * mfma.m * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
 
     def b_off(ni, ki):
-        return (ni * mfma.n * tile.unroll_k + ki * mfma.k) * elem
+        pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (ni * mfma.n * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
 
     def emit_compute(ctx, mr, nr, ki_count, mfma, a_names, b_names, a_off, b_off, tile, elem, label=""):
         """Emit preamble + compute (16 MFMAs with A prefetch)."""
@@ -2123,7 +2131,8 @@ def phase_dtl_k_loop(level, ctx):
     av = mfma.a_vgprs
     bv = mfma.b_vgprs
 
-    lds_half = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
+    pad_e = tile.lds_pad // elem if tile.lds_pad > 0 else 0
+    lds_half = (tile.wg_m + tile.wg_n) * (tile.unroll_k + pad_e) * elem
     log2_uk = int(math.log2(tile.unroll_k))
 
     ctx.alloc_sgpr_permanent(1, "s_lds_db_step")
@@ -2160,10 +2169,10 @@ def phase_dtl_k_loop(level, ctx):
             a_names[(buf, ki)] = name
 
     def a_off(mi, ki):
-        return (mi * mfma.m * tile.unroll_k + ki * mfma.k) * elem
+        pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (mi * mfma.m * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
 
     def b_off(ni, ki):
-        return (ni * mfma.n * tile.unroll_k + ki * mfma.k) * elem
+        pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (ni * mfma.n * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
 
     # K-loop
     ctx.label("k_loop")
@@ -2298,7 +2307,8 @@ def phase_interleaved_large_k_loop(level, ctx):
     ki_count = tile.k_iterations
     av = mfma.a_vgprs
     bv = mfma.b_vgprs
-    lds_half = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
+    pad_e = tile.lds_pad // elem if tile.lds_pad > 0 else 0
+    lds_half = (tile.wg_m + tile.wg_n) * (tile.unroll_k + pad_e) * elem
     k_stride = tile.unroll_k * elem
     log2_uk = int(math.log2(tile.unroll_k))
 
@@ -2334,10 +2344,10 @@ def phase_interleaved_large_k_loop(level, ctx):
             a_names[(buf, ki)] = name
 
     def a_off(mi, ki):
-        return (mi * mfma.m * tile.unroll_k + ki * mfma.k) * elem
+        pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (mi * mfma.m * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
 
     def b_off(ni, ki):
-        return (ni * mfma.n * tile.unroll_k + ki * mfma.k) * elem
+        pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (ni * mfma.n * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
 
     def do_mfma(mi, ni, ki, a_buf):
         acc_per = mfma.acc_vgprs

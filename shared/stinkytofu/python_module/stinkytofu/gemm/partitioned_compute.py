@@ -64,10 +64,10 @@ def emit_partitioned_compute(
                 f"partitions ({partition_m}x{partition_n}x{ki_count})")
 
     def b_off(ni, ki):
-        return (ni * mfma.n * tile.unroll_k + ki * mfma.k) * elem
+        pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (ni * mfma.n * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
 
     def a_off(mi, ki):
-        return (mi * mfma.m * tile.unroll_k + ki * mfma.k) * elem
+        pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (mi * mfma.m * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
 
     # Allocate A double-buffer (persistent across partitions)
     a_names = {}
