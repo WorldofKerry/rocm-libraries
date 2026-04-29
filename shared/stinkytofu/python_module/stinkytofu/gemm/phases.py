@@ -2275,3 +2275,227 @@ DTL_PROLOGUE_PHASES = [
     TilePhase("dtl_setup", phase_dtl_setup),
     TilePhase("dtl_k_loop", phase_dtl_k_loop),
 ]
+
+# ===================================================================
+# Fully-interleaved K-loop for large tiles (128+ MFMAs)
+# Moves suffix ops (vmcnt, toggle, ds_writes) into late MFMAs
+# and prefix ops (ptr advance, global loads) into early MFMAs.
+# ===================================================================
+
+def phase_interleaved_large_k_loop(level, ctx):
+    """K-loop with suffix/prefix interleaved into MFMA gaps.
+
+    Per ki phase (64 MFMAs): preamble (9 reads + wait), then 8 mi groups.
+    Prefix (global loads) interleaved with ki=0 early mi groups.
+    Suffix (vmcnt, toggle, ds_writes) interleaved with last ki late mi groups.
+    """
+    tile = _tile(ctx)
+    problem = _problem(ctx)
+    elem = problem.element_bytes
+    mfma = tile.mfma
+    mr = tile.mfma_m_repeat
+    nr = tile.mfma_n_repeat
+    ki_count = tile.k_iterations
+    av = mfma.a_vgprs
+    bv = mfma.b_vgprs
+    lds_half = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
+    k_stride = tile.unroll_k * elem
+    log2_uk = int(math.log2(tile.unroll_k))
+
+    ctx.alloc_sgpr_permanent(1, "s_lds_db_step")
+    ctx.comment("=== Interleaved large K-loop ===")
+    ctx.s_lshr(ctx.sreg("s_k_tiles"), ctx.sreg("s_K"), log2_uk,
+               comment=f"k_tiles = K / {tile.unroll_k}")
+    ctx.s_mov(ctx.sreg("s_lds_db_step"), str(lds_half),
+              comment=f"DB toggle step = {lds_half}")
+    ctx.raw("")
+
+    # Prefetch first tile
+    ctx.comment("Prefetch first K-tile")
+    _emit_global_load_impl(ctx, problem, tile)
+    ctx.comment("Write first tile to LDS buf[0]")
+    _emit_lds_write_impl(ctx, tile)
+
+    # Per-(ni,ki) B and per-(buf,ki) A registers
+    b_names = {}
+    for ni in range(nr):
+        for ki in range(ki_count):
+            name = f"v_b_s{ni}k{ki}"
+            if not ctx.has(name):
+                ctx.alloc_vgpr_permanent(bv, name)
+            b_names[(ni, ki)] = name
+
+    a_names = {}
+    for buf in range(2):
+        for ki in range(ki_count):
+            name = f"v_a_b{buf}k{ki}"
+            if not ctx.has(name):
+                ctx.alloc_vgpr_permanent(av, name)
+            a_names[(buf, ki)] = name
+
+    def a_off(mi, ki):
+        return (mi * mfma.m * tile.unroll_k + ki * mfma.k) * elem
+
+    def b_off(ni, ki):
+        return (ni * mfma.n * tile.unroll_k + ki * mfma.k) * elem
+
+    def do_mfma(mi, ni, ki, a_buf):
+        acc_per = mfma.acc_vgprs
+        acc_off = (mi * nr + ni) * acc_per
+        ctx.inst(f"v_mfma_f32_{mfma.m}x{mfma.n}x{mfma.k}_f16",
+                 ctx.areg("acc_C", acc_off, acc_per),
+                 ctx.vreg(a_names[(a_buf, ki)], 0, av),
+                 ctx.vreg(b_names[(ni, ki)], 0, bv),
+                 ctx.areg("acc_C", acc_off, acc_per),
+                 comment=f"MFMA m{mi}_n{ni}_k{ki}")
+
+    # K-loop
+    ctx.label("k_loop")
+    ctx.raw("")
+    ctx.comment(f"Interleaved: {mr}x{nr}x{ki_count} = {mr*nr*ki_count} MFMAs")
+
+    for ki in range(ki_count):
+        is_first_ki = (ki == 0)
+        is_last_ki = (ki == ki_count - 1)
+
+        # Preamble: B reads + A[0]
+        for ni in range(nr):
+            ctx.ds_read(ctx.vreg(b_names[(ni, ki)], 0, bv),
+                        ctx.vreg("v_lds_rd_b"),
+                        offset=b_off(ni, ki), width=bv,
+                        comment=f"LR B n{ni}k{ki}")
+        cur_a = 0
+        ctx.ds_read(ctx.vreg(a_names[(cur_a, ki)], 0, av),
+                    ctx.vreg("v_lds_rd_a"),
+                    offset=a_off(0, ki), width=av,
+                    comment=f"LR A m0k{ki} b{cur_a}")
+        ctx.s_waitcnt("lgkmcnt(0)", comment=f"wait preamble k{ki}")
+        ctx.raw("")
+
+        for mi in range(mr):
+            has_a_pf = (mi < mr - 1)
+
+            # A prefetch before MFMAs
+            if has_a_pf:
+                next_a = 1 - cur_a
+                ctx.ds_read(ctx.vreg(a_names[(next_a, ki)], 0, av),
+                            ctx.vreg("v_lds_rd_a"),
+                            offset=a_off(mi + 1, ki), width=av,
+                            comment=f"LR A m{mi+1}k{ki} b{next_a}")
+
+            # PREFIX: conditional global loads in ki=0 early mi groups
+            if is_first_ki and mi == 0:
+                # k_tiles-- and conditional skip of global loads
+                ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
+                          comment="k_tiles--")
+                ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
+                         comment="SCC = (k_tiles != 0)")
+                ctx.inst("s_cbranch_scc0", "skip_gload",
+                         comment="skip gload on last iter")
+                for addr in ["v_addr_a", "v_addr_b"]:
+                    ctx.inst("v_add_co_u32", ctx.vreg(addr, 0, 1), "vcc",
+                             str(k_stride), ctx.vreg(addr, 0, 1),
+                             comment=f"{addr} += {k_stride}")
+                    ctx.inst("v_addc_co_u32", ctx.vreg(addr, 1, 1), "vcc",
+                             ctx.vreg(addr, 1, 1), "0", "vcc", comment="carry")
+                # Global loads
+                for name, aname in [("A", "v_addr_a"), ("B", "v_addr_b")]:
+                    gn = f"v_gload_{name.lower()}"
+                    load = ctx.get(gn)
+                    for i in range(0, load.count, 4):
+                        cnt = min(4, load.count - i)
+                        w = {4: "dwordx4", 2: "dwordx2", 1: "dword"}[cnt]
+                        ctx.inst(f"global_load_{w}", ctx.vreg(gn, i, cnt),
+                                 ctx.vreg(aname, 0, 2),
+                                 f"off offset:{i*4}" if i > 0 else "off",
+                                 comment=f"gload {name}[{i}:{i+cnt}]")
+                ctx.label("skip_gload")
+                # All 8 MFMAs for mi=0
+                for ni in range(nr):
+                    do_mfma(mi, ni, ki, cur_a)
+
+            elif is_first_ki and mi == 1:
+                # Regular MFMAs (global loads already issued above)
+                for ni in range(nr):
+                    do_mfma(mi, ni, ki, cur_a)
+
+            # SUFFIX: interleave with last ki, mi=mr-2 (vmcnt+toggle) and mi=mr-1 (ds_writes)
+            elif is_last_ki and mi == mr - 2:
+                # vmcnt + toggle interleaved with MFMAs
+                ctx.s_waitcnt("vmcnt(0)", comment="wait gload")
+                do_mfma(mi, 0, ki, cur_a)
+                ctx.v_add(ctx.vreg("v_lds_wr_a"), ctx.sreg("s_lds_db_step"),
+                          ctx.vreg("v_lds_wr_a"), comment="wr_a += db")
+                do_mfma(mi, 1, ki, cur_a)
+                ctx.v_add(ctx.vreg("v_lds_wr_b"), ctx.sreg("s_lds_db_step"),
+                          ctx.vreg("v_lds_wr_b"), comment="wr_b += db")
+                do_mfma(mi, 2, ki, cur_a)
+                ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.sreg("s_lds_db_step"),
+                          ctx.vreg("v_lds_rd_a"), comment="rd_a += db")
+                do_mfma(mi, 3, ki, cur_a)
+                ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.sreg("s_lds_db_step"),
+                          ctx.vreg("v_lds_rd_b"), comment="rd_b += db")
+                do_mfma(mi, 4, ki, cur_a)
+                ctx.inst("s_sub_u32", ctx.sreg("s_lds_db_step"), "0",
+                         ctx.sreg("s_lds_db_step"), comment="negate")
+                for ni in range(5, nr):
+                    do_mfma(mi, ni, ki, cur_a)
+
+            elif is_last_ki and mi == mr - 1:
+                # ds_writes interleaved with last mi group MFMAs
+                writes = []
+                for name in ["a", "b"]:
+                    load = ctx.get(f"v_gload_{name}")
+                    for i in range(0, load.count, 4):
+                        cnt = min(4, load.count - i)
+                        writes.append((name, i, cnt))
+                w_idx = 0
+                for ni in range(nr):
+                    if w_idx < len(writes):
+                        n, i, c = writes[w_idx]
+                        ctx.ds_write(ctx.vreg(f"v_lds_wr_{n}"),
+                                     ctx.vreg(f"v_gload_{n}", i, c),
+                                     offset=i * 4, width=c,
+                                     comment=f"ds_wr {n.upper()}[{i}:{i+c}]")
+                        w_idx += 1
+                    do_mfma(mi, ni, ki, cur_a)
+                while w_idx < len(writes):
+                    n, i, c = writes[w_idx]
+                    ctx.ds_write(ctx.vreg(f"v_lds_wr_{n}"),
+                                 ctx.vreg(f"v_gload_{n}", i, c),
+                                 offset=i * 4, width=c,
+                                 comment=f"ds_wr {n.upper()}[{i}:{i+c}]")
+                    w_idx += 1
+            else:
+                # Regular mi group: just MFMAs
+                for ni in range(nr):
+                    do_mfma(mi, ni, ki, cur_a)
+
+            # Wait for A prefetch
+            if has_a_pf:
+                ctx.s_waitcnt("lgkmcnt(0)", comment=f"wait A[{mi+1}]k{ki}")
+                cur_a = next_a
+
+        ctx.raw("")
+
+    # Postamble: wait for ds_writes, barrier, loop control
+    ctx.s_waitcnt("lgkmcnt(0)", comment="wait ds_writes")
+    ctx.s_barrier(comment="sync workgroup")
+    ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
+             comment="SCC = (k_tiles != 0)")
+    ctx.inst("s_cbranch_scc1", "k_loop", comment="next K-tile")
+    ctx.raw("")
+
+
+
+
+
+INTERLEAVED_LARGE_PROLOGUE_PHASES = [
+    TilePhase("load_kernargs", phase_load_kernargs),
+    TilePhase("thread_indexing", phase_thread_indexing),
+    TilePhase("load_cluster_setup", phase_load_cluster_setup),
+    TilePhase("lds_addrs", phase_lds_addrs),
+    TilePhase("init_acc", phase_init_acc),
+    TilePhase("global_addrs", phase_global_addrs),
+    TilePhase("interleaved_large_k_loop", phase_interleaved_large_k_loop),
+]

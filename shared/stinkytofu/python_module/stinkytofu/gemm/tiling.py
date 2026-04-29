@@ -317,7 +317,8 @@ class GemmTiling:
                        scheduled: bool = False,
                        interleaved: bool = False,
                        pgr2: bool = False,
-                       dtl: bool = False) -> TileLevel:
+                       dtl: bool = False,
+                       interleaved_large: bool = False) -> TileLevel:
         """Build the full tile tree with phases from TileDim chains.
 
         The chain structure determines the tree levels:
@@ -341,7 +342,8 @@ class GemmTiling:
             PIPELINED_PROLOGUE_PHASES, OPTIMIZED_PROLOGUE_PHASES,
             SCHEDULED_PROLOGUE_PHASES,
             PGR2_PROLOGUE_PHASES,
-            DTL_PROLOGUE_PHASES, INTERLEAVED_PROLOGUE_PHASES,
+            DTL_PROLOGUE_PHASES,
+            INTERLEAVED_LARGE_PROLOGUE_PHASES, INTERLEAVED_PROLOGUE_PHASES,
         )
 
         # Leaf: MFMA instruction (from HARDWARE TileDim leaves)
@@ -351,7 +353,7 @@ class GemmTiling:
 
         # Wave: per-wave compute tile
         # K-loop data movement phases go here (non-pipelined)
-        if pipelined or optimized or scheduled or interleaved or pgr2 or dtl:
+        if pipelined or optimized or scheduled or interleaved or pgr2 or dtl or interleaved_large:
             # Pipelined/optimized: K-loop phase handles compute internally.
             # Wave gets a no-op emit so the tree walker skips it.
             wave_level = TileLevel(
@@ -368,7 +370,9 @@ class GemmTiling:
                 epilogue_phases=list(WAVE_EPILOGUE_PHASES))
 
         # Workgroup: setup + K-loop structure + store
-        if dtl:
+        if interleaved_large:
+            wg_pro = list(INTERLEAVED_LARGE_PROLOGUE_PHASES)
+        elif dtl:
             wg_pro = list(DTL_PROLOGUE_PHASES)
         elif pgr2:
             wg_pro = list(PGR2_PROLOGUE_PHASES)

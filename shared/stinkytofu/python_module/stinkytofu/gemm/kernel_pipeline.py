@@ -130,7 +130,8 @@ class GemmKernel:
               scheduled: bool = False,
               interleaved: bool = False,
               pgr2: bool = False,
-              dtl: bool = False) -> GemmKernel:
+              dtl: bool = False,
+              interleaved_large: bool = False) -> GemmKernel:
         """Build a GemmKernel.  GemmTiling is the source of truth.
 
         Args:
@@ -152,7 +153,7 @@ class GemmKernel:
             if tile is not None:
                 tiling = GemmTiling.from_tile_config(tile)
             else:
-                if optimized or scheduled or interleaved or pgr2 or dtl:
+                if optimized or scheduled or interleaved or pgr2 or dtl or interleaved_large:
                     tiling = GemmTiling.high_perf()
                 else:
                     tiling = GemmTiling.standard()
@@ -169,7 +170,8 @@ class GemmKernel:
                 pipelined=pipelined, optimized=optimized,
                 scheduled=scheduled, interleaved=interleaved,
                 pgr2=pgr2,
-                dtl=dtl)
+                dtl=dtl,
+                interleaved_large=interleaved_large)
 
         tile_tree.validate()
 
@@ -186,7 +188,7 @@ class GemmKernel:
         elem = self.problem.element_bytes
         lds_half = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
         # Double LDS for double-buffered mode
-        is_db = any(p.name in ("optimized_k_loop", "scheduled_k_loop", "fully_interleaved_k_loop", "pgr2_k_loop", "dtl_k_loop")
+        is_db = any(p.name in ("optimized_k_loop", "scheduled_k_loop", "fully_interleaved_k_loop", "pgr2_k_loop", "dtl_k_loop", "interleaved_large_k_loop")
                      for p in self.tile_tree.prologue_phases)
         lds_total = lds_half * 2 if is_db else lds_half
 
