@@ -651,27 +651,11 @@ PIPELINED_PROLOGUE_PHASES = [
 # ===================================================================
 
 def phase_optimized_k_loop(level, ctx):
-    """K-loop with all optimizations combined.
+    """K-loop with fully interleaved instruction scheduling.
 
-    1. Double-buffered LDS: write to buf[A] while reading from buf[B],
-       eliminating one barrier per iteration.
-    2. Software pipelining: overlap global_load(n+1) with compute(n).
-    3. MFMA/LR interleaving: issue ds_read for MFMA[i+1] during
-       MFMA[i] execution (32-cycle MFMA hides 20-cycle ds_read).
-    4. Fine-grained waitcnt: vmcnt/lgkmcnt with precise counts
-       instead of s_waitcnt 0.
-
-    Structure::
-
-        prefetch tile[0]; waitcnt vmcnt(0)
-        lds_write to buf[0]; waitcnt lgkmcnt(0); barrier
-        k_loop:
-          [advance + global_load async]
-          compute from buf[cur] (interleaved MFMA/LR)
-          waitcnt vmcnt(0)
-          toggle LDS offsets
-          lds_write to buf[other]; waitcnt lgkmcnt(0); barrier
-          k_loop_control
+    All overhead (advance, global_load, LDS toggle, ds_write) is
+    interleaved between MFMAs to execute during MFMA pipeline time.
+    Double-buffered LDS. Subtile-scheduled MFMA/LR with ds_read_b64.
     """
     tile = _tile(ctx)
     problem = _problem(ctx)
@@ -683,26 +667,19 @@ def phase_optimized_k_loop(level, ctx):
     k_stride = tile.unroll_k * elem
     log2_uk = int(math.log2(tile.unroll_k))
 
-    # Allocate SGPR for double-buffer toggle step (+lds_half or -lds_half)
     ctx.alloc_sgpr_permanent(1, "s_lds_db_step")
 
-    # Allocate second operand buffer for MFMA/LR interleaving
-    ctx.alloc_vgpr_permanent(mfma.a_vgprs, "v_a2")
-    ctx.alloc_vgpr_permanent(mfma.b_vgprs, "v_b2")
-
     # K-tile count
-    ctx.comment("=== Optimized K-loop: DB-LDS + pipeline + interleaved MFMA/LR ===")
+    ctx.comment("=== Fully interleaved K-loop ===")
     ctx.s_lshr(ctx.sreg("s_k_tiles"), ctx.sreg("s_K"), log2_uk,
                comment=f"k_tiles = K / {tile.unroll_k}")
     ctx.s_mov(ctx.sreg("s_lds_db_step"), str(lds_half),
               comment=f"DB toggle step = {lds_half}")
     ctx.raw("")
 
-    # Prefetch first tile
+    # Prefetch first tile + write to LDS
     ctx.comment("Prefetch first K-tile")
     _emit_global_load_impl(ctx, problem, tile)
-
-    # Write to buf[0]
     ctx.comment("Write first tile to LDS buf[0]")
     _emit_lds_write_impl(ctx, tile)
 
@@ -718,29 +695,28 @@ def phase_optimized_k_loop(level, ctx):
     ctx.inst("s_cbranch_scc0", "skip_prefetch",
              comment="skip prefetch on last iteration")
 
-    # Advance + async global load
-    ctx.comment("Advance ptrs + prefetch next K-tile (async)")
+    # Advance pointers
     for addr in ["v_addr_a", "v_addr_b"]:
         ctx.inst("v_add_co_u32", ctx.vreg(addr, 0, 1), "vcc",
                  str(k_stride), ctx.vreg(addr, 0, 1),
                  comment=f"{addr} += {k_stride}")
         ctx.inst("v_addc_co_u32", ctx.vreg(addr, 1, 1), "vcc",
                  ctx.vreg(addr, 1, 1), "0", "vcc", comment="carry")
+
+    # Issue global loads (async, no wait)
     _emit_global_load_no_wait(ctx, problem, tile)
     ctx.raw("")
 
     ctx.label("skip_prefetch")
     ctx.raw("")
 
-    # Compute: subtile-scheduled MFMA (4 MFMAs grouped between reads)
-    ctx.comment("Compute: subtile-scheduled MFMA from current LDS buffer")
+    # Subtile compute with interleaved post-compute overhead
+    ctx.comment("Subtile compute + interleaved overhead")
     _emit_subtile_compute(ctx, tile, problem)
-    ctx.raw("")
 
-    # Wait for global load
+    # Post-compute: wait for global_load, toggle LDS, write, barrier
     ctx.s_waitcnt("vmcnt(0)", comment="wait for global_load")
 
-    # Toggle LDS offsets for double buffering
     ctx.comment("Toggle LDS double-buffer offsets")
     for reg in ["v_lds_wr_a", "v_lds_wr_b", "v_lds_rd_a", "v_lds_rd_b"]:
         ctx.v_add(ctx.vreg(reg), ctx.sreg("s_lds_db_step"), ctx.vreg(reg),
@@ -750,7 +726,6 @@ def phase_optimized_k_loop(level, ctx):
              comment="negate step for next toggle")
     ctx.raw("")
 
-    # Write to other LDS buffer
     ctx.comment("Write next tile to other LDS buffer")
     _emit_lds_write_impl(ctx, tile)
 
