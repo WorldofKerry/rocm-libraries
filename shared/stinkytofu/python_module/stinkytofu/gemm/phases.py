@@ -91,30 +91,53 @@ def phase_thread_indexing(level, ctx):
 
 
 def phase_load_cluster_setup(level, ctx):
-    """Compute global-load thread cluster coordinates (row, col)."""
+    """Compute global-load thread cluster coordinates for A and B.
+
+    For symmetric tiles (wg_m == wg_n), A and B use the same mapping.
+    For asymmetric tiles, B gets its own row/col computed from wg_n.
+    """
     tile = _tile(ctx)
     problem = _problem(ctx)
     elem = problem.element_bytes
-    elems_per_thread = (tile.wg_m * tile.unroll_k) // tile.block_size
-    contiguous_k = min(elems_per_thread, tile.unroll_k)
-    k_groups = max(1, tile.unroll_k // contiguous_k)
 
-    ctx.comment(f"Global-load cluster: {tile.block_size // k_groups} rows x "
-                f"{k_groups} K-groups ({contiguous_k} elems each)")
-    if k_groups == 1:
-        ctx.v_mov(ctx.vreg("v_gload_row"), ctx.vreg("v_tid"),
-                  comment="row = tid (k_groups=1)")
-        ctx.v_mov(ctx.vreg("v_gload_col"), "0", comment="col = 0")
+    def _emit_cluster(wg_dim, row_reg, col_reg, label):
+        """Emit thread cluster coords for a tile of size wg_dim x unroll_k."""
+        elems_per_thread = (wg_dim * tile.unroll_k) // tile.block_size
+        contiguous_k = min(elems_per_thread, tile.unroll_k)
+        k_groups = max(1, tile.unroll_k // contiguous_k)
+        rows = tile.block_size // k_groups
+
+        ctx.comment(f"Load cluster {label}: {rows} rows x "
+                     f"{k_groups} K-groups ({contiguous_k} elems each)")
+        if k_groups == 1:
+            ctx.v_mov(row_reg, ctx.vreg("v_tid"),
+                      comment=f"{label} row = tid")
+            ctx.v_mov(col_reg, "0", comment=f"{label} col = 0")
+        else:
+            log2_kg = int(math.log2(k_groups))
+            ctx.v_lshr(row_reg, ctx.vreg("v_tid"), log2_kg,
+                       comment=f"{label} row = tid >> {log2_kg}")
+            ctx.v_and(col_reg, ctx.vreg("v_tid"), k_groups - 1,
+                      comment=f"{label} tid % {k_groups}")
+            if contiguous_k > 1:
+                log2_ck = int(math.log2(contiguous_k))
+                ctx.v_lshl(col_reg, col_reg,
+                           log2_ck, comment=f"* {contiguous_k} -> k_start")
+
+    # A cluster
+    _emit_cluster(tile.wg_m, ctx.vreg("v_gload_row"), ctx.vreg("v_gload_col"), "A")
+    ctx.raw("")
+
+    # B cluster (may differ from A if wg_m != wg_n)
+    if tile.wg_m == tile.wg_n:
+        ctx.comment("B uses same cluster as A (symmetric tile)")
+        ctx.v_mov(ctx.vreg("v_gload_row_b"), ctx.vreg("v_gload_row"),
+                  comment="B row = A row")
+        ctx.v_mov(ctx.vreg("v_gload_col_b"), ctx.vreg("v_gload_col"),
+                  comment="B col = A col")
     else:
-        log2_kg = int(math.log2(k_groups))
-        ctx.v_lshr(ctx.vreg("v_gload_row"), ctx.vreg("v_tid"), log2_kg,
-                   comment=f"row = tid >> {log2_kg}")
-        ctx.v_and(ctx.vreg("v_gload_col"), ctx.vreg("v_tid"), k_groups - 1,
-                  comment=f"tid % {k_groups}")
-        if contiguous_k > 1:
-            log2_ck = int(math.log2(contiguous_k))
-            ctx.v_lshl(ctx.vreg("v_gload_col"), ctx.vreg("v_gload_col"),
-                       log2_ck, comment=f"* {contiguous_k} -> k_start")
+        _emit_cluster(tile.wg_n, ctx.vreg("v_gload_row_b"),
+                      ctx.vreg("v_gload_col_b"), "B")
     ctx.raw("")
 
 
@@ -137,8 +160,12 @@ def phase_lds_addrs(level, ctx):
                 scale=elem, comment="lds_wr_a")
     ctx.raw("")
 
+    wr_bindings_b = {
+        "row": ctx.vreg("v_gload_row_b"),
+        "col": ctx.vreg("v_gload_col_b"),
+    }
     ctx.comment(f"LDS write B: {layouts.lds_b} + offset {layouts.lds_b_offset}")
-    emit_affine(ctx, layouts.lds_b, wr_bindings,
+    emit_affine(ctx, layouts.lds_b, wr_bindings_b,
                 result=ctx.vreg("v_lds_wr_b"),
                 scale=elem, base=str(layouts.lds_b_offset),
                 comment="lds_wr_b")
@@ -220,6 +247,9 @@ def phase_global_addrs(level, ctx):
     ]:
         addr_v = "v_addr_a" if name == "A" else "v_addr_b"
         dim_name = "m" if name == "A" else "n"
+        # Use B-specific load cluster coords for B
+        row_reg = "v_gload_row" if name == "A" else "v_gload_row_b"
+        col_reg = "v_gload_col" if name == "A" else "v_gload_col_b"
 
         ctx.comment(f"Global address {name}: {layout} [{dim_name} coeff = s_K]")
 
@@ -227,12 +257,12 @@ def phase_global_addrs(level, ctx):
         ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg(wg_id_s), str(wg_size),
                   comment=f"wg_id * {wg_size}")
         ctx.v_add(ctx.vreg("v_tmp0"), ctx.sreg("s_tmp0"),
-                  ctx.vreg("v_gload_row"), comment="+ thread_row -> global_row")
+                  ctx.vreg(row_reg), comment="+ thread_row -> global_row")
 
         # offset = global_row * K + col  (K is dynamic, via transform)
         emit_affine(ctx, layout,
                     bindings={dim_name: ctx.vreg("v_tmp0"),
-                              "k": ctx.vreg("v_gload_col")},
+                              "k": ctx.vreg(col_reg)},
                     result=ctx.vreg("v_tmp0"),
                     dynamic_coefficients={dim_name: ctx.sreg("s_K")},
                     scale=problem.element_bytes,

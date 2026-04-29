@@ -85,6 +85,9 @@ def alloc_registers(ctx: AsmContext, problem: GemmProblem,
 
     ctx.alloc_vgpr_permanent(1, "v_gload_row")
     ctx.alloc_vgpr_permanent(1, "v_gload_col")
+    # Separate B load cluster coords (used when wg_m != wg_n)
+    ctx.alloc_vgpr_permanent(1, "v_gload_row_b")
+    ctx.alloc_vgpr_permanent(1, "v_gload_col_b")
 
     ctx.alloc_vgpr_permanent(1, "v_lds_wr_a")
     ctx.alloc_vgpr_permanent(1, "v_lds_wr_b")
