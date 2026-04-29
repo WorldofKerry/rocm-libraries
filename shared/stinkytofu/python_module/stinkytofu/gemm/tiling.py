@@ -238,7 +238,7 @@ class GemmTiling:
         waves_m: int = 2, waves_n: int = 2,
         mfma: Optional[MfmaConfig] = None,
         wave_size: int = 64,
-        lds_pad: int = 4,  # 4 bytes padding eliminates 8-way bank conflicts
+        lds_pad: int = 0,  # TODO: fix non-pow2 padding slowdown, then re-enable
     ) -> GemmTiling:
         """High-performance tiling for gfx950.
 
@@ -324,7 +324,8 @@ class GemmTiling:
                        pgr2: bool = False,
                        dtl: bool = False,
                        interleaved_large: bool = False,
-                       auto_scheduled: bool = False) -> TileLevel:
+                      auto_scheduled: bool = False,
+                       pgr2_interleaved: bool = False) -> TileLevel:
         """Build the full tile tree with phases from TileDim chains.
 
         The chain structure determines the tree levels:
@@ -359,7 +360,7 @@ class GemmTiling:
 
         # Wave: per-wave compute tile
         # K-loop data movement phases go here (non-pipelined)
-        if pipelined or optimized or scheduled or interleaved or pgr2 or dtl or interleaved_large or auto_scheduled:
+        if pipelined or optimized or scheduled or interleaved or pgr2 or dtl or interleaved_large or auto_scheduled or pgr2_interleaved:
             # Pipelined/optimized: K-loop phase handles compute internally.
             # Wave gets a no-op emit so the tree walker skips it.
             wave_level = TileLevel(
@@ -376,7 +377,10 @@ class GemmTiling:
                 epilogue_phases=list(WAVE_EPILOGUE_PHASES))
 
         # Workgroup: setup + K-loop structure + store
-        if auto_scheduled:
+        if pgr2_interleaved:
+            from .pgr2_interleaved import PGR2_INTERLEAVED_PROLOGUE_PHASES
+            wg_pro = list(PGR2_INTERLEAVED_PROLOGUE_PHASES)
+        elif auto_scheduled:
             from .auto_scheduled_phase import _get_prologue_phases
             wg_pro = _get_prologue_phases()
         elif interleaved_large:
