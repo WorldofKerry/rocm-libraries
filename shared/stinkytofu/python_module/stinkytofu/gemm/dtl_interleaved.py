@@ -418,27 +418,37 @@ def phase_dtl_interleaved_k_loop(level, ctx):
     ctx.label("dtl_skip_all")
     ctx.raw("")
 
-    # --- Preamble merged with mi=0 group ---
-    # Issue all B reads + A[m0], then lgkmcnt, then mi=0 MFMAs.
-    # B reads are issued BEFORE the lgkmcnt gap is filled with DTL loads
-    # (which were already issued above), so the ~34 read issue cycles
-    # overlap with the in-flight DTL loads.
-    ctx.comment("Preamble: B + A[m0] reads")
-    for ki in range(ki_count):
-        for ni in range(nr):
-            ctx.ds_read(ctx.vreg(b_names[(ni, ki)], 0, bv),
-                        ctx.vreg("v_lds_rd_b"),
-                        offset=_b_off(ni, ki, tile, mfma, elem),
-                        width=bv, comment=f"LR B n{ni}k{ki}")
+    # --- Preamble: B[ki=0] + A[m0,ki=0], lgkmcnt, then B[ki=1] interleaved ---
+    ctx.comment("Preamble: B[ki=0] + A[m0]")
+    # Issue ki=0 B reads and A[m0,k0]
+    for ni in range(nr):
+        ctx.ds_read(ctx.vreg(b_names[(ni, 0)], 0, bv),
+                    ctx.vreg("v_lds_rd_b"),
+                    offset=_b_off(ni, 0, tile, mfma, elem),
+                    width=bv, comment=f"LR B n{ni}k0")
 
     cur_a = 0
-    for ki in range(ki_count):
-        ctx.ds_read(ctx.vreg(a_names[(cur_a, ki)], 0, av),
-                    ctx.vreg("v_lds_rd_a"),
-                    offset=_a_off(0, ki, tile, mfma, elem),
-                    width=av, comment=f"LR A m0k{ki} b{cur_a}")
+    ctx.ds_read(ctx.vreg(a_names[(cur_a, 0)], 0, av),
+                ctx.vreg("v_lds_rd_a"),
+                offset=_a_off(0, 0, tile, mfma, elem),
+                width=av, comment=f"LR A m0k0 b{cur_a}")
 
-    ctx.s_waitcnt("lgkmcnt(0)", comment="wait preamble")
+    # Issue ki=1 B reads (will be interleaved with mi=0 ki=0 MFMAs)
+    for ni in range(nr):
+        ctx.ds_read(ctx.vreg(b_names[(ni, 1)], 0, bv),
+                    ctx.vreg("v_lds_rd_b"),
+                    offset=_b_off(ni, 1, tile, mfma, elem),
+                    width=bv, comment=f"LR B n{ni}k1")
+
+    ctx.ds_read(ctx.vreg(a_names[(cur_a, 1)], 0, av),
+                ctx.vreg("v_lds_rd_a"),
+                offset=_a_off(0, 1, tile, mfma, elem),
+                width=av, comment=f"LR A m0k1 b{cur_a}")
+
+    # Wait for ki=0 reads (we need them for the first 8 MFMAs)
+    # There are 18 reads total, ki=0 was issued first (9 reads)
+    # lgkmcnt(9) means wait until 9 are left = first 9 are done
+    ctx.s_waitcnt("lgkmcnt(9)", comment="wait B[ki=0] + A[m0,k0]")
     ctx.raw("")
 
     # --- 128 MFMAs with interleaved ops ---
@@ -450,6 +460,9 @@ def phase_dtl_interleaved_k_loop(level, ctx):
 
         mfma_idx = 0
         for ki in range(ki_count):
+            # Wait for ki=1 data before first ki=1 MFMA of mi=0
+            if mi == 0 and ki == 1:
+                ctx.s_waitcnt("lgkmcnt(0)", comment="wait B[ki=1] + A[m0,k1]")
             for ni in range(nr):
                 # A-prefetch: spread ds_reads at slots 2 and 10
                 # (earlier = more time for data to arrive before lgkmcnt)
