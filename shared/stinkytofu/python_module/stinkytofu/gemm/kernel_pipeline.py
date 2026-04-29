@@ -127,7 +127,9 @@ class GemmKernel:
               tiling: Optional[GemmTiling] = None,
               pipelined: bool = False,
               optimized: bool = False,
-              scheduled: bool = False) -> GemmKernel:
+              scheduled: bool = False,
+              interleaved: bool = False,
+              pgr2: bool = False) -> GemmKernel:
         """Build a GemmKernel.  GemmTiling is the source of truth.
 
         Args:
@@ -141,13 +143,15 @@ class GemmKernel:
                        pipelining + interleaved MFMA/LR + fine waitcnt).
             scheduled: If True, use three-layer scheduled codegen with
                        TileOp-based slot placement (DESIGN.md Phase 2).
+            interleaved: If True, use fully-interleaved K-loop that
+                         distributes ALL overhead between MFMAs.
         """
         # GemmTiling is always the source of truth
         if tiling is None:
             if tile is not None:
                 tiling = GemmTiling.from_tile_config(tile)
             else:
-                if optimized or scheduled:
+                if optimized or scheduled or interleaved or pgr2:
                     tiling = GemmTiling.high_perf()
                 else:
                     tiling = GemmTiling.standard()
@@ -162,7 +166,8 @@ class GemmKernel:
         if tile_tree is None:
             tile_tree = tiling.build_tile_tree(
                 pipelined=pipelined, optimized=optimized,
-                scheduled=scheduled)
+                scheduled=scheduled, interleaved=interleaved,
+                pgr2=pgr2)
 
         tile_tree.validate()
 
@@ -179,7 +184,7 @@ class GemmKernel:
         elem = self.problem.element_bytes
         lds_half = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
         # Double LDS for double-buffered mode
-        is_db = any(p.name in ("optimized_k_loop", "scheduled_k_loop")
+        is_db = any(p.name in ("optimized_k_loop", "scheduled_k_loop", "fully_interleaved_k_loop", "pgr2_k_loop")
                      for p in self.tile_tree.prologue_phases)
         lds_total = lds_half * 2 if is_db else lds_half
 
