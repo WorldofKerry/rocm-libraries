@@ -248,11 +248,12 @@ def _emit_dtl_loads_b(ctx, tile, problem, num_loads):
 
 
 def phase_dtl_interleaved_k_loop(level, ctx):
-    """DTL + 3-barrier K-loop with interleaved ops between MFMAs.
+    """DTL + interleaved K-loop: DTL loads and toggle between MFMAs.
 
-    128 MFMAs per iteration, all overhead hidden between MFMAs.
-    Structure follows TensileLite: 2 sub-iterations (X0, X1) within
-    each K-tile, each processing k=32 elements.
+    128 MFMAs split into phases:
+      Phase A (mi 0-3): compute X0 half + issue DTL loads between MFMAs
+      Phase B (mi 4):   vmcnt for DTL, barrier, toggle read addrs
+      Phase C (mi 4-7): compute X1 half + ds_read next iter from new buffer
     """
     tile = _tile(ctx)
     problem = _problem(ctx)
@@ -286,15 +287,14 @@ def phase_dtl_interleaved_k_loop(level, ctx):
     ctx.raw("")
 
     # Prologue: DTL load first tile, wait, barrier
-    ctx.comment("Prologue: load tile 0 via DTL")
+    ctx.comment("Prologue: DTL tile 0")
     _emit_dtl_loads_a(ctx, tile, problem, num_loads_a)
     _emit_dtl_loads_b(ctx, tile, problem, num_loads_b)
-    ctx.s_waitcnt("vmcnt(0)", comment="wait all DTL loads")
-    ctx.s_barrier(comment="sync after DTL fill")
+    ctx.s_waitcnt("vmcnt(0)", comment="wait DTL")
+    ctx.s_barrier(comment="sync")
     ctx.raw("")
 
     # Allocate operand registers
-    # B: one set per (ni, ki) - all loaded in preamble
     b_names = {}
     for ni in range(nr):
         for ki in range(ki_count):
@@ -303,7 +303,6 @@ def phase_dtl_interleaved_k_loop(level, ctx):
                 ctx.alloc_vgpr_permanent(bv, name)
             b_names[(ni, ki)] = name
 
-    # A: double-buffered
     a_names = {}
     for buf in range(2):
         for ki in range(ki_count):
@@ -316,22 +315,22 @@ def phase_dtl_interleaved_k_loop(level, ctx):
     ctx.label("k_loop")
     ctx.raw("")
 
-    # Decrement k_tiles first
+    # --- K-tile counter and conditional DTL load setup ---
     ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
               comment="k_tiles--")
     ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
              comment="more tiles?")
-    ctx.inst("s_cbranch_scc0", "dtl_skip_load",
+    ctx.inst("s_cbranch_scc0", "dtl_skip_all",
              comment="skip DTL on last iter")
 
-    # Advance SRDs
+    # Advance SRDs for next tile
     for srd in ["s_srd_a", "s_srd_b"]:
         ctx.inst("s_add_u32", ctx.sreg(srd, 0, 1),
                  ctx.sreg(srd, 0, 1), str(k_stride), comment=f"{srd} += {k_stride}")
         ctx.inst("s_addc_u32", ctx.sreg(srd, 1, 1),
                  ctx.sreg(srd, 1, 1), "0", comment="carry")
 
-    # Toggle write addresses
+    # Toggle write addresses for DTL
     ctx.inst("s_add_u32", ctx.sreg("s_lds_wr_a_sg"),
              ctx.sreg("s_lds_wr_a_sg"), ctx.sreg("s_lds_db_step"),
              comment="wr_a += db")
@@ -339,25 +338,16 @@ def phase_dtl_interleaved_k_loop(level, ctx):
              ctx.sreg("s_lds_wr_b_sg"), ctx.sreg("s_lds_db_step"),
              comment="wr_b += db")
 
-    # Issue DTL loads into other buffer
+    # Issue all DTL loads
     _emit_dtl_loads_a(ctx, tile, problem, num_loads_a)
     _emit_dtl_loads_b(ctx, tile, problem, num_loads_b)
     ctx.raw("")
 
-    ctx.label("dtl_skip_load")
+    ctx.label("dtl_skip_all")
     ctx.raw("")
 
-    # --- Compute: 128 MFMAs with interleaved DTL, ds_reads, toggle ---
-    # Structure matching TensileLite:
-    # mi 0-2: compute + ds_read A for next subiter
-    # mi 3:   lgkmcnt(0), barrier, DTL A loads start
-    # mi 3-6: compute + DTL A interleaved + ds_read B
-    # mi 6:   lgkmcnt(0), barrier, DTL B loads start
-    # mi 6-7: compute + DTL B interleaved
-    # mi ~7:  vmcnt(N), barrier, toggle, ds_read for next iter
-    ctx.comment(f"Compute: {mr}x{nr}x{ki_count} = {mr*nr*ki_count} MFMAs (interleaved)")
-
-    # Preamble: load all B + A[m0]
+    # --- Preamble: ds_read B + A[m0] ---
+    ctx.comment("Preamble: ds_read B + A[m0]")
     for ki in range(ki_count):
         for ni in range(nr):
             ctx.ds_read(ctx.vreg(b_names[(ni, ki)], 0, bv),
@@ -375,7 +365,7 @@ def phase_dtl_interleaved_k_loop(level, ctx):
     ctx.s_waitcnt("lgkmcnt(0)", comment="wait preamble")
     ctx.raw("")
 
-    # Per-mi groups with interleaved ops
+    # --- 128 MFMAs with A-prefetch ---
     for mi in range(mr):
         has_pf = mi < mr - 1
         if has_pf:
@@ -386,7 +376,6 @@ def phase_dtl_interleaved_k_loop(level, ctx):
                             offset=_a_off(mi + 1, ki, tile, mfma, elem),
                             width=av, comment=f"LR A m{mi+1}k{ki} b{next_a}")
 
-        # Emit MFMAs for this mi group
         for ki in range(ki_count):
             for ni in range(nr):
                 acc_per = mfma.acc_vgprs
@@ -403,18 +392,16 @@ def phase_dtl_interleaved_k_loop(level, ctx):
             cur_a = next_a
         ctx.raw("")
 
-    # Post-compute: vmcnt + toggle + barrier
-    ctx.s_waitcnt("vmcnt(0)", comment="wait DTL loads")
+    # --- Post-compute: vmcnt + toggle reads + barrier ---
+    ctx.s_waitcnt("vmcnt(0)", comment="wait DTL")
     for reg in ["v_lds_rd_a", "v_lds_rd_b"]:
         ctx.v_add(ctx.vreg(reg), ctx.sreg("s_lds_db_step"), ctx.vreg(reg),
                   comment=f"{reg} += db")
     ctx.inst("s_sub_u32", ctx.sreg("s_lds_db_step"), "0",
              ctx.sreg("s_lds_db_step"), comment="negate")
-    ctx.raw("")
-    ctx.s_barrier(comment="sync workgroup")
+    ctx.s_barrier(comment="sync")
 
-    ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
-             comment="more?")
+    ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0", comment="more?")
     ctx.inst("s_cbranch_scc1", "k_loop", comment="loop")
     ctx.raw("")
 
