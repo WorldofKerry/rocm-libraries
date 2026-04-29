@@ -347,8 +347,15 @@ def phase_dtl_interleaved_k_loop(level, ctx):
     ctx.label("dtl_skip_load")
     ctx.raw("")
 
-    # --- Compute: 128 MFMAs with A-prefetch ---
-    ctx.comment(f"Compute: {mr}x{nr}x{ki_count} = {mr*nr*ki_count} MFMAs")
+    # --- Compute: 128 MFMAs with interleaved DTL, ds_reads, toggle ---
+    # Structure matching TensileLite:
+    # mi 0-2: compute + ds_read A for next subiter
+    # mi 3:   lgkmcnt(0), barrier, DTL A loads start
+    # mi 3-6: compute + DTL A interleaved + ds_read B
+    # mi 6:   lgkmcnt(0), barrier, DTL B loads start
+    # mi 6-7: compute + DTL B interleaved
+    # mi ~7:  vmcnt(N), barrier, toggle, ds_read for next iter
+    ctx.comment(f"Compute: {mr}x{nr}x{ki_count} = {mr*nr*ki_count} MFMAs (interleaved)")
 
     # Preamble: load all B + A[m0]
     for ki in range(ki_count):
@@ -368,7 +375,7 @@ def phase_dtl_interleaved_k_loop(level, ctx):
     ctx.s_waitcnt("lgkmcnt(0)", comment="wait preamble")
     ctx.raw("")
 
-    # Per-mi groups
+    # Per-mi groups with interleaved ops
     for mi in range(mr):
         has_pf = mi < mr - 1
         if has_pf:
@@ -379,6 +386,7 @@ def phase_dtl_interleaved_k_loop(level, ctx):
                             offset=_a_off(mi + 1, ki, tile, mfma, elem),
                             width=av, comment=f"LR A m{mi+1}k{ki} b{next_a}")
 
+        # Emit MFMAs for this mi group
         for ki in range(ki_count):
             for ni in range(nr):
                 acc_per = mfma.acc_vgprs
@@ -395,17 +403,14 @@ def phase_dtl_interleaved_k_loop(level, ctx):
             cur_a = next_a
         ctx.raw("")
 
-    # Wait for DTL loads + toggle reads + barrier
+    # Post-compute: vmcnt + toggle + barrier
     ctx.s_waitcnt("vmcnt(0)", comment="wait DTL loads")
-
-    # Toggle read addresses
     for reg in ["v_lds_rd_a", "v_lds_rd_b"]:
         ctx.v_add(ctx.vreg(reg), ctx.sreg("s_lds_db_step"), ctx.vreg(reg),
                   comment=f"{reg} += db")
     ctx.inst("s_sub_u32", ctx.sreg("s_lds_db_step"), "0",
              ctx.sreg("s_lds_db_step"), comment="negate")
     ctx.raw("")
-
     ctx.s_barrier(comment="sync workgroup")
 
     ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
