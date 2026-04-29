@@ -418,8 +418,12 @@ def phase_dtl_interleaved_k_loop(level, ctx):
     ctx.label("dtl_skip_all")
     ctx.raw("")
 
-    # --- Preamble: ds_read B + A[m0] ---
-    ctx.comment("Preamble: ds_read B + A[m0]")
+    # --- Preamble merged with mi=0 group ---
+    # Issue all B reads + A[m0], then lgkmcnt, then mi=0 MFMAs.
+    # B reads are issued BEFORE the lgkmcnt gap is filled with DTL loads
+    # (which were already issued above), so the ~34 read issue cycles
+    # overlap with the in-flight DTL loads.
+    ctx.comment("Preamble: B + A[m0] reads")
     for ki in range(ki_count):
         for ni in range(nr):
             ctx.ds_read(ctx.vreg(b_names[(ni, ki)], 0, bv),
@@ -437,30 +441,41 @@ def phase_dtl_interleaved_k_loop(level, ctx):
     ctx.s_waitcnt("lgkmcnt(0)", comment="wait preamble")
     ctx.raw("")
 
-    # --- 128 MFMAs with interleaved A-prefetch ds_reads ---
-    # Place ds_reads BETWEEN MFMAs to prevent pipeline stalls.
-    # Each mi group has nr*ki_count=16 MFMAs. A-prefetch needs
-    # 2 ds_reads per group (ki_count=2). Place them at slots 1 and 3.
-    # lgkmcnt(0) at the start of the next mi group.
+    # --- 128 MFMAs with interleaved ops ---
     for mi in range(mr):
         has_pf = mi < mr - 1
+        is_last = mi == mr - 1
         if has_pf:
             next_a = 1 - cur_a
 
-        mfma_idx = 0  # index within this mi group
+        mfma_idx = 0
         for ki in range(ki_count):
             for ni in range(nr):
-                # Interleave A-prefetch before specific MFMA slots
-                if has_pf and mfma_idx == 1:
+                # A-prefetch: spread ds_reads at slots 2 and 10
+                # (earlier = more time for data to arrive before lgkmcnt)
+                if has_pf and mfma_idx == 2:
                     ctx.ds_read(ctx.vreg(a_names[(next_a, 0)], 0, av),
                                 ctx.vreg("v_lds_rd_a"),
                                 offset=_a_off(mi + 1, 0, tile, mfma, elem),
                                 width=av, comment=f"LR A m{mi+1}k0 b{next_a}")
-                elif has_pf and mfma_idx == 5:
+                elif has_pf and mfma_idx == 10:
                     ctx.ds_read(ctx.vreg(a_names[(next_a, 1)], 0, av),
                                 ctx.vreg("v_lds_rd_a"),
                                 offset=_a_off(mi + 1, 1, tile, mfma, elem),
                                 width=av, comment=f"LR A m{mi+1}k1 b{next_a}")
+
+                # Suffix ops in last mi group
+                if is_last and mfma_idx == 8:
+                    ctx.s_waitcnt("vmcnt(0)", comment="wait DTL")
+                elif is_last and mfma_idx == 10:
+                    ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.sreg("s_lds_db_step"),
+                              ctx.vreg("v_lds_rd_a"), comment="rd_a += db")
+                elif is_last and mfma_idx == 11:
+                    ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.sreg("s_lds_db_step"),
+                              ctx.vreg("v_lds_rd_b"), comment="rd_b += db")
+                elif is_last and mfma_idx == 12:
+                    ctx.inst("s_sub_u32", ctx.sreg("s_lds_db_step"), "0",
+                             ctx.sreg("s_lds_db_step"), comment="negate db")
 
                 acc_per = mfma.acc_vgprs
                 acc_off = (mi * nr + ni) * acc_per
@@ -477,13 +492,7 @@ def phase_dtl_interleaved_k_loop(level, ctx):
             cur_a = next_a
         ctx.raw("")
 
-    # --- Post-compute: vmcnt + toggle reads + barrier ---
-    ctx.s_waitcnt("vmcnt(0)", comment="wait DTL")
-    for reg in ["v_lds_rd_a", "v_lds_rd_b"]:
-        ctx.v_add(ctx.vreg(reg), ctx.sreg("s_lds_db_step"), ctx.vreg(reg),
-                  comment=f"{reg} += db")
-    ctx.inst("s_sub_u32", ctx.sreg("s_lds_db_step"), "0",
-             ctx.sreg("s_lds_db_step"), comment="negate")
+    # Suffix: only barrier remains (vmcnt + toggle moved into last mi group)
     ctx.s_barrier(comment="sync")
 
     ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0", comment="more?")
