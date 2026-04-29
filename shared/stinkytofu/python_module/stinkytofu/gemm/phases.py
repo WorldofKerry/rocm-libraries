@@ -900,7 +900,11 @@ def phase_scheduled_k_loop(level, ctx):
 
     # Build tile plan and schedule
     plan = TilePlan.build(tile, problem)
-    schedule = plan.schedule(SchedulingRules())
+    # For large tiles (128+ MFMAs), interleave global loads in compute.
+    # For small tiles (16 MFMAs), keep loads in loop prefix (less disruption).
+    use_interleaved = tile.total_mfma_per_wave >= 64
+    schedule = plan.schedule(SchedulingRules(),
+                             interleave_global_loads=use_interleaved)
 
     # K-loop
     ctx.label("k_loop")
@@ -914,7 +918,7 @@ def phase_scheduled_k_loop(level, ctx):
     ctx.inst("s_cbranch_scc0", "skip_prefetch",
              comment="skip prefetch on last iteration")
 
-    # Advance pointers
+    # Advance pointers + issue global loads
     for addr in ["v_addr_a", "v_addr_b"]:
         ctx.inst("v_add_co_u32", ctx.vreg(addr, 0, 1), "vcc",
                  str(k_stride), ctx.vreg(addr, 0, 1),
@@ -922,8 +926,8 @@ def phase_scheduled_k_loop(level, ctx):
         ctx.inst("v_addc_co_u32", ctx.vreg(addr, 1, 1), "vcc",
                  ctx.vreg(addr, 1, 1), "0", "vcc", comment="carry")
 
-    # Issue global loads (async, no wait) -- interleaved in schedule
-    _emit_global_load_no_wait(ctx, problem, tile)
+    if not use_interleaved:
+        _emit_global_load_no_wait(ctx, problem, tile)
     ctx.raw("")
 
     ctx.label("skip_prefetch")

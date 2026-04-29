@@ -200,11 +200,13 @@ class TilePlan:
             problem=problem,
         )
 
-    def schedule(self, rules: Optional[SchedulingRules] = None) -> Schedule:
+    def schedule(self, rules: Optional[SchedulingRules] = None,
+                 interleave_global_loads: bool = False) -> Schedule:
         """Schedule this plan into MFMA slots + loop structure.
 
-        Places global loads and LDS writes between MFMAs (forward),
-        and wait ops (backward) to maximize latency hiding.
+        Places A-prefetch reads between MFMA groups.  When
+        ``interleave_global_loads=True``, also spreads global loads
+        evenly across MFMA slots for latency hiding.
         """
         if rules is None:
             rules = SchedulingRules()
@@ -234,10 +236,15 @@ class TilePlan:
             group_start = max(0, (mi - 1) * mfmas_per_group)
             placer.place_forward(mi_groups[mi], start_slot=group_start)
 
-        # Global loads and LDS writes are handled by the K-loop phase
-        # (phase_scheduled_k_loop), not by the scheduled compute section.
-        # This avoids double-emission and keeps the conditional prefetch
-        # logic in one place.
+        # Interleave global loads across MFMA slots (spread evenly)
+        if interleave_global_loads and self.global_load_ops:
+            n_loads = len(self.global_load_ops)
+            n_slots = len(placer.slots)
+            # Spread loads evenly: place load i at slot (i+1)*n_slots/(n_loads+1)
+            for i, op in enumerate(self.global_load_ops):
+                target = int((i + 1) * n_slots / (n_loads + 1))
+                target = min(target, n_slots - 1)
+                placer.place_forward([op], start_slot=target)
 
         return Schedule(
             slots=placer.slots,
