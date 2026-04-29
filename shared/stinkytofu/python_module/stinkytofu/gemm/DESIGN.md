@@ -372,6 +372,167 @@ kernel = GemmKernel.build(problem, scheduler=MyScheduler())
 - Enable 256x256 tile with 504 VGPRs (248 regular + 256 acc)
 - Measure: expect to approach hipBLASLt performance
 
+---
+
+## Current Status (April 2025)
+
+### What's been built
+
+**Performance**: 1014 TFLOPS at 8192x8192x8192 fp16 on MI355X (83.6% of hipBLASLt's 1213).
+
+| K-loop variant | Tile | TFLOPS | Key technique |
+|---|---|---|---|
+| DTL interleaved | 256x256x64 | **1014** | DirectToLDS, MFMA interleaving, split-ki preamble |
+| PGR=2 | 256x256x32 | 770 | Double-buffered global loads |
+| PGR=2 | 128x128x32 | 715 | Original baseline |
+
+**Architecture**: ~10K lines Python, 202 unit tests, correct at all tested sizes.
+Layers 1 and 3 are implemented. Layer 2 has a prototype (`auto_scheduler.py`)
+but the high-perf DTL K-loop bypasses it with hand-coded scheduling.
+
+**Key files**:
+- `dtl_interleaved.py` -- DTL K-loop with interleaved A-prefetch, split-ki preamble
+- `phases.py` -- All K-loop variants (PGR=2, DTL, interleaved, auto-scheduled)
+- `tiling.py` -- Per-dimension TileDim chains, GemmTiling source of truth
+- `auto_scheduler.py` -- Dataflow graph-based MFMA scheduler (Layer 2 prototype)
+- `kernel_pipeline.py` -- GemmKernel.build() orchestration
+
+### ATT profiling bottleneck breakdown (DTL 256x256x64)
+
+| Category | % of K-loop stall | Root cause |
+|---|---|---|
+| MFMA pipeline | 42.4% | Back-to-back MFMAs without side ops (14 of 16 slots empty) |
+| buffer_load | 22.9% | DTL memory controller pressure |
+| ds_read | 20.9% | LDS bank conflicts (stride=128 = 1 bank cycle) |
+| waitcnt | 9.4% | lgkmcnt(0) hard stall in preamble |
+| barrier | 4.4% | Workgroup sync |
+
+### What remains: closing the 16.4% gap to hipBLASLt
+
+#### Phase 5: Full MFMA interleaving (expected +5-8%)
+
+**Problem**: 42% of stall comes from empty MFMA slots. Only 2 of 16 slots
+per mi group have a side op (A-prefetch ds_read). The other 14 are back-to-back
+MFMAs that stall the pipeline.
+
+**Approach**: Wire the DTL K-loop through `auto_scheduler.py`'s `ScheduleGraph`.
+Feed ALL operations (128 MFMAs, 32 ds_reads, 16 DTL loads, SALU, vmcnt, barrier)
+into the graph with proper dependency edges. Let the SPREAD algorithm place
+1 side op between every MFMA pair.
+
+The auto-scheduler already has the right APIs (`add_mfma`, `add_ds_read`,
+`add_buffer_load`, `add_barrier`) and the SPREAD placement with
+`min_side_per_slot=1`. The missing piece is building the graph for the
+DTL K-loop structure instead of the compute-only graph used today.
+
+**Key constraint**: dependency ordering. ds_reads must complete before the
+MFMAs that consume them. DTL loads must complete before the barrier. The
+scheduler's `earliest`/`latest` range per op handles this automatically.
+
+**Estimated work**: 1-2 days. Mostly wiring, no new algorithms needed.
+
+#### Phase 6: Pipelined preamble with double-buffered B registers (expected +2-3%)
+
+**Problem**: The preamble issues 18 ds_reads (16 B + 2 A) then stalls on
+lgkmcnt(0) for ~20 cycles. This is dead time every K-loop iteration.
+
+**Approach**: Allocate a second set of B registers (`b_names_next`, 32 VGPRs).
+During the last mi group (mi=7), issue next-iteration B reads into
+`b_names_next`. At loop top, swap `b_names` and `b_names_next`. The B data
+is already in registers when the new iteration starts -- no preamble stall.
+
+**Why the previous attempt failed**: The first attempt (commit d8d584d)
+reused the same `b_names` registers for both current and next-iteration reads.
+mi=7's MFMAs were still consuming `b_names` when the next-iteration reads
+overwrote them. With separate register sets, this conflict disappears.
+
+**VGPR budget**: 108 arch VGPRs used currently, 512 available. Adding 32
+for B double-buffer brings us to 140, well within budget.
+
+**Estimated work**: 0.5-1 day.
+
+#### Phase 7: 3-barrier pipelining (expected +3-5%)
+
+**Problem**: Currently 1 barrier per K-loop iteration. TensileLite uses 3
+barriers to create a fine-grained pipeline:
+
+```
+Barrier 1: A ds_reads done -> safe to DTL-write A region of LDS
+Barrier 2: B ds_reads done -> safe to DTL-write B region of LDS
+Barrier 3: DTL writes done -> safe to ds_read from new buffer
+```
+
+This allows DTL writes to overlap with ds_reads: while one wave reads B from
+LDS, the hardware can simultaneously write A via DTL. With 1 barrier, DTL
+writes and ds_reads are fully serialized.
+
+**Prerequisite**: Phase 6 (pipelined preamble). The 3-barrier structure
+requires reads and writes to different LDS regions to overlap, which needs
+the preamble to be integrated into the MFMA compute phase.
+
+**Assembly structure** (matching TensileLite):
+```
+mfma 0-20:   compute X0 + ds_read A into X1 buffers
+mfma 21:     BARRIER 1, then issue DTL A loads
+mfma 22-50:  compute X0 + DTL A interleaved + ds_read B into X1
+mfma 51:     BARRIER 2, then issue DTL B loads
+mfma 52-91:  compute X0/X1 + DTL B interleaved
+mfma 91:     vmcnt(13), BARRIER 3
+mfma 92-127: compute X1 + ds_read from new buffer for next iter
+```
+
+**Estimated work**: 2-3 days. Requires restructuring the compute loop into
+4 distinct phases with barrier placement.
+
+#### Phase 8: Even/odd wave scheduling (expected +1-2%)
+
+**Problem**: Two waves on the same CU issue DTL loads and ds_reads
+simultaneously, causing memory controller and LDS bank contention.
+
+**Approach**: Read `HW_REG_HW_ID` bit 4 (SIMD ID) at kernel start.
+Generate two code paths: even waves issue `buffer_load` then `ds_read`,
+odd waves reverse the order. This staggers resource demands by 1 MFMA cycle.
+
+**Implementation**: Emit the K-loop body as a macro with an `isOdd` parameter.
+Branch to the appropriate path at kernel start.
+
+**Estimated work**: 1 day. Requires duplicating the K-loop body.
+
+#### Phase 9: Vectorized store epilogue (expected +1-2% for small K)
+
+**Problem**: Store uses 256 `global_store_short` (2 bytes each). TensileLite
+uses 28 `buffer_store_dwordx4` (16 bytes each) with `v_pack_b32_f16`.
+
+**Challenge**: MFMA 16x16x32 produces 4 accumulator values in 4 different
+rows (lane_m_base + 0,1,2,3) at the same column. `v_pack_b32_f16` packs
+2 f16 values into 1 dword, but the values must be column-adjacent (same row,
+consecutive columns) for a wider store to work.
+
+**Approach**: Transpose the accumulator data within registers using LDS
+(write in row order, read in column order), then pack and store with
+`buffer_store_dwordx4`. TensileLite avoids this by using a buffer SRD
+with column-major stride, writing 1 element per row per store but using
+the SRD stride to advance by N*elem per dword.
+
+**Alternative**: Use `global_store_dword` without packing -- store f32
+values directly and rely on the memory controller to handle the wider
+writes. This halves stores but doubles bandwidth. Not ideal for fp16 output.
+
+**Estimated work**: 2-3 days. Requires understanding the exact SRD-based
+store pattern from TensileLite.
+
+### Performance projection
+
+| Phase | Cumulative TFLOPS | % hipBLASLt | Key technique |
+|---|---|---|---|
+| Current | 1014 | 83.6% | DTL + split-ki + interleaved A-prefetch |
+| + Phase 5 (auto-sched) | ~1070 | 88% | Fill all MFMA slots with side ops |
+| + Phase 6 (B double-buf) | ~1100 | 91% | Eliminate preamble stall |
+| + Phase 7 (3-barrier) | ~1140 | 94% | Overlap DTL writes with ds_reads |
+| + Phase 8 (even/odd) | ~1160 | 96% | Reduce CU contention |
+| + Phase 9 (vec store) | ~1170 | 96.5% | Faster epilogue |
+| hipBLASLt | 1213 | 100% | All of the above + hand-tuned |
+
 ## Concrete Types (Python)
 
 ```python
