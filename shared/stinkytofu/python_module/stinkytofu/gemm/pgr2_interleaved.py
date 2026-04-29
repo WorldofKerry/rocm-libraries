@@ -1,18 +1,11 @@
-"""PGR=2 interleaved K-loop: all overhead hidden between MFMAs.
+"""PGR=2 interleaved K-loop: gloads before compute, writes in late MFMAs.
 
 Key optimizations over phase_pgr2_k_loop:
-1. Global loads issued between early MFMAs (overlap with compute)
-2. vmcnt(N) instead of vmcnt(0) (keep next tile's loads in flight)
-3. ds_writes between late MFMAs (overlap with compute)
-4. s_nop between MFMAs that have no side ops (prevent pipeline stalls)
-5. Precise lgkmcnt for A-operand prefetch
-
-Structure per K-loop iteration (16 MFMAs, 2x unrolled for buffer swap):
-  Preamble: ds_read B[n0..n3] + A[m0], lgkmcnt(0)
-  mi=0: ptr advance + 4 gloads (interleaved), ds_read A[m1]
-  mi=1: s_nop fillers, lgkmcnt for A[m1], ds_read A[m2]
-  mi=2: vmcnt(N) + toggle + start ds_writes, lgkmcnt for A[m2], ds_read A[m3]
-  mi=3: finish ds_writes + lgkmcnt + barrier + loop control
+1. Gloads issued BEFORE compute (overlap ds_read latency)
+2. vmcnt + toggle + ds_writes interleaved with late MFMAs
+3. No s_nops -- back-to-back MFMAs are fine on gfx950
+4. Barrier after last MFMA (not in sequential suffix)
+5. Correct PGR=2: check k_tiles before decrementing for gloads
 """
 from __future__ import annotations
 
@@ -45,71 +38,69 @@ def _b_off(ni, ki, tile, mfma, elem):
     return (ni * mfma.n * (tile.unroll_k + pad_e) + ki * mfma.k) * elem
 
 
-def _emit_gloads_individual(ctx, problem, tile, buf_suffix):
-    """Return a list of callables, each issuing one global_load_dwordx4."""
-    ops = []
+def _emit_gloads(ctx, problem, tile, buf_suffix):
+    """Issue all global loads into buf_suffix."""
     for name, addr_name in [("A", "v_addr_a"), ("B", "v_addr_b")]:
-        gload_name = f"v_gload{buf_suffix}_{name.lower()}"
-        load = ctx.get(gload_name)
+        gn = f"v_gload{buf_suffix}_{name.lower()}"
+        load = ctx.get(gn)
         addr = ctx.vreg(addr_name, 0, 2)
         for i in range(0, load.count, 4):
             cnt = min(4, load.count - i)
-            width = {4: "dwordx4", 2: "dwordx2", 1: "dword"}[cnt]
-            _i, _cnt, _width, _gload_name = i, cnt, width, gload_name
-            _addr_name = addr_name
-            _name = name
-            def emit_one(_i=_i, _cnt=_cnt, _width=_width,
-                         _gload_name=_gload_name, _addr_name=_addr_name,
-                         _name=_name):
-                a = ctx.vreg(_addr_name, 0, 2)
-                dst = ctx.vreg(_gload_name, _i, _cnt)
-                off = f"off offset:{_i * 4}" if _i > 0 else "off"
-                ctx.inst(f"global_load_{_width}", dst, a, off,
-                         comment=f"gload {_name}[{_i}:{_i+_cnt}]")
-            ops.append(emit_one)
-    return ops
+            w = {4: "dwordx4", 2: "dwordx2", 1: "dword"}[cnt]
+            dst = ctx.vreg(gn, i, cnt)
+            off = f"off offset:{i * 4}" if i > 0 else "off"
+            ctx.inst(f"global_load_{w}", dst, addr, off,
+                     comment=f"gload {name}[{i}:{i+cnt}]")
+
+
+def _emit_ds_writes(ctx, tile, buf_suffix):
+    """Write global load buffer to LDS."""
+    for name in ["a", "b"]:
+        gn = f"v_gload{buf_suffix}_{name}"
+        load = ctx.get(gn)
+        addr_reg = ctx.vreg(f"v_lds_wr_{name}")
+        for i in range(0, load.count, 4):
+            cnt = min(4, load.count - i)
+            src = ctx.vreg(gn, i, cnt)
+            ctx.ds_write(addr_reg, src, offset=i * 4, width=cnt,
+                         comment=f"ds_wr {name.upper()}[{i}:{i+cnt}]")
 
 
 def _emit_ds_writes_individual(ctx, tile, buf_suffix):
-    """Return a list of callables, each issuing one ds_write."""
+    """Return list of callables, each issuing one ds_write."""
     ops = []
     for name in ["a", "b"]:
-        gload_name = f"v_gload{buf_suffix}_{name}"
-        load = ctx.get(gload_name)
-        _name = name
+        gn = f"v_gload{buf_suffix}_{name}"
+        load = ctx.get(gn)
         for i in range(0, load.count, 4):
             cnt = min(4, load.count - i)
-            _i, _cnt, _gload_name = i, cnt, gload_name
-            def emit_one(_i=_i, _cnt=_cnt, _gload_name=_gload_name,
-                         _name=_name):
-                addr_reg = ctx.vreg(f"v_lds_wr_{_name}")
-                src = ctx.vreg(_gload_name, _i, _cnt)
-                ctx.ds_write(addr_reg, src, offset=_i * 4, width=_cnt,
-                             comment=f"LDS write {_name.upper()}[{_i}:{_i+_cnt}]")
-            ops.append(emit_one)
+            _i, _cnt, _gn, _name = i, cnt, gn, name
+            def emit(_i=_i, _cnt=_cnt, _gn=_gn, _name=_name):
+                ctx.ds_write(ctx.vreg(f"v_lds_wr_{_name}"),
+                             ctx.vreg(_gn, _i, _cnt),
+                             offset=_i * 4, width=_cnt,
+                             comment=f"ds_wr {_name.upper()}[{_i}:{_i+_cnt}]")
+            ops.append(emit)
     return ops
 
 
-def _emit_one_iter(ctx, tile, problem, mfma, mr, nr, ki_count,
-                   a_names, b_names, elem,
-                   load_buf_suffix, write_buf_suffix,
-                   k_stride, is_first_half, label_suffix):
-    """Emit one half of the 2x-unrolled main loop with full interleaving.
+def _emit_compute(ctx, tile, mfma, mr, nr, ki_count, a_names, b_names,
+                  elem, label, write_ops=None, do_vmcnt=False, do_toggle=False):
+    """Emit compute phase: preamble + MFMAs with A-prefetch.
 
-    load_buf_suffix:  buffer to issue NEW global loads into ("" or "2")
-    write_buf_suffix: buffer to wait for + write to LDS ("2" or "")
+    If write_ops/do_vmcnt/do_toggle are set, interleave them into late
+    mi groups instead of emitting them sequentially after compute.
+
+    Layout for mr=8:
+      mi=0..3: pure compute (A-prefetch + MFMAs)
+      mi=4: vmcnt + toggle (if requested)
+      mi=5: ds_writes interleaved
+      mi=6..7: remaining ds_writes + barrier prep
     """
     av = mfma.a_vgprs
     bv = mfma.b_vgprs
 
-    # Build lists of individual operations
-    gload_ops = _emit_gloads_individual(ctx, problem, tile, load_buf_suffix)
-    ds_write_ops = _emit_ds_writes_individual(ctx, tile, write_buf_suffix)
-    n_gloads = len(gload_ops)
-    n_ds_writes = len(ds_write_ops)
-
-    # Preamble: read all B + A[m0]
-    ctx.comment(f"--- Iter {label_suffix}: preamble ---")
+    # Preamble: read all B + A[0]
     for ki in range(ki_count):
         for ni in range(nr):
             name = b_names[(ni, ki)]
@@ -124,46 +115,20 @@ def _emit_one_iter(ctx, tile, problem, mfma, mr, nr, ki_count,
                     offset=_a_off(0, ki, tile, mfma, elem), width=av,
                     comment=f"LR A m0k{ki} b{cur_a}")
 
-    ctx.s_waitcnt("lgkmcnt(0)", comment=f"wait preamble {label_suffix}")
+    ctx.s_waitcnt("lgkmcnt(0)", comment=f"wait preamble {label}")
     ctx.raw("")
 
-    # Track gload and ds_write insertion points
-    gload_idx = 0
-    ds_write_idx = 0
+    # Distribute write ops across late mi groups
+    wr_idx = 0
+    n_writes = len(write_ops) if write_ops else 0
+    # Place vmcnt+toggle at mi = mr//2 (halfway through compute)
+    vmcnt_mi = mr // 2  # mi=4 for mr=8
 
     for mi in range(mr):
-        has_a_prefetch = (mi < mr - 1)
+        has_prefetch = mi < mr - 1
 
-        # === mi=0: ptr advance + gloads ===
-        if mi == 0:
-            ctx.comment(f"--- mi=0: gloads + ptr advance ---")
-            # Check if there are tiles left to load BEFORE decrementing.
-            # k_tiles counts remaining tiles to load. If > 0, load one.
-            ctx.inst("s_cmp_eq_u32", ctx.sreg("s_k_tiles"), "0",
-                     comment="SCC = (k_tiles == 0, no more to load)")
-            ctx.inst("s_cbranch_scc1", f"skip_gload_{label_suffix}",
-                     comment="skip gload if none left")
-            ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
-                      comment="k_tiles-- (consumed a gload)")
-
-            # Advance pointers
-            for addr in ["v_addr_a", "v_addr_b"]:
-                ctx.inst("v_add_co_u32", ctx.vreg(addr, 0, 1), "vcc",
-                         str(k_stride), ctx.vreg(addr, 0, 1),
-                         comment=f"{addr} += {k_stride}")
-                ctx.inst("v_addc_co_u32", ctx.vreg(addr, 1, 1), "vcc",
-                         ctx.vreg(addr, 1, 1), "0", "vcc", comment="carry")
-
-            # Issue all gloads
-            for g_op in gload_ops:
-                g_op()
-            gload_idx = n_gloads
-
-            ctx.label(f"skip_gload_{label_suffix}")
-            ctx.raw("")
-
-        # A prefetch before this mi group's MFMAs
-        if has_a_prefetch:
+        # A prefetch
+        if has_prefetch:
             next_a = 1 - cur_a
             for ki in range(ki_count):
                 name = a_names[(next_a, ki)]
@@ -172,49 +137,24 @@ def _emit_one_iter(ctx, tile, problem, mfma, mr, nr, ki_count,
                             width=av,
                             comment=f"LR A m{mi+1}k{ki} b{next_a}")
 
-        # === mi=2: vmcnt + toggle before MFMAs ===
-        if mi == 2:
-            ctx.comment(f"--- mi=2: vmcnt + toggle ---")
-            # Wait for PREVIOUS tile's gloads (the ones in write_buf).
-            # Our new gloads (in load_buf) should stay in flight.
-            # vmcnt(N) where N = number of new gloads still in flight
-            # Use vmcnt(0) for safety: when gloads were skipped (last iter),
-            # only previous iter's gloads are in flight and vmcnt(N>0) won't wait.
-            # TODO: use conditional vmcnt(N) when gloads were issued for perf
-            ctx.s_waitcnt("vmcnt(0)",
-                          comment="wait for in-flight global loads")
-
-            # Toggle LDS double buffer
-            for reg in ["v_lds_wr_a", "v_lds_wr_b", "v_lds_rd_a", "v_lds_rd_b"]:
+        # vmcnt at midpoint; toggle WRITE addrs only (reads stay on old buffer)
+        if do_vmcnt and mi == vmcnt_mi:
+            ctx.s_waitcnt("vmcnt(0)", comment="wait prev gloads")
+        if do_toggle and mi == vmcnt_mi:
+            # Only toggle write addresses -- reads must stay on current buffer
+            # until all A-prefetch reads are done
+            for reg in ["v_lds_wr_a", "v_lds_wr_b"]:
                 ctx.v_add(ctx.vreg(reg), ctx.sreg("s_lds_db_step"),
-                          ctx.vreg(reg), comment=f"{reg} += db_step")
-            ctx.inst("s_sub_u32", ctx.sreg("s_lds_db_step"), "0",
-                     ctx.sreg("s_lds_db_step"),
-                     comment="negate step for next toggle")
+                          ctx.vreg(reg), comment=f"{reg} += db")
 
-        # Emit MFMAs for this mi group with interleaved side ops
-        for ni in range(nr):
-            # Before each MFMA: insert side operations
-            side_emitted = False
+        # MFMAs for this mi group
+        for ki in range(ki_count):
+            for ni in range(nr):
+                # Interleave ds_writes in late mi groups
+                if write_ops and mi > vmcnt_mi and wr_idx < n_writes:
+                    write_ops[wr_idx]()
+                    wr_idx += 1
 
-            # mi=3: interleave ds_writes
-            if mi == mr - 1 and ds_write_idx < n_ds_writes:
-                ds_write_ops[ds_write_idx]()
-                ds_write_idx += 1
-                side_emitted = True
-
-            # mi=2, ni >= 2: start ds_writes
-            if mi == 2 and ni >= 2 and ds_write_idx < n_ds_writes:
-                ds_write_ops[ds_write_idx]()
-                ds_write_idx += 1
-                side_emitted = True
-
-            # If no side op was emitted, insert s_nop to prevent MFMA stall
-            if not side_emitted:
-                ctx.inst("s_nop", "0", comment="prevent MFMA stall")
-
-            # Emit MFMA
-            for ki in range(ki_count):
                 acc_per = mfma.acc_vgprs
                 acc_off = (mi * nr + ni) * acc_per
                 ctx.inst(
@@ -225,26 +165,33 @@ def _emit_one_iter(ctx, tile, problem, mfma, mr, nr, ki_count,
                     ctx.areg("acc_C", acc_off, acc_per),
                     comment=f"MFMA m{mi}_n{ni}_k{ki}")
 
-        # Wait for A prefetch
-        if has_a_prefetch:
+        if has_prefetch:
             ctx.s_waitcnt("lgkmcnt(0)", comment=f"wait A[{mi+1}]")
             cur_a = next_a
-
         ctx.raw("")
 
-    # Emit any remaining ds_writes (shouldn't happen with 4 writes + 8 MFMA slots)
-    while ds_write_idx < n_ds_writes:
-        ds_write_ops[ds_write_idx]()
-        ds_write_idx += 1
+    # Emit remaining ds_writes after last MFMA
+    while wr_idx < n_writes:
+        write_ops[wr_idx]()
+        wr_idx += 1
 
-    # Wait for ds_writes + barrier
-    ctx.s_waitcnt("lgkmcnt(0)", comment="wait LDS writes")
-    ctx.s_barrier(comment="sync workgroup")
-    ctx.raw("")
+    # If we did writes, wait for them, toggle reads, negate step, barrier
+    if write_ops:
+        ctx.s_waitcnt("lgkmcnt(0)", comment="wait ds_writes")
+        if do_toggle:
+            # Now toggle read addresses (safe: all ds_reads are done)
+            for reg in ["v_lds_rd_a", "v_lds_rd_b"]:
+                ctx.v_add(ctx.vreg(reg), ctx.sreg("s_lds_db_step"),
+                          ctx.vreg(reg), comment=f"{reg} += db")
+            # Negate step for next toggle
+            ctx.inst("s_sub_u32", ctx.sreg("s_lds_db_step"), "0",
+                     ctx.sreg("s_lds_db_step"), comment="negate")
+        ctx.s_barrier(comment="sync workgroup")
+        ctx.raw("")
 
 
 def phase_pgr2_interleaved_k_loop(level, ctx):
-    """K-loop with PGR=2 and fully interleaved operations."""
+    """K-loop with PGR=2: gloads before compute, writes in late MFMAs."""
     tile = _tile(ctx)
     problem = _problem(ctx)
     elem = problem.element_bytes
@@ -263,7 +210,7 @@ def phase_pgr2_interleaved_k_loop(level, ctx):
 
     ctx.alloc_sgpr_permanent(1, "s_lds_db_step")
 
-    # Allocate second global load buffer
+    # Second global load buffer
     for name in ["a", "b"]:
         load = ctx.get(f"v_gload_{name}")
         if not ctx.has(f"v_gload2_{name}"):
@@ -276,13 +223,13 @@ def phase_pgr2_interleaved_k_loop(level, ctx):
               comment=f"DB toggle step = {lds_half}")
     ctx.raw("")
 
-    # === Prologue: load tile 0 -> buf[0], write to LDS ===
+    # Prologue: load tile 0 -> LDS buf 0, load tile 1 -> buf2 (async)
     ctx.comment("Prologue: load tile 0")
     _emit_global_load_impl(ctx, problem, tile)
-    ctx.comment("Write tile 0 to LDS buf[0]")
+    ctx.comment("Write tile 0 to LDS")
     _emit_lds_write_impl(ctx, tile)
 
-    # Advance pointers to tile 1
+    # Advance + prefetch tile 1 into buf2
     for addr in ["v_addr_a", "v_addr_b"]:
         ctx.inst("v_add_co_u32", ctx.vreg(addr, 0, 1), "vcc",
                  str(k_stride), ctx.vreg(addr, 0, 1),
@@ -290,25 +237,13 @@ def phase_pgr2_interleaved_k_loop(level, ctx):
         ctx.inst("v_addc_co_u32", ctx.vreg(addr, 1, 1), "vcc",
                  ctx.vreg(addr, 1, 1), "0", "vcc", comment="carry")
 
-    # Load tile 1 -> buf[1] (async)
-    ctx.comment("Prefetch tile 1 into buf[1]")
-    for name, addr_name in [("A", "v_addr_a"), ("B", "v_addr_b")]:
-        gload2 = f"v_gload2_{name.lower()}"
-        load = ctx.get(gload2)
-        addr = ctx.vreg(addr_name, 0, 2)
-        for i in range(0, load.count, 4):
-            cnt = min(4, load.count - i)
-            width = {4: "dwordx4", 2: "dwordx2", 1: "dword"}[cnt]
-            dst = ctx.vreg(gload2, i, cnt)
-            off = f"off offset:{i * 4}" if i > 0 else "off"
-            ctx.inst(f"global_load_{width}", dst, addr, off,
-                     comment=f"prefetch tile1 {name}[{i}:{i+cnt}]")
-
+    ctx.comment("Prefetch tile 1 into buf2")
+    _emit_gloads(ctx, problem, tile, "2")
     ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "2",
-              comment="k_tiles -= 2 (prologue consumed 2)")
+              comment="k_tiles -= 2")
     ctx.raw("")
 
-    # === Allocate operand registers ===
+    # Allocate operand registers
     b_names = {}
     for ni in range(nr):
         for ki in range(ki_count):
@@ -329,141 +264,105 @@ def phase_pgr2_interleaved_k_loop(level, ctx):
     ctx.label("k_loop")
     ctx.raw("")
 
-    # Iter A: load into buf "" (v_gload_a/b), write from buf "2" (v_gload2_a/b)
-    _emit_one_iter(ctx, tile, problem, mfma, mr, nr, ki_count,
-                   a_names, b_names, elem,
-                   load_buf_suffix="", write_buf_suffix="2",
-                   k_stride=k_stride, is_first_half=True,
-                   label_suffix="A")
+    # --- Iter A: gloads into buf"", write buf"2" to LDS ---
 
+    # Issue gloads BEFORE compute (fills ds_read latency gap)
+    ctx.comment("--- Iter A: gloads before compute ---")
+    ctx.inst("s_cmp_eq_u32", ctx.sreg("s_k_tiles"), "0",
+             comment="any tiles left?")
+    ctx.inst("s_cbranch_scc1", "skip_gload_A",
+             comment="skip if none")
+    ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
+              comment="k_tiles--")
+    for addr in ["v_addr_a", "v_addr_b"]:
+        ctx.inst("v_add_co_u32", ctx.vreg(addr, 0, 1), "vcc",
+                 str(k_stride), ctx.vreg(addr, 0, 1),
+                 comment=f"{addr} += {k_stride}")
+        ctx.inst("v_addc_co_u32", ctx.vreg(addr, 1, 1), "vcc",
+                 ctx.vreg(addr, 1, 1), "0", "vcc", comment="carry")
+    _emit_gloads(ctx, problem, tile, "")
+    ctx.label("skip_gload_A")
+    ctx.raw("")
+
+    # Compute with vmcnt+toggle+ds_writes interleaved in late MFMAs
+    wr_ops_a = _emit_ds_writes_individual(ctx, tile, "2")
+    _emit_compute(ctx, tile, mfma, mr, nr, ki_count,
+                  a_names, b_names, elem, "A",
+                  write_ops=wr_ops_a, do_vmcnt=True, do_toggle=True)
+
+    # Check loop exit
     ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
              comment="SCC = (k_tiles != 0)")
     ctx.inst("s_cbranch_scc0", "k_nll",
-             comment="branch to NLL if last iteration")
+             comment="NLL if last")
     ctx.raw("")
 
-    # Iter B: load into buf "2" (v_gload2_a/b), write from buf "" (v_gload_a/b)
-    _emit_one_iter(ctx, tile, problem, mfma, mr, nr, ki_count,
-                   a_names, b_names, elem,
-                   load_buf_suffix="2", write_buf_suffix="",
-                   k_stride=k_stride, is_first_half=False,
-                   label_suffix="B")
+    # --- Iter B: gloads into buf"2", write buf"" to LDS ---
+    ctx.comment("--- Iter B: gloads before compute ---")
+    ctx.inst("s_cmp_eq_u32", ctx.sreg("s_k_tiles"), "0",
+             comment="any tiles left?")
+    ctx.inst("s_cbranch_scc1", "skip_gload_B",
+             comment="skip if none")
+    ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
+              comment="k_tiles--")
+    for addr in ["v_addr_a", "v_addr_b"]:
+        ctx.inst("v_add_co_u32", ctx.vreg(addr, 0, 1), "vcc",
+                 str(k_stride), ctx.vreg(addr, 0, 1),
+                 comment=f"{addr} += {k_stride}")
+        ctx.inst("v_addc_co_u32", ctx.vreg(addr, 1, 1), "vcc",
+                 ctx.vreg(addr, 1, 1), "0", "vcc", comment="carry")
+    _emit_gloads(ctx, problem, tile, "2")
+    ctx.label("skip_gload_B")
+    ctx.raw("")
+
+    wr_ops_b = _emit_ds_writes_individual(ctx, tile, "")
+    _emit_compute(ctx, tile, mfma, mr, nr, ki_count,
+                  a_names, b_names, elem, "B",
+                  write_ops=wr_ops_b, do_vmcnt=True, do_toggle=True)
 
     ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
              comment="SCC = (k_tiles != 0)")
     ctx.inst("s_cbranch_scc1", "k_loop",
-             comment="loop if more iterations")
+             comment="loop if more")
     ctx.raw("")
 
-    # === NLL for iter B exit: buf "2" was loaded last, buf "" was written ===
+    # === NLL for iter B exit ===
     ctx.comment("NLL (iter B): compute + write buf2")
-    _emit_nll(ctx, tile, problem, mfma, mr, nr, ki_count,
-              a_names, b_names, elem, write_buf_suffix="2",
-              label_suffix="nll_b", lds_half=lds_half)
-
+    _emit_compute(ctx, tile, mfma, mr, nr, ki_count,
+                  a_names, b_names, elem, "nll_b1")
+    ctx.s_waitcnt("vmcnt(0)", comment="wait final gloads")
+    for reg in ["v_lds_wr_a", "v_lds_wr_b", "v_lds_rd_a", "v_lds_rd_b"]:
+        ctx.v_add(ctx.vreg(reg), ctx.sreg("s_lds_db_step"),
+                  ctx.vreg(reg), comment=f"{reg} += db")
+    ctx.inst("s_sub_u32", ctx.sreg("s_lds_db_step"), "0",
+             ctx.sreg("s_lds_db_step"), comment="negate")
+    _emit_ds_writes(ctx, tile, "2")
+    ctx.s_waitcnt("lgkmcnt(0)", comment="wait writes")
+    ctx.s_barrier(comment="sync")
+    _emit_compute(ctx, tile, mfma, mr, nr, ki_count,
+                  a_names, b_names, elem, "nll_b2")
     ctx.inst("s_branch", "k_done", comment="skip k_nll")
     ctx.raw("")
 
-    # === NLL for iter A exit: buf "" was loaded last, buf "2" was written ===
+    # === NLL for iter A exit ===
     ctx.label("k_nll")
-    ctx.comment("NLL (iter A): compute + write buf0")
-    _emit_nll(ctx, tile, problem, mfma, mr, nr, ki_count,
-              a_names, b_names, elem, write_buf_suffix="",
-              label_suffix="nll_a", lds_half=lds_half)
+    ctx.comment("NLL (iter A): compute + write buf")
+    _emit_compute(ctx, tile, mfma, mr, nr, ki_count,
+                  a_names, b_names, elem, "nll_a1")
+    ctx.s_waitcnt("vmcnt(0)", comment="wait final gloads")
+    for reg in ["v_lds_wr_a", "v_lds_wr_b", "v_lds_rd_a", "v_lds_rd_b"]:
+        ctx.v_add(ctx.vreg(reg), ctx.sreg("s_lds_db_step"),
+                  ctx.vreg(reg), comment=f"{reg} += db")
+    ctx.inst("s_sub_u32", ctx.sreg("s_lds_db_step"), "0",
+             ctx.sreg("s_lds_db_step"), comment="negate")
+    _emit_ds_writes(ctx, tile, "")
+    ctx.s_waitcnt("lgkmcnt(0)", comment="wait writes")
+    ctx.s_barrier(comment="sync")
+    _emit_compute(ctx, tile, mfma, mr, nr, ki_count,
+                  a_names, b_names, elem, "nll_a2")
 
     ctx.label("k_done")
     ctx.raw("")
-
-
-def _emit_nll(ctx, tile, problem, mfma, mr, nr, ki_count,
-              a_names, b_names, elem, write_buf_suffix,
-              label_suffix, lds_half):
-    """No-Load Loop: compute last tile, then wait and write the
-    in-flight buffer to LDS for final compute."""
-    av = mfma.a_vgprs
-    bv = mfma.b_vgprs
-
-    ds_write_ops = _emit_ds_writes_individual(ctx, tile, write_buf_suffix)
-
-    # Compute from current LDS
-    _emit_compute_with_nops(ctx, tile, mfma, mr, nr, ki_count,
-                            a_names, b_names, elem, label_suffix)
-
-    # Wait for in-flight gloads (from the write buffer)
-    ctx.s_waitcnt("vmcnt(0)", comment="wait final gloads")
-
-    # Toggle LDS
-    for reg in ["v_lds_wr_a", "v_lds_wr_b", "v_lds_rd_a", "v_lds_rd_b"]:
-        ctx.v_add(ctx.vreg(reg), ctx.sreg("s_lds_db_step"),
-                  ctx.vreg(reg), comment=f"{reg} += db_step")
-    ctx.inst("s_sub_u32", ctx.sreg("s_lds_db_step"), "0",
-             ctx.sreg("s_lds_db_step"), comment="negate")
-
-    # Write to LDS
-    for op in ds_write_ops:
-        op()
-    ctx.s_waitcnt("lgkmcnt(0)", comment="wait LDS writes")
-    ctx.s_barrier(comment="sync")
-
-    # Final compute
-    _emit_compute_with_nops(ctx, tile, mfma, mr, nr, ki_count,
-                            a_names, b_names, elem, f"final_{label_suffix}")
-    ctx.raw("")
-
-
-def _emit_compute_with_nops(ctx, tile, mfma, mr, nr, ki_count,
-                            a_names, b_names, elem, label):
-    """Emit compute phase with s_nop between MFMAs and A prefetch."""
-    av = mfma.a_vgprs
-    bv = mfma.b_vgprs
-
-    # Preamble
-    for ki in range(ki_count):
-        for ni in range(nr):
-            name = b_names[(ni, ki)]
-            ctx.ds_read(ctx.vreg(name, 0, bv), ctx.vreg("v_lds_rd_b"),
-                        offset=_b_off(ni, ki, tile, mfma, elem), width=bv,
-                        comment=f"LR B n{ni}k{ki}")
-
-    cur_a = 0
-    for ki in range(ki_count):
-        name = a_names[(cur_a, ki)]
-        ctx.ds_read(ctx.vreg(name, 0, av), ctx.vreg("v_lds_rd_a"),
-                    offset=_a_off(0, ki, tile, mfma, elem), width=av,
-                    comment=f"LR A m0k{ki} b{cur_a}")
-
-    ctx.s_waitcnt("lgkmcnt(0)", comment=f"wait preamble {label}")
-    ctx.raw("")
-
-    for mi in range(mr):
-        has_prefetch = mi < mr - 1
-        if has_prefetch:
-            next_a = 1 - cur_a
-            for ki in range(ki_count):
-                name = a_names[(next_a, ki)]
-                ctx.ds_read(ctx.vreg(name, 0, av), ctx.vreg("v_lds_rd_a"),
-                            offset=_a_off(mi + 1, ki, tile, mfma, elem),
-                            width=av,
-                            comment=f"LR A m{mi+1}k{ki} b{next_a}")
-
-        for ki in range(ki_count):
-            for ni in range(nr):
-                ctx.inst("s_nop", "0", comment="prevent MFMA stall")
-                acc_per = mfma.acc_vgprs
-                acc_off = (mi * nr + ni) * acc_per
-                ctx.inst(
-                    f"v_mfma_f32_{mfma.m}x{mfma.n}x{mfma.k}_f16",
-                    ctx.areg("acc_C", acc_off, acc_per),
-                    ctx.vreg(a_names[(cur_a, ki)], 0, av),
-                    ctx.vreg(b_names[(ni, ki)], 0, bv),
-                    ctx.areg("acc_C", acc_off, acc_per),
-                    comment=f"MFMA m{mi}_n{ni}_k{ki}")
-
-        if has_prefetch:
-            ctx.s_waitcnt("lgkmcnt(0)", comment=f"wait A[{mi+1}]")
-            cur_a = next_a
-
-        ctx.raw("")
 
 
 PGR2_INTERLEAVED_PROLOGUE_PHASES = [
