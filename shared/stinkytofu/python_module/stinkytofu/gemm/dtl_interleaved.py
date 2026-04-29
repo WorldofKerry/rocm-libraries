@@ -437,19 +437,31 @@ def phase_dtl_interleaved_k_loop(level, ctx):
     ctx.s_waitcnt("lgkmcnt(0)", comment="wait preamble")
     ctx.raw("")
 
-    # --- 128 MFMAs with A-prefetch ---
+    # --- 128 MFMAs with interleaved A-prefetch ds_reads ---
+    # Place ds_reads BETWEEN MFMAs to prevent pipeline stalls.
+    # Each mi group has nr*ki_count=16 MFMAs. A-prefetch needs
+    # 2 ds_reads per group (ki_count=2). Place them at slots 1 and 3.
+    # lgkmcnt(0) at the start of the next mi group.
     for mi in range(mr):
         has_pf = mi < mr - 1
         if has_pf:
             next_a = 1 - cur_a
-            for ki in range(ki_count):
-                ctx.ds_read(ctx.vreg(a_names[(next_a, ki)], 0, av),
-                            ctx.vreg("v_lds_rd_a"),
-                            offset=_a_off(mi + 1, ki, tile, mfma, elem),
-                            width=av, comment=f"LR A m{mi+1}k{ki} b{next_a}")
 
+        mfma_idx = 0  # index within this mi group
         for ki in range(ki_count):
             for ni in range(nr):
+                # Interleave A-prefetch before specific MFMA slots
+                if has_pf and mfma_idx == 1:
+                    ctx.ds_read(ctx.vreg(a_names[(next_a, 0)], 0, av),
+                                ctx.vreg("v_lds_rd_a"),
+                                offset=_a_off(mi + 1, 0, tile, mfma, elem),
+                                width=av, comment=f"LR A m{mi+1}k0 b{next_a}")
+                elif has_pf and mfma_idx == 5:
+                    ctx.ds_read(ctx.vreg(a_names[(next_a, 1)], 0, av),
+                                ctx.vreg("v_lds_rd_a"),
+                                offset=_a_off(mi + 1, 1, tile, mfma, elem),
+                                width=av, comment=f"LR A m{mi+1}k1 b{next_a}")
+
                 acc_per = mfma.acc_vgprs
                 acc_off = (mi * nr + ni) * acc_per
                 ctx.inst(f"v_mfma_f32_{mfma.m}x{mfma.n}x{mfma.k}_f16",
@@ -458,6 +470,7 @@ def phase_dtl_interleaved_k_loop(level, ctx):
                          ctx.vreg(b_names[(ni, ki)], 0, bv),
                          ctx.areg("acc_C", acc_off, acc_per),
                          comment=f"MFMA m{mi}_n{ni}_k{ki}")
+                mfma_idx += 1
 
         if has_pf:
             ctx.s_waitcnt("lgkmcnt(0)", comment=f"wait A[{mi+1}]")
