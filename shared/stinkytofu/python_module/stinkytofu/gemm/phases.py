@@ -956,8 +956,10 @@ def phase_scheduled_k_loop(level, ctx):
         ctx.inst("v_addc_co_u32", ctx.vreg(addr, 1, 1), "vcc",
                  ctx.vreg(addr, 1, 1), "0", "vcc", comment="carry")
 
-    if not use_interleaved:
-        _emit_global_load_no_wait(ctx, problem, tile)
+    # Always emit global loads in the loop prefix (async, no wait).
+    # For tiles using partitioned compute, global loads are NOT interleaved
+    # in the compute section -- they run here before compute starts.
+    _emit_global_load_no_wait(ctx, problem, tile)
     ctx.raw("")
 
     ctx.label("skip_prefetch")
@@ -965,7 +967,16 @@ def phase_scheduled_k_loop(level, ctx):
 
     # Emit scheduled compute (MFMAs with interleaved side ops)
     ctx.comment("Scheduled compute")
-    emit_scheduled_kernel(schedule, ctx, tile, problem, layouts)
+    # Use partitioned compute for large tiles (64+ MFMAs)
+    if tile.total_mfma_per_wave >= 64:
+        from .partitioned_compute import emit_partitioned_compute
+        # Use 4x4 partitions (4 partitions for 8x8 repeat)
+        # Larger partitions = fewer preamble stalls, more B VGPRs per partition
+        pm = min(4, tile.mfma_m_repeat)
+        pn = min(4, tile.mfma_n_repeat)
+        emit_partitioned_compute(ctx, tile, problem, partition_m=pm, partition_n=pn)
+    else:
+        emit_scheduled_kernel(schedule, ctx, tile, problem, layouts)
 
     # Post-compute: wait for global_load, toggle LDS, write, barrier
     ctx.s_waitcnt("vmcnt(0)", comment="wait for global_load")

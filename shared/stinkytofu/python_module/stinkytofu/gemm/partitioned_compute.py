@@ -117,7 +117,7 @@ def emit_partitioned_compute(
                                 comment=f"LR B n{ni}k{ki} p{part_id}")
 
             # 2. Load A[first_mi] for this partition
-            cur_a = 0
+            cur_a = 0  # reset A double-buffer for each partition
             first_mi = mi_start
             for ki in range(ki_count):
                 ctx.ds_read(ctx.vreg(a_names[(cur_a, ki)], 0, av),
@@ -128,7 +128,6 @@ def emit_partitioned_compute(
             # 3. Wait for all reads
             ctx.s_waitcnt("lgkmcnt(0)",
                           comment=f"wait partition {part_id} preamble")
-            ctx.raw("")
 
             # 4. Per-mi loop within partition
             for local_mi in range(partition_m):
