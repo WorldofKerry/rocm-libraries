@@ -325,7 +325,8 @@ class GemmTiling:
                        dtl: bool = False,
                        interleaved_large: bool = False,
                       auto_scheduled: bool = False,
-                       pgr2_interleaved: bool = False) -> TileLevel:
+                       pgr2_interleaved: bool = False,
+                       dtl_interleaved: bool = False) -> TileLevel:
         """Build the full tile tree with phases from TileDim chains.
 
         The chain structure determines the tree levels:
@@ -360,7 +361,7 @@ class GemmTiling:
 
         # Wave: per-wave compute tile
         # K-loop data movement phases go here (non-pipelined)
-        if pipelined or optimized or scheduled or interleaved or pgr2 or dtl or interleaved_large or auto_scheduled or pgr2_interleaved:
+        if pipelined or optimized or scheduled or interleaved or pgr2 or dtl or interleaved_large or auto_scheduled or pgr2_interleaved or dtl_interleaved:
             # Pipelined/optimized: K-loop phase handles compute internally.
             # Wave gets a no-op emit so the tree walker skips it.
             wave_level = TileLevel(
@@ -377,7 +378,10 @@ class GemmTiling:
                 epilogue_phases=list(WAVE_EPILOGUE_PHASES))
 
         # Workgroup: setup + K-loop structure + store
-        if pgr2_interleaved:
+        if dtl_interleaved:
+            from .dtl_interleaved import DTL_INTERLEAVED_PROLOGUE_PHASES
+            wg_pro = list(DTL_INTERLEAVED_PROLOGUE_PHASES)
+        elif pgr2_interleaved:
             from .pgr2_interleaved import PGR2_INTERLEAVED_PROLOGUE_PHASES
             wg_pro = list(PGR2_INTERLEAVED_PROLOGUE_PHASES)
         elif auto_scheduled:

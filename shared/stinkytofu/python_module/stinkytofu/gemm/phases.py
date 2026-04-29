@@ -2092,10 +2092,10 @@ def _emit_dtl_loads(ctx, tile, problem, label=""):
     """Issue buffer_load_dwordx4 with ,lds for both A and B."""
     elem = problem.element_bytes
     threads_per_row = tile.unroll_k // 8
-    rows_per_load = tile.block_size // threads_per_row  # 64 for 128x128x32
-    lds_stride_per_load = rows_per_load * tile.unroll_k * elem  # 64*32*2 = 4096
+    rows_per_load = tile.block_size // threads_per_row
+    lds_stride_per_load = rows_per_load * tile.unroll_k * elem
     layouts = _layouts(ctx)
-    num_loads = tile.wg_m // rows_per_load  # 128/64 = 2
+    num_loads = tile.wg_m // rows_per_load
 
     for name, srd, soffset, lds_wr_sg, dtl_off, lds_base_offset in [
         ("A", "s_srd_a", "s_soffset_a", "s_lds_wr_a_sg", "v_dtl_off_a", 0),
@@ -2105,15 +2105,19 @@ def _emit_dtl_loads(ctx, tile, problem, label=""):
         ctx.inst("s_mov_b32", "m0", ctx.sreg(lds_wr_sg),
                  comment=f"m0 = LDS write base {name}")
 
+        # Use cumulative soffset for multi-line DTL loads
+        ctx.s_mov(ctx.sreg("s_tmp0"), "0", comment="cumulative soffset")
         for load_idx in range(num_loads):
-            soff = "0" if load_idx == 0 else ctx.sreg(soffset)
             ctx.inst("buffer_load_dwordx4",
                      ctx.vreg(dtl_off), ctx.sreg(srd, 0, 4),
-                     soff, "offen offset:0, lds",
+                     ctx.sreg("s_tmp0"), "offen offset:0, lds",
                      comment=f"DTL {name} line {load_idx}")
             if load_idx < num_loads - 1:
                 ctx.inst("s_add_u32", "m0", "m0", str(lds_stride_per_load),
                          comment=f"m0 += {lds_stride_per_load}")
+                ctx.inst("s_add_u32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+                         ctx.sreg(soffset),
+                         comment=f"soffset += {name}_stride")
     ctx.raw("")
 
 
