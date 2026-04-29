@@ -126,7 +126,8 @@ class GemmKernel:
               tile_tree: Optional[TileLevel] = None,
               tiling: Optional[GemmTiling] = None,
               pipelined: bool = False,
-              optimized: bool = False) -> GemmKernel:
+              optimized: bool = False,
+              scheduled: bool = False) -> GemmKernel:
         """Build a GemmKernel.  GemmTiling is the source of truth.
 
         Args:
@@ -138,13 +139,15 @@ class GemmKernel:
             pipelined: If True, use software-pipelined K-loop.
             optimized: If True, use all optimizations (DB-LDS +
                        pipelining + interleaved MFMA/LR + fine waitcnt).
+            scheduled: If True, use three-layer scheduled codegen with
+                       TileOp-based slot placement (DESIGN.md Phase 2).
         """
         # GemmTiling is always the source of truth
         if tiling is None:
             if tile is not None:
                 tiling = GemmTiling.from_tile_config(tile)
             else:
-                if optimized:
+                if optimized or scheduled:
                     tiling = GemmTiling.high_perf()
                 else:
                     tiling = GemmTiling.standard()
@@ -158,7 +161,8 @@ class GemmKernel:
         # Tree comes from tiling (unless explicitly overridden)
         if tile_tree is None:
             tile_tree = tiling.build_tile_tree(
-                pipelined=pipelined, optimized=optimized)
+                pipelined=pipelined, optimized=optimized,
+                scheduled=scheduled)
 
         tile_tree.validate()
 
@@ -175,7 +179,7 @@ class GemmKernel:
         elem = self.problem.element_bytes
         lds_half = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
         # Double LDS for double-buffered mode
-        is_db = any(p.name == "optimized_k_loop"
+        is_db = any(p.name in ("optimized_k_loop", "scheduled_k_loop")
                      for p in self.tile_tree.prologue_phases)
         lds_total = lds_half * 2 if is_db else lds_half
 

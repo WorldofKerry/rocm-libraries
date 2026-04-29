@@ -313,7 +313,8 @@ class GemmTiling:
         )
 
     def build_tile_tree(self, pipelined: bool = False,
-                       optimized: bool = False) -> TileLevel:
+                       optimized: bool = False,
+                       scheduled: bool = False) -> TileLevel:
         """Build the full tile tree with phases from TileDim chains.
 
         The chain structure determines the tree levels:
@@ -335,6 +336,7 @@ class GemmTiling:
             WORKGROUP_PROLOGUE_PHASES, WORKGROUP_EPILOGUE_PHASES,
             WAVE_PROLOGUE_PHASES, WAVE_EPILOGUE_PHASES,
             PIPELINED_PROLOGUE_PHASES, OPTIMIZED_PROLOGUE_PHASES,
+            SCHEDULED_PROLOGUE_PHASES,
         )
 
         # Leaf: MFMA instruction (from HARDWARE TileDim leaves)
@@ -344,7 +346,7 @@ class GemmTiling:
 
         # Wave: per-wave compute tile
         # K-loop data movement phases go here (non-pipelined)
-        if pipelined or optimized:
+        if pipelined or optimized or scheduled:
             # Pipelined/optimized: K-loop phase handles compute internally.
             # Wave gets a no-op emit so the tree walker skips it.
             wave_level = TileLevel(
@@ -361,7 +363,9 @@ class GemmTiling:
                 epilogue_phases=list(WAVE_EPILOGUE_PHASES))
 
         # Workgroup: setup + K-loop structure + store
-        if optimized:
+        if scheduled:
+            wg_pro = list(SCHEDULED_PROLOGUE_PHASES)
+        elif optimized:
             wg_pro = list(OPTIMIZED_PROLOGUE_PHASES)
         elif pipelined:
             wg_pro = list(PIPELINED_PROLOGUE_PHASES)

@@ -858,6 +858,116 @@ OPTIMIZED_PROLOGUE_PHASES = [
 
 
 # ===================================================================
+# Scheduled K-loop: uses TileOp-based scheduling with interleaved
+# global loads between MFMAs (see scheduled_codegen.py / DESIGN.md)
+# ===================================================================
+
+def phase_scheduled_k_loop(level, ctx):
+    """K-loop using the three-layer scheduled codegen.
+
+    Generates TileOps from the tile config, schedules them into MFMA
+    slots with interleaved global loads and LDS writes, then emits
+    assembly by walking the schedule.
+    """
+    from .scheduled_codegen import TilePlan, emit_scheduled_kernel
+    from .schedule import SchedulingRules
+
+    tile = _tile(ctx)
+    problem = _problem(ctx)
+    layouts = _layouts(ctx)
+    elem = problem.element_bytes
+    mfma = tile.mfma
+
+    lds_half = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
+    k_stride = tile.unroll_k * elem
+    log2_uk = int(math.log2(tile.unroll_k))
+
+    ctx.alloc_sgpr_permanent(1, "s_lds_db_step")
+
+    # K-tile count
+    ctx.comment("=== Scheduled K-loop ===")
+    ctx.s_lshr(ctx.sreg("s_k_tiles"), ctx.sreg("s_K"), log2_uk,
+               comment=f"k_tiles = K / {tile.unroll_k}")
+    ctx.s_mov(ctx.sreg("s_lds_db_step"), str(lds_half),
+              comment=f"DB toggle step = {lds_half}")
+    ctx.raw("")
+
+    # Prefetch first tile + write to LDS
+    ctx.comment("Prefetch first K-tile")
+    _emit_global_load_impl(ctx, problem, tile)
+    ctx.comment("Write first tile to LDS buf[0]")
+    _emit_lds_write_impl(ctx, tile)
+
+    # Build tile plan and schedule
+    plan = TilePlan.build(tile, problem)
+    schedule = plan.schedule(SchedulingRules())
+
+    # K-loop
+    ctx.label("k_loop")
+    ctx.raw("")
+
+    # Decrement + conditional prefetch
+    ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
+              comment="k_tiles--")
+    ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
+             comment="SCC = (k_tiles != 0)")
+    ctx.inst("s_cbranch_scc0", "skip_prefetch",
+             comment="skip prefetch on last iteration")
+
+    # Advance pointers
+    for addr in ["v_addr_a", "v_addr_b"]:
+        ctx.inst("v_add_co_u32", ctx.vreg(addr, 0, 1), "vcc",
+                 str(k_stride), ctx.vreg(addr, 0, 1),
+                 comment=f"{addr} += {k_stride}")
+        ctx.inst("v_addc_co_u32", ctx.vreg(addr, 1, 1), "vcc",
+                 ctx.vreg(addr, 1, 1), "0", "vcc", comment="carry")
+
+    # Issue global loads (async, no wait) -- interleaved in schedule
+    _emit_global_load_no_wait(ctx, problem, tile)
+    ctx.raw("")
+
+    ctx.label("skip_prefetch")
+    ctx.raw("")
+
+    # Emit scheduled compute (MFMAs with interleaved side ops)
+    ctx.comment("Scheduled compute")
+    emit_scheduled_kernel(schedule, ctx, tile, problem, layouts)
+
+    # Post-compute: wait for global_load, toggle LDS, write, barrier
+    ctx.s_waitcnt("vmcnt(0)", comment="wait for global_load")
+
+    ctx.comment("Toggle LDS double-buffer offsets")
+    for reg in ["v_lds_wr_a", "v_lds_wr_b", "v_lds_rd_a", "v_lds_rd_b"]:
+        ctx.v_add(ctx.vreg(reg), ctx.sreg("s_lds_db_step"), ctx.vreg(reg),
+                  comment=f"{reg} += db_step")
+    ctx.inst("s_sub_u32", ctx.sreg("s_lds_db_step"), "0",
+             ctx.sreg("s_lds_db_step"),
+             comment="negate step for next toggle")
+    ctx.raw("")
+
+    ctx.comment("Write next tile to other LDS buffer")
+    _emit_lds_write_impl(ctx, tile)
+
+    # Loop control
+    ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
+             comment="SCC = (k_tiles != 0)")
+    ctx.inst("s_cbranch_scc1", "k_loop",
+             comment="branch if k_tiles > 0")
+    ctx.raw("")
+
+
+SCHEDULED_PROLOGUE_PHASES = [
+    TilePhase("load_kernargs", phase_load_kernargs),
+    TilePhase("thread_indexing", phase_thread_indexing),
+    TilePhase("load_cluster_setup", phase_load_cluster_setup),
+    TilePhase("lds_addrs", phase_lds_addrs),
+    TilePhase("init_acc", phase_init_acc),
+    TilePhase("global_addrs", phase_global_addrs),
+    TilePhase("scheduled_k_loop", phase_scheduled_k_loop),
+]
+
+
+# ===================================================================
 # Subtile-scheduled compute: group 4 MFMAs between reads
 # ===================================================================
 
@@ -1064,4 +1174,3 @@ def _emit_scheduled_compute(ctx, tile, problem):
             cur_a = next_a
 
         ctx.raw("")
-
