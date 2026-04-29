@@ -231,6 +231,27 @@ class GemmTiling:
 
         return GemmTiling(dim_m, dim_n, dim_k, mfma, wave_size)
 
+    @staticmethod
+    def high_perf(
+        wg_m: int = 256, wg_n: int = 256, unroll_k: int = 64,
+        waves_m: int = 2, waves_n: int = 2,
+        mfma: Optional[MfmaConfig] = None,
+        wave_size: int = 64,
+    ) -> GemmTiling:
+        """High-performance tiling for gfx950.
+
+        Uses ``v_mfma_f32_16x16x32_f16`` (2x FLOPs/cycle vs 16x16x16)
+        and a 256x256x64 macro tile (128 MFMAs per K-tile iteration,
+        providing 2048 cycles of compute to fully hide global load latency).
+        """
+        if mfma is None:
+            mfma = MfmaConfig.f16_16x16x32()
+        return GemmTiling.standard(
+            wg_m=wg_m, wg_n=wg_n, unroll_k=unroll_k,
+            waves_m=waves_m, waves_n=waves_n,
+            mfma=mfma, wave_size=wave_size,
+        )
+
     # -- Derived quantities (same interface as TileConfig) -----------
 
     @property

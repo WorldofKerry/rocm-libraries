@@ -79,6 +79,20 @@ class MfmaConfig:
             a_vgprs=2, b_vgprs=2, acc_vgprs=16,
         )
 
+    @staticmethod
+    def f16_16x16x32() -> MfmaConfig:
+        """``v_mfma_f32_16x16x32_f16``: 16x16 output, K=32 (gfx950).
+
+        2x the K-depth of f16_16x16x16 at the same cycle count (16 cycles),
+        doubling FLOPs per instruction.  A/B operands are 4 VGPRs each
+        (8 fp16 elements per thread), read via ds_read_b128.
+        """
+        return MfmaConfig(
+            m=16, n=16, k=32, blocks=1,
+            input_type="f16", acc_type="f32",
+            a_vgprs=4, b_vgprs=4, acc_vgprs=4,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Sub-tile configuration

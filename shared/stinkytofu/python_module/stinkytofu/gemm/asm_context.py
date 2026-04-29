@@ -123,7 +123,25 @@ class AsmContext(TileContext):
         self.inst("v_sub_u32", dst, str(src0), str(src1), comment=comment)
 
     def v_mul(self, dst: str, src0, src1, comment: str = "") -> None:
-        self.inst("v_mul_lo_u32", dst, str(src0), str(src1), comment=comment)
+        # Use shift for power-of-2 multipliers to avoid literal constant issues
+        s0, s1 = str(src0), str(src1)
+        try:
+            val = int(s0)
+            if val > 0 and (val & (val - 1)) == 0:
+                import math
+                self.v_lshl(dst, s1, int(math.log2(val)), comment=comment)
+                return
+        except (ValueError, TypeError):
+            pass
+        try:
+            val = int(s1)
+            if val > 0 and (val & (val - 1)) == 0:
+                import math
+                self.v_lshl(dst, s0, int(math.log2(val)), comment=comment)
+                return
+        except (ValueError, TypeError):
+            pass
+        self.inst("v_mul_lo_u32", dst, s0, s1, comment=comment)
 
     def v_lshr(self, dst: str, src, shift: int, comment: str = "") -> None:
         self.inst("v_lshrrev_b32", dst, str(shift), str(src), comment=comment)

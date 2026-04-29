@@ -144,7 +144,10 @@ class GemmKernel:
             if tile is not None:
                 tiling = GemmTiling.from_tile_config(tile)
             else:
-                tiling = GemmTiling.standard()
+                if optimized:
+                    tiling = GemmTiling.high_perf()
+                else:
+                    tiling = GemmTiling.standard()
 
         tiling.validate()
         tile = tiling.to_tile_config()

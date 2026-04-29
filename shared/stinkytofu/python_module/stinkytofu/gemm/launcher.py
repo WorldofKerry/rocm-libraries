@@ -311,6 +311,7 @@ class GemmLauncher:
         kernel_name: str = "gemm_kernel",
         num_warmup: int = 3,
         num_iters: int = 10,
+        lds_bytes: int = 0,
     ) -> GemmResult:
         """Launch the generated GEMM assembly kernel on the GPU.
 
@@ -409,8 +410,15 @@ class GemmLauncher:
         for i, v in enumerate(_arg_vals):
             args[i] = ctypes.cast(ctypes.pointer(v), ctypes.c_void_p)
 
-        lds_size = (self.tile.wg_m * self.tile.unroll_k
-                    + self.tile.wg_n * self.tile.unroll_k) * elem
+        # Use caller-provided LDS size, or compute from tile config.
+        # For double-buffered kernels, caller should pass lds_bytes from
+        # AsmKernel.lds_bytes to match the kernel descriptor.
+        if lds_bytes > 0:
+            lds_size = lds_bytes
+        else:
+            # Assembly kernels set LDS via amdhsa_group_segment_fixed_size
+            # in the descriptor, so pass 0 for dynamic shared memory.
+            lds_size = 0
 
         # Warmup
         for _ in range(num_warmup):
