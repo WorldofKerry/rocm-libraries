@@ -233,7 +233,7 @@ class GemmTiling:
 
     @staticmethod
     def high_perf(
-        wg_m: int = 256, wg_n: int = 256, unroll_k: int = 64,
+        wg_m: int = 128, wg_n: int = 128, unroll_k: int = 32,
         waves_m: int = 2, waves_n: int = 2,
         mfma: Optional[MfmaConfig] = None,
         wave_size: int = 64,
@@ -241,8 +241,12 @@ class GemmTiling:
         """High-performance tiling for gfx950.
 
         Uses ``v_mfma_f32_16x16x32_f16`` (2x FLOPs/cycle vs 16x16x16)
-        and a 256x256x64 macro tile (128 MFMAs per K-tile iteration,
-        providing 2048 cycles of compute to fully hide global load latency).
+        with a 128x128x32 macro tile (16 MFMAs per K-tile iteration).
+        The single K-iteration (unroll_k == mfma.k) eliminates inner ki
+        loop overhead, maximizing MFMA density.
+
+        For larger tiles (256x256), partition-scoped VGPR recycling and
+        slot-based scheduling are required (see DESIGN.md Phase 2-4).
         """
         if mfma is None:
             mfma = MfmaConfig.f16_16x16x32()
