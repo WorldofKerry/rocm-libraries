@@ -184,3 +184,66 @@ def emit_descriptor(ctx: AsmContext, kernel_name: str,
             ctx.raw(f"        .address_space:  global")
     ctx.raw("...")
     ctx.raw(".end_amdgpu_metadata")
+
+
+def alloc_registers_dtl(ctx: AsmContext, problem: GemmProblem,
+                        tile: TileConfig) -> None:
+    """Allocate registers for DirectToLDS kernel (no global load buffers).
+
+    DTL replaces global_load + ds_write with buffer_load ... ,lds.
+    This eliminates v_gload_a/b (16 VGPRs) and v_addr_a/b (4 VGPRs),
+    replacing them with SRDs (8 SGPRs) and per-lane offsets (2 VGPRs).
+    """
+    # ABI registers
+    ctx.alloc_sgpr_permanent(2, "s_kernarg")
+    ctx.alloc_sgpr_permanent(1, "s_wg_id_x")
+    ctx.alloc_sgpr_permanent(1, "s_wg_id_y")
+
+    # Kernel args
+    ctx.alloc_sgpr_permanent(2, "s_ptr_A")
+    ctx.alloc_sgpr_permanent(2, "s_ptr_B")
+    ctx.alloc_sgpr_permanent(2, "s_ptr_D")
+    ctx.alloc_sgpr_permanent(1, "s_M")
+    ctx.alloc_sgpr_permanent(1, "s_N")
+    ctx.alloc_sgpr_permanent(1, "s_K")
+    ctx.alloc_sgpr_permanent(1, "s_k_tiles")
+    ctx.alloc_sgpr_permanent(1, "s_tmp0")
+    ctx.alloc_sgpr_permanent(1, "s_tmp1")
+
+    # DTL-specific SGPRs
+    ctx.alloc_sgpr_permanent(4, "s_srd_a")   # Buffer resource descriptor A
+    ctx.alloc_sgpr_permanent(4, "s_srd_b")   # Buffer resource descriptor B
+    ctx.alloc_sgpr_permanent(1, "s_lds_wr_a_sg")  # LDS write base A (for m0)
+    ctx.alloc_sgpr_permanent(1, "s_lds_wr_b_sg")  # LDS write base B (for m0)
+    ctx.alloc_sgpr_permanent(1, "s_k_stride")     # K * elem bytes (SRD advance)
+    ctx.alloc_sgpr_permanent(1, "s_soffset_a")    # Scalar offset for 2nd A load
+    ctx.alloc_sgpr_permanent(1, "s_soffset_b")    # Scalar offset for 2nd B load
+
+    # Standard VGPRs
+    ctx.alloc_vgpr_permanent(1, "v_tid")
+    ctx.alloc_vgpr_permanent(1, "v_wave_id")
+    ctx.alloc_vgpr_permanent(1, "v_lane_id")
+    ctx.alloc_vgpr_permanent(1, "v_wave_m")
+    ctx.alloc_vgpr_permanent(1, "v_wave_n")
+
+    # DTL per-lane offsets (replace gload_row/col and addr_a/b)
+    ctx.alloc_vgpr_permanent(1, "v_dtl_off_a")  # Per-lane buffer offset for A
+    ctx.alloc_vgpr_permanent(1, "v_dtl_off_b")  # Per-lane buffer offset for B
+
+    # LDS read addresses (same as non-DTL)
+    ctx.alloc_vgpr_permanent(1, "v_lds_rd_a")
+    ctx.alloc_vgpr_permanent(1, "v_lds_rd_b")
+
+    # MFMA operands (same as non-DTL)
+    ctx.alloc_vgpr_permanent(tile.mfma.a_vgprs, "v_a")
+    ctx.alloc_vgpr_permanent(tile.mfma.b_vgprs, "v_b")
+
+    # Store registers
+    ctx.alloc_vgpr_permanent(2, "v_addr_d")
+    ctx.alloc_vgpr_permanent(1, "v_store_tmp")
+    ctx.alloc_vgpr_permanent(1, "v_tmp0")
+    ctx.alloc_vgpr_permanent(1, "v_tmp1")
+
+    # Accumulators
+    acc_total = tile.mfma_m_repeat * tile.mfma_n_repeat * tile.mfma.acc_vgprs
+    ctx.alloc_acc_permanent(acc_total, "acc_C")

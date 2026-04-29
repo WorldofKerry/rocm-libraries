@@ -1879,3 +1879,399 @@ PGR2_PROLOGUE_PHASES = [
     TilePhase("global_addrs", phase_global_addrs),
     TilePhase("pgr2_k_loop", phase_pgr2_k_loop),
 ]
+
+
+# ===================================================================
+# DirectToLDS K-loop: buffer_load ... ,lds eliminates ds_write
+# ===================================================================
+
+def phase_dtl_setup(level, ctx):
+    """Set up SRDs, per-lane offsets, and LDS write bases for DTL."""
+    tile = _tile(ctx)
+    problem = _problem(ctx)
+    elem = problem.element_bytes
+    mfma = tile.mfma
+
+    ctx.comment("=== DirectToLDS setup ===")
+
+    # Load kernel arguments (same as phase_load_kernargs)
+    karg = ctx.sreg("s_kernarg")
+    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_A"), karg, "0", comment="A ptr")
+    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_B"), karg, "8", comment="B ptr")
+    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_D"), karg, "16", comment="D ptr")
+    ctx.inst("s_load_dword", ctx.sreg("s_M"), karg, "24", comment="M")
+    ctx.inst("s_load_dword", ctx.sreg("s_N"), karg, "28", comment="N")
+    ctx.inst("s_load_dword", ctx.sreg("s_K"), karg, "32", comment="K")
+    ctx.s_waitcnt("lgkmcnt(0)", comment="wait for kernarg loads")
+    ctx.raw("")
+
+    # Thread indexing
+    log2_ws = int(math.log2(tile.wave_size))
+    ctx.comment("Thread indexing")
+    ctx.v_lshr(ctx.vreg("v_wave_id"), ctx.vreg("v_tid"), log2_ws,
+               comment=f"wave_id = tid >> {log2_ws}")
+    ctx.v_and(ctx.vreg("v_lane_id"), ctx.vreg("v_tid"), tile.wave_size - 1,
+              comment=f"lane_id = tid & {tile.wave_size - 1}")
+    if tile.waves_n > 1:
+        log2_wn = int(math.log2(tile.waves_n))
+        ctx.v_lshr(ctx.vreg("v_wave_m"), ctx.vreg("v_wave_id"), log2_wn,
+                   comment=f"wave_m = wave_id >> {log2_wn}")
+        ctx.v_and(ctx.vreg("v_wave_n"), ctx.vreg("v_wave_id"),
+                  tile.waves_n - 1,
+                  comment=f"wave_n = wave_id & {tile.waves_n - 1}")
+    else:
+        ctx.v_mov(ctx.vreg("v_wave_m"), ctx.vreg("v_wave_id"),
+                  comment="wave_m = wave_id")
+        ctx.v_mov(ctx.vreg("v_wave_n"), "0", comment="wave_n = 0")
+    ctx.raw("")
+
+    # DTL per-lane offset computation
+    # Contiguous mapping: thread t loads 8 fp16 starting at linear position t*8
+    # row = t / threads_per_row, col = (t % threads_per_row) * 8
+    # threads_per_row = unroll_k / 8 = 4 for unroll_k=32
+    threads_per_row = tile.unroll_k // 8  # 8 elements per dwordx4 load (fp16)
+    log2_tpr = int(math.log2(threads_per_row))
+
+    ctx.comment(f"DTL per-lane offset: {threads_per_row} threads/row, 8 elems/thread")
+    # thread_row = tid >> log2_tpr
+    ctx.v_lshr(ctx.vreg("v_tmp0"), ctx.vreg("v_tid"), log2_tpr,
+               comment=f"thread_row = tid >> {log2_tpr}")
+    # thread_col_byte = (tid & (tpr-1)) * 16  (8 fp16 = 16 bytes)
+    ctx.v_and(ctx.vreg("v_tmp1"), ctx.vreg("v_tid"), threads_per_row - 1,
+              comment=f"tid & {threads_per_row - 1}")
+    ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_tmp1"), 4,
+               comment="* 16 -> col_bytes")
+
+    # A offset = thread_row * K * elem + col_bytes
+    # K * elem = s_K * 2 for fp16
+    ctx.s_lshl(ctx.sreg("s_k_stride"), ctx.sreg("s_K"), int(math.log2(elem)),
+               comment=f"s_k_stride = K * {elem}")
+    ctx.inst("v_mul_lo_u32", ctx.vreg("v_dtl_off_a"),
+             ctx.sreg("s_k_stride"), ctx.vreg("v_tmp0"),
+             comment="row * K * elem")
+    ctx.v_add(ctx.vreg("v_dtl_off_a"), ctx.vreg("v_dtl_off_a"),
+              ctx.vreg("v_tmp1"), comment="+ col_bytes -> A offset")
+    # B uses same mapping (B is N x K, row-major with stride K)
+    ctx.v_mov(ctx.vreg("v_dtl_off_b"), ctx.vreg("v_dtl_off_a"),
+              comment="B offset = same mapping")
+    ctx.raw("")
+
+    # SRD setup for A
+    # SRD base = ptr_A + wg_id_x * wg_m * K * elem
+    ctx.comment("SRD setup for A")
+    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"), str(tile.wg_m),
+              comment=f"wg_id_x * {tile.wg_m}")
+    ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+             ctx.sreg("s_k_stride"),
+             comment="* K * elem -> wg tile offset A")
+    # 64-bit add: srd_a = ptr_A + wg_offset
+    ctx.inst("s_add_u32", ctx.sreg("s_srd_a", 0, 1),
+             ctx.sreg("s_ptr_A", 0, 1), ctx.sreg("s_tmp0"),
+             comment="SRD_A base lo")
+    ctx.inst("s_addc_u32", ctx.sreg("s_srd_a", 1, 1),
+             ctx.sreg("s_ptr_A", 1, 1), "0",
+             comment="SRD_A base hi")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_a", 2, 1), "0xFFFFFFFF",
+             comment="SRD_A limit (no OOB check)")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_a", 3, 1), "0x20000",
+             comment="SRD_A flags: data_format=4")
+    ctx.raw("")
+
+    # SRD setup for B
+    ctx.comment("SRD setup for B")
+    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"), str(tile.wg_n),
+              comment=f"wg_id_y * {tile.wg_n}")
+    ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+             ctx.sreg("s_k_stride"),
+             comment="* K * elem -> wg tile offset B")
+    ctx.inst("s_add_u32", ctx.sreg("s_srd_b", 0, 1),
+             ctx.sreg("s_ptr_B", 0, 1), ctx.sreg("s_tmp0"),
+             comment="SRD_B base lo")
+    ctx.inst("s_addc_u32", ctx.sreg("s_srd_b", 1, 1),
+             ctx.sreg("s_ptr_B", 1, 1), "0",
+             comment="SRD_B base hi")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_b", 2, 1), "0xFFFFFFFF",
+             comment="SRD_B limit")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_b", 3, 1), "0x20000",
+             comment="SRD_B flags")
+    ctx.raw("")
+
+    # Scalar offsets for 2nd load line (rows 64-127)
+    # soffset = rows_per_load * K * elem
+    rows_per_load = tile.block_size // threads_per_row  # 256/4 = 64
+    ctx.comment(f"Scalar offset for 2nd load line ({rows_per_load} rows)")
+    ctx.s_mul(ctx.sreg("s_soffset_a"), ctx.sreg("s_k_stride"),
+              str(rows_per_load),
+              comment=f"soffset_a = {rows_per_load} * K * elem")
+    ctx.s_mov(ctx.sreg("s_soffset_b"), ctx.sreg("s_soffset_a"),
+              comment="soffset_b = same")
+    ctx.raw("")
+
+    # LDS write bases (SGPR, loaded from VGPR via v_readfirstlane)
+    # Each wave needs its own m0 value.
+    # LDS base for wave w: w * rows_per_wave * unroll_k * elem
+    rows_per_wave = tile.wave_size // threads_per_row  # 64/4 = 16
+    lds_stride_per_wave = rows_per_wave * tile.unroll_k * elem  # 16*32*2 = 1024
+
+    ctx.comment("LDS write bases (per-wave via v_readfirstlane)")
+    # Compute per-thread LDS write address (same formula as row-major layout)
+    # lds_wr = thread_row * unroll_k * elem + col_bytes
+    # But we already have thread_row in v_tmp0 and col_bytes in v_tmp1
+    ctx.v_mul(ctx.vreg("v_tmp0"), str(tile.unroll_k * elem),
+              ctx.vreg("v_tmp0"), comment=f"row * {tile.unroll_k * elem}")
+    ctx.v_add(ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),
+              comment="+ col_bytes -> lds_wr_per_thread")
+    # Extract wave's lane-0 value as the SGPR base
+    ctx.inst("v_readfirstlane_b32", ctx.sreg("s_lds_wr_a_sg"),
+             ctx.vreg("v_tmp0"),
+             comment="lds_wr_a base for this wave")
+
+    # B LDS write base: offset by lds_b_offset
+    layouts = _layouts(ctx)
+    ctx.inst("s_add_u32", ctx.sreg("s_lds_wr_b_sg"),
+             ctx.sreg("s_lds_wr_a_sg"), str(layouts.lds_b_offset),
+             comment=f"lds_wr_b = lds_wr_a + {layouts.lds_b_offset}")
+    ctx.raw("")
+
+    # LDS read addresses (same as non-DTL)
+    k_per_group = mfma.k // (tile.wave_size // mfma.m)
+    ctx.comment("MFMA lane mapping for LDS reads")
+    ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.m - 1,
+              comment=f"lane_row = lane_id % {mfma.m}")
+    ctx.v_lshr(ctx.vreg("v_tmp1"), ctx.vreg("v_lane_id"),
+               int(math.log2(mfma.m)), comment=f"lane_id / {mfma.m}")
+    ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_tmp1"),
+               int(math.log2(k_per_group)),
+               comment=f"* {k_per_group} -> lane_k_offset")
+
+    # LDS read A: addr = (row * unroll_k + lane_k) * elem
+    ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(tile.m_per_wave),
+              ctx.vreg("v_wave_m"), comment=f"wave_m * {tile.m_per_wave}")
+    ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
+              ctx.vreg("v_tmp0"), comment="+ lane_row -> row")
+    ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(tile.unroll_k),
+              ctx.vreg("v_lds_rd_a"), comment=f"* {tile.unroll_k}")
+    ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
+              ctx.vreg("v_tmp1"), comment="+ lane_k_offset")
+    ctx.v_lshl(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
+               int(math.log2(elem)), comment=f"* {elem} -> bytes")
+    ctx.raw("")
+
+    # LDS read B: addr = lds_b_offset + (row * unroll_k + lane_k) * elem
+    ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(tile.n_per_wave),
+              ctx.vreg("v_wave_n"), comment=f"wave_n * {tile.n_per_wave}")
+    ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
+              ctx.vreg("v_tmp0"), comment="+ lane_row -> row")
+    ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(tile.unroll_k),
+              ctx.vreg("v_lds_rd_b"), comment=f"* {tile.unroll_k}")
+    ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
+              ctx.vreg("v_tmp1"), comment="+ lane_k_offset")
+    ctx.v_lshl(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
+               int(math.log2(elem)), comment=f"* {elem} -> bytes")
+    ctx.v_add(ctx.vreg("v_lds_rd_b"), str(layouts.lds_b_offset),
+              ctx.vreg("v_lds_rd_b"), comment=f"+ lds_b_offset")
+    ctx.raw("")
+
+    # Init accumulators
+    acc_total = tile.mfma_m_repeat * tile.mfma_n_repeat * tile.mfma.acc_vgprs
+    ctx.comment(f"Init {acc_total} accumulators")
+    for i in range(acc_total):
+        ctx.inst("v_accvgpr_write_b32", ctx.areg("acc_C", i, 1), "0")
+    ctx.raw("")
+
+
+def _emit_dtl_loads(ctx, tile, problem, label=""):
+    """Issue buffer_load_dwordx4 with ,lds for both A and B."""
+    elem = problem.element_bytes
+    threads_per_row = tile.unroll_k // 8
+    rows_per_load = tile.block_size // threads_per_row  # 64 for 128x128x32
+    lds_stride_per_load = rows_per_load * tile.unroll_k * elem  # 64*32*2 = 4096
+    layouts = _layouts(ctx)
+    num_loads = tile.wg_m // rows_per_load  # 128/64 = 2
+
+    for name, srd, soffset, lds_wr_sg, dtl_off, lds_base_offset in [
+        ("A", "s_srd_a", "s_soffset_a", "s_lds_wr_a_sg", "v_dtl_off_a", 0),
+        ("B", "s_srd_b", "s_soffset_b", "s_lds_wr_b_sg", "v_dtl_off_b", layouts.lds_b_offset),
+    ]:
+        ctx.comment(f"DTL load {name} {label}")
+        ctx.inst("s_mov_b32", "m0", ctx.sreg(lds_wr_sg),
+                 comment=f"m0 = LDS write base {name}")
+
+        for load_idx in range(num_loads):
+            soff = "0" if load_idx == 0 else ctx.sreg(soffset)
+            ctx.inst("buffer_load_dwordx4",
+                     ctx.vreg(dtl_off), ctx.sreg(srd, 0, 4),
+                     soff, "offen offset:0, lds",
+                     comment=f"DTL {name} line {load_idx}")
+            if load_idx < num_loads - 1:
+                ctx.inst("s_add_u32", "m0", "m0", str(lds_stride_per_load),
+                         comment=f"m0 += {lds_stride_per_load}")
+    ctx.raw("")
+
+
+def phase_dtl_k_loop(level, ctx):
+    """K-loop with DirectToLDS: buffer_load_dwordx4 ... ,lds."""
+    tile = _tile(ctx)
+    problem = _problem(ctx)
+    elem = problem.element_bytes
+    mfma = tile.mfma
+    layouts = _layouts(ctx)
+
+    mr = tile.mfma_m_repeat
+    nr = tile.mfma_n_repeat
+    ki_count = tile.k_iterations
+    av = mfma.a_vgprs
+    bv = mfma.b_vgprs
+
+    lds_half = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
+    log2_uk = int(math.log2(tile.unroll_k))
+
+    ctx.alloc_sgpr_permanent(1, "s_lds_db_step")
+
+    ctx.comment("=== DTL K-loop ===")
+    ctx.s_lshr(ctx.sreg("s_k_tiles"), ctx.sreg("s_K"), log2_uk,
+               comment=f"k_tiles = K / {tile.unroll_k}")
+    ctx.s_mov(ctx.sreg("s_lds_db_step"), str(lds_half),
+              comment=f"DB toggle step = {lds_half}")
+    ctx.raw("")
+
+    # Prologue: DTL load tile 0 + wait + barrier
+    ctx.comment("Prologue: DTL load tile 0")
+    _emit_dtl_loads(ctx, tile, problem, "tile0")
+    ctx.s_waitcnt("vmcnt(0)", comment="wait for DTL loads")
+    ctx.s_barrier(comment="sync after DTL fill")
+    ctx.raw("")
+
+    # Allocate operand registers
+    b_names = {}
+    for ni in range(nr):
+        for ki in range(ki_count):
+            name = f"v_b_s{ni}k{ki}"
+            if not ctx.has(name):
+                ctx.alloc_vgpr_permanent(bv, name)
+            b_names[(ni, ki)] = name
+
+    a_names = {}
+    for buf in range(2):
+        for ki in range(ki_count):
+            name = f"v_a_b{buf}k{ki}"
+            if not ctx.has(name):
+                ctx.alloc_vgpr_permanent(av, name)
+            a_names[(buf, ki)] = name
+
+    def a_off(mi, ki):
+        return (mi * mfma.m * tile.unroll_k + ki * mfma.k) * elem
+
+    def b_off(ni, ki):
+        return (ni * mfma.n * tile.unroll_k + ki * mfma.k) * elem
+
+    # K-loop
+    ctx.label("k_loop")
+    ctx.raw("")
+
+    # Decrement + conditional DTL load
+    ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
+              comment="k_tiles--")
+    ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
+             comment="SCC = (k_tiles != 0)")
+    ctx.inst("s_cbranch_scc0", "dtl_skip_load",
+             comment="skip DTL load on last iteration")
+
+    # Advance SRD bases by k_stride
+    k_stride = tile.unroll_k * elem
+    for srd in ["s_srd_a", "s_srd_b"]:
+        ctx.inst("s_add_u32", ctx.sreg(srd, 0, 1),
+                 ctx.sreg(srd, 0, 1), str(k_stride),
+                 comment=f"{srd} += {k_stride}")
+        ctx.inst("s_addc_u32", ctx.sreg(srd, 1, 1),
+                 ctx.sreg(srd, 1, 1), "0", comment="carry")
+
+    # Toggle LDS write bases (point to other buffer)
+    ctx.inst("s_add_u32", ctx.sreg("s_lds_wr_a_sg"),
+             ctx.sreg("s_lds_wr_a_sg"), ctx.sreg("s_lds_db_step"),
+             comment="lds_wr_a += db_step")
+    ctx.inst("s_add_u32", ctx.sreg("s_lds_wr_b_sg"),
+             ctx.sreg("s_lds_wr_b_sg"), ctx.sreg("s_lds_db_step"),
+             comment="lds_wr_b += db_step")
+
+    # Issue DTL loads into the OTHER buffer
+    _emit_dtl_loads(ctx, tile, problem, "next")
+    ctx.raw("")
+
+    ctx.label("dtl_skip_load")
+    ctx.raw("")
+
+    # Compute from current LDS buffer
+    ctx.comment(f"Compute: {mr}x{nr}x{ki_count} = {mr*nr*ki_count} MFMAs")
+
+    # Preamble: load all B + A[0]
+    for ki in range(ki_count):
+        for ni in range(nr):
+            name = b_names[(ni, ki)]
+            ctx.ds_read(ctx.vreg(name, 0, bv), ctx.vreg("v_lds_rd_b"),
+                        offset=b_off(ni, ki), width=bv,
+                        comment=f"LR B n{ni}k{ki}")
+
+    cur_a = 0
+    for ki in range(ki_count):
+        name = a_names[(cur_a, ki)]
+        ctx.ds_read(ctx.vreg(name, 0, av), ctx.vreg("v_lds_rd_a"),
+                    offset=a_off(0, ki), width=av,
+                    comment=f"LR A m0k{ki} b{cur_a}")
+
+    ctx.s_waitcnt("lgkmcnt(0)", comment="wait preamble")
+    ctx.raw("")
+
+    # Per-mi groups: A prefetch + MFMAs
+    for mi in range(mr):
+        has_prefetch = mi < mr - 1
+        if has_prefetch:
+            next_a = 1 - cur_a
+            for ki in range(ki_count):
+                name = a_names[(next_a, ki)]
+                ctx.ds_read(ctx.vreg(name, 0, av), ctx.vreg("v_lds_rd_a"),
+                            offset=a_off(mi + 1, ki), width=av,
+                            comment=f"LR A m{mi+1}k{ki} b{next_a}")
+
+        for ki in range(ki_count):
+            for ni in range(nr):
+                acc_per = mfma.acc_vgprs
+                acc_off = (mi * nr + ni) * acc_per
+                ctx.inst(
+                    f"v_mfma_f32_{mfma.m}x{mfma.n}x{mfma.k}_f16",
+                    ctx.areg("acc_C", acc_off, acc_per),
+                    ctx.vreg(a_names[(cur_a, ki)], 0, av),
+                    ctx.vreg(b_names[(ni, ki)], 0, bv),
+                    ctx.areg("acc_C", acc_off, acc_per),
+                    comment=f"MFMA m{mi}_n{ni}_k{ki}")
+
+        if has_prefetch:
+            ctx.s_waitcnt("lgkmcnt(0)",
+                          comment=f"wait A[{mi+1}]")
+            cur_a = next_a
+        ctx.raw("")
+
+    # Post-compute: wait for DTL loads + toggle read addrs + barrier
+    ctx.s_waitcnt("vmcnt(0)", comment="wait for DTL loads")
+
+    # Toggle LDS read addresses
+    for reg in ["v_lds_rd_a", "v_lds_rd_b"]:
+        ctx.v_add(ctx.vreg(reg), ctx.sreg("s_lds_db_step"), ctx.vreg(reg),
+                  comment=f"{reg} += db_step")
+    ctx.inst("s_sub_u32", ctx.sreg("s_lds_db_step"), "0",
+             ctx.sreg("s_lds_db_step"),
+             comment="negate step for next toggle")
+    ctx.raw("")
+
+    ctx.s_barrier(comment="sync workgroup")
+    ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
+             comment="SCC = (k_tiles != 0)")
+    ctx.inst("s_cbranch_scc1", "k_loop",
+             comment="branch if k_tiles > 0")
+    ctx.raw("")
+
+
+DTL_PROLOGUE_PHASES = [
+    TilePhase("dtl_setup", phase_dtl_setup),
+    TilePhase("dtl_k_loop", phase_dtl_k_loop),
+]

@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
 from .asm_context import AsmContext
-from .asm_emitter import alloc_registers, emit_header, emit_descriptor, assemble_kernel
+from .asm_emitter import alloc_registers, alloc_registers_dtl, emit_header, emit_descriptor, assemble_kernel
 from .asm_transforms import emit_affine, GemmLayouts
 from .phases import default_mfma_visitor
 from .problem import GemmProblem, TileConfig
@@ -129,7 +129,8 @@ class GemmKernel:
               optimized: bool = False,
               scheduled: bool = False,
               interleaved: bool = False,
-              pgr2: bool = False) -> GemmKernel:
+              pgr2: bool = False,
+              dtl: bool = False) -> GemmKernel:
         """Build a GemmKernel.  GemmTiling is the source of truth.
 
         Args:
@@ -151,7 +152,7 @@ class GemmKernel:
             if tile is not None:
                 tiling = GemmTiling.from_tile_config(tile)
             else:
-                if optimized or scheduled or interleaved or pgr2:
+                if optimized or scheduled or interleaved or pgr2 or dtl:
                     tiling = GemmTiling.high_perf()
                 else:
                     tiling = GemmTiling.standard()
@@ -167,7 +168,8 @@ class GemmKernel:
             tile_tree = tiling.build_tile_tree(
                 pipelined=pipelined, optimized=optimized,
                 scheduled=scheduled, interleaved=interleaved,
-                pgr2=pgr2)
+                pgr2=pgr2,
+                dtl=dtl)
 
         tile_tree.validate()
 
@@ -184,7 +186,7 @@ class GemmKernel:
         elem = self.problem.element_bytes
         lds_half = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
         # Double LDS for double-buffered mode
-        is_db = any(p.name in ("optimized_k_loop", "scheduled_k_loop", "fully_interleaved_k_loop", "pgr2_k_loop")
+        is_db = any(p.name in ("optimized_k_loop", "scheduled_k_loop", "fully_interleaved_k_loop", "pgr2_k_loop", "dtl_k_loop")
                      for p in self.tile_tree.prologue_phases)
         lds_total = lds_half * 2 if is_db else lds_half
 
@@ -195,7 +197,12 @@ class GemmKernel:
             "layouts": self.layouts,
             "kernel": self,
         }
-        alloc_registers(ctx, self.problem, tile)
+        is_dtl = any(p.name == "dtl_setup"
+                     for p in self.tile_tree.prologue_phases)
+        if is_dtl:
+            alloc_registers_dtl(ctx, self.problem, tile)
+        else:
+            alloc_registers(ctx, self.problem, tile)
 
         ctx.register_view(MemoryView(
             name="A", source="lds", layout=self.layouts.lds_a,
