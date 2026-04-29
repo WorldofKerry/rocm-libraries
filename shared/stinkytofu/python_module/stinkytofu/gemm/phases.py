@@ -887,116 +887,128 @@ OPTIMIZED_PROLOGUE_PHASES = [
 # ===================================================================
 
 def _emit_subtile_compute(ctx, tile, problem):
-    """Emit MFMAs with subtile scheduling for maximum ds_read hiding.
+    """Subtile-scheduled MFMA with ds_read_b64 and merged ki.
 
-    Schedule: for each ki, for each mi:
-      1. Load all B[ni=0..3, ki] upfront (one-time per ki)
-      2. Load A[mi=0, ki], wait
-      3. Prefetch A[mi+1, ki] (2 ds_reads, 20-cycle latency)
-      4. Execute 4 MFMAs for (mi, ni=0..3) -- 32 cycles total
-      5. Wait for A prefetch (32 > 20 cycles, no stall)
-      6. Repeat for next mi
+    Key optimizations over naive ds_read + mfma:
+    1. ds_read_b64: load 2-VGPR operand in one instruction (halves reads)
+    2. Merge ki: group 4*ki_count MFMAs per A-prefetch for more hiding
+    3. B pre-loaded per ki, A double-buffered with prefetch
 
-    The 4-MFMA group (32 cycles) fully hides the A prefetch latency
-    (20 cycles). B values are preloaded and reused across all mi.
+    Schedule (ki_count=2, nr=4):
+      Load B[ni=0..3, ki=0..1] upfront (8 reads via b64 = 8 lgkm)
+      Load A[mi=0, ki=0..1] (2 reads via b64)
+      Wait for all
+      For each mi:
+        Prefetch A[mi+1, ki=0..1] (2 reads)
+        Execute 4*ki_count MFMAs: (mi, ni=0..3, ki=0..ki_count-1)
+        Wait for A prefetch (hidden by MFMAs)
     """
     mfma = tile.mfma
     elem = problem.element_bytes
-    mr = tile.mfma_m_repeat   # typically 4
-    nr = tile.mfma_n_repeat   # typically 4
-    ki_count = tile.k_iterations  # typically 2
+    mr = tile.mfma_m_repeat
+    nr = tile.mfma_n_repeat
+    ki_count = tile.k_iterations
     av = mfma.a_vgprs  # 2
     bv = mfma.b_vgprs  # 2
 
-    # Allocate 4 B buffers (one per ni) + A double-buffer
-    # v_a and v_a2 already allocated by _alloc_registers and optimized_k_loop
-    b_names = []
+    # Allocate B buffers: one per (ni, ki)
+    b_names = {}
     for ni in range(nr):
-        name = f"v_b_st{ni}"
-        if not ctx.has(name):
-            ctx.alloc_vgpr_permanent(bv, name)
-        b_names.append(name)
+        for ki in range(ki_count):
+            name = f"v_b_s{ni}k{ki}"
+            if not ctx.has(name):
+                ctx.alloc_vgpr_permanent(bv, name)
+            b_names[(ni, ki)] = name
 
-    if not ctx.has("v_a2"):
-        ctx.alloc_vgpr_permanent(av, "v_a2")
+    # A double-buffer: one per ki in each buffer
+    a_names = {}
+    for buf in range(2):
+        for ki in range(ki_count):
+            name = f"v_a_b{buf}k{ki}"
+            if not ctx.has(name):
+                ctx.alloc_vgpr_permanent(av, name)
+            a_names[(buf, ki)] = name
 
-    a_bufs = ["v_a", "v_a2"]
-
-    def a_lds_off(mi, ki):
+    def a_off(mi, ki):
         return (mi * mfma.m * tile.unroll_k + ki * mfma.k) * elem
 
-    def b_lds_off(ni, ki):
+    def b_off(ni, ki):
         return (ni * mfma.n * tile.unroll_k + ki * mfma.k) * elem
 
     def read_a(mi, ki, buf):
-        off = a_lds_off(mi, ki)
+        off = a_off(mi, ki)
+        name = a_names[(buf, ki)]
         if off > 0:
             ctx.v_add(ctx.vreg("v_tmp0"), str(off), ctx.vreg("v_lds_rd_a"),
                       comment=f"A addr m{mi}k{ki}")
             addr = ctx.vreg("v_tmp0")
         else:
             addr = ctx.vreg("v_lds_rd_a")
-        for r in range(av):
-            ctx.ds_read(ctx.vreg(buf, r, 1), addr, offset=r*4, width=1,
-                        comment=f"LR A[{r}] m{mi}k{ki}")
+        # Use ds_read_b64 for 2-VGPR operand
+        ctx.ds_read(ctx.vreg(name, 0, av), addr, width=av,
+                    comment=f"LR A m{mi}k{ki} buf{buf}")
 
-    def read_b(ni, ki, buf):
-        off = b_lds_off(ni, ki)
+    def read_b(ni, ki):
+        off = b_off(ni, ki)
+        name = b_names[(ni, ki)]
         if off > 0:
             ctx.v_add(ctx.vreg("v_tmp1"), str(off), ctx.vreg("v_lds_rd_b"),
                       comment=f"B addr n{ni}k{ki}")
             addr = ctx.vreg("v_tmp1")
         else:
             addr = ctx.vreg("v_lds_rd_b")
-        for r in range(bv):
-            ctx.ds_read(ctx.vreg(buf, r, 1), addr, offset=r*4, width=1,
-                        comment=f"LR B[{r}] n{ni}k{ki}")
+        ctx.ds_read(ctx.vreg(name, 0, bv), addr, width=bv,
+                    comment=f"LR B n{ni}k{ki}")
 
-    def do_mfma(mi, ni, ki, a_buf, b_buf):
+    def do_mfma(mi, ni, ki, a_buf):
         acc_per = mfma.acc_vgprs
         acc_off = (mi * nr + ni) * acc_per
+        a_name = a_names[(a_buf, ki)]
+        b_name = b_names[(ni, ki)]
         ctx.inst(
             f"v_mfma_f32_{mfma.m}x{mfma.n}x{mfma.k}_f16",
             ctx.areg("acc_C", acc_off, acc_per),
-            ctx.vreg(a_buf, 0, av),
-            ctx.vreg(b_buf, 0, bv),
+            ctx.vreg(a_name, 0, av),
+            ctx.vreg(b_name, 0, bv),
             ctx.areg("acc_C", acc_off, acc_per),
             comment=f"mfma m{mi}_n{ni}_k{ki}")
 
-    ctx.comment(f"Subtile schedule: {mr}m x {nr}n x {ki_count}k, "
-                f"groups of {nr} MFMAs")
+    total_mfma = mr * nr * ki_count
+    ctx.comment(f"Subtile: {mr}m x {nr}n x {ki_count}k = {total_mfma} MFMAs, "
+                f"ds_read_b64, {nr*ki_count} B bufs")
 
+    # Load all B[ni, ki] upfront via ds_read_b64
     for ki in range(ki_count):
-        # Load all B[ni, ki] upfront
         for ni in range(nr):
-            read_b(ni, ki, b_names[ni])
+            read_b(ni, ki)
 
-        # Load first A[mi=0, ki]
-        cur_a = 0
-        read_a(0, ki, a_bufs[cur_a])
+    # Load A[mi=0, ki=0..ki_count-1]
+    cur_a = 0
+    for ki in range(ki_count):
+        read_a(0, ki, cur_a)
 
-        # Wait for all B + A[0] reads
-        ctx.s_waitcnt("lgkmcnt(0)",
-                      comment=f"wait B[0..{nr-1}]+A[0] for ki={ki}")
-        ctx.raw("")
+    # Total reads: nr*ki_count (B) + ki_count (A) = 4*2+2 = 10 for default
+    ctx.s_waitcnt("lgkmcnt(0)",
+                  comment=f"wait all B + A[0]")
+    ctx.raw("")
 
-        for mi in range(mr):
-            # Prefetch A[mi+1] during the 4 MFMAs that follow
-            has_prefetch = False
-            if mi < mr - 1:
-                next_a = 1 - cur_a
-                read_a(mi + 1, ki, a_bufs[next_a])
-                has_prefetch = True
+    for mi in range(mr):
+        # Prefetch A[mi+1] for all ki values
+        has_prefetch = mi < mr - 1
+        if has_prefetch:
+            next_a = 1 - cur_a
+            for ki in range(ki_count):
+                read_a(mi + 1, ki, next_a)
 
-            # Execute nr MFMAs: (mi, ni=0..nr-1, ki)
-            # These take nr * 8 = 32 cycles, hiding the A prefetch
+        # Execute nr * ki_count MFMAs
+        for ki in range(ki_count):
             for ni in range(nr):
-                do_mfma(mi, ni, ki, a_bufs[cur_a], b_names[ni])
+                do_mfma(mi, ni, ki, cur_a)
 
-            # Wait for A prefetch (should be hidden by MFMAs)
-            if has_prefetch:
-                ctx.s_waitcnt("lgkmcnt(0)",
-                              comment=f"wait A[{mi+1}] ({nr} MFMAs hid latency)")
-                cur_a = next_a
+        # Wait for A prefetch (hidden by nr*ki_count MFMAs)
+        if has_prefetch:
+            ctx.s_waitcnt("lgkmcnt(0)",
+                          comment=f"wait A[{mi+1}] ({nr*ki_count} MFMAs hid latency)")
+            cur_a = next_a
 
-            ctx.raw("")
+        ctx.raw("")
