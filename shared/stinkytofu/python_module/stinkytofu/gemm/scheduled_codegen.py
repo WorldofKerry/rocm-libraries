@@ -388,8 +388,12 @@ def emit_scheduled_kernel(
 
         # Wait for A prefetch
         if has_prefetch:
-            ctx.s_waitcnt("lgkmcnt(0)",
-                          comment=f"wait A[{mi+1}] ({nr*ki_count} MFMAs hid)")
+            # Use precise lgkmcnt: we issued ki_count ds_reads for A[mi+1],
+            # and need them done before using next_a in the next mi group.
+            # lgkmcnt(0) is precise here since no other LDS ops are in flight
+            # after the preamble (preamble waited with lgkmcnt(0)).
+            ctx.s_waitcnt(f"lgkmcnt(0)",
+                          comment=f"wait A[{mi+1}]")
             cur_a = next_a
 
         ctx.raw("")
