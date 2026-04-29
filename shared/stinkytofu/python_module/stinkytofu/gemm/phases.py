@@ -712,7 +712,7 @@ def phase_optimized_k_loop(level, ctx):
 
     # Subtile compute with interleaved post-compute overhead
     ctx.comment("Subtile compute + interleaved overhead")
-    _emit_subtile_compute(ctx, tile, problem)
+    _emit_scheduled_compute(ctx, tile, problem)
 
     # Post-compute: wait for global_load, toggle LDS, write, barrier
     ctx.s_waitcnt("vmcnt(0)", comment="wait for global_load")
@@ -861,7 +861,7 @@ OPTIMIZED_PROLOGUE_PHASES = [
 # Subtile-scheduled compute: group 4 MFMAs between reads
 # ===================================================================
 
-def _emit_subtile_compute(ctx, tile, problem):
+def _emit_subtile_compute_legacy(ctx, tile, problem):
     """Subtile-scheduled MFMA with ds_read_b64 and merged ki.
 
     All B values for all (ni, ki) loaded upfront. A double-buffered
@@ -963,3 +963,105 @@ def _emit_subtile_compute(ctx, tile, problem):
             cur_a = next_a
 
         ctx.raw("")
+
+
+# ===================================================================
+# Automated subtile scheduler with preamble
+# ===================================================================
+
+def _emit_scheduled_compute(ctx, tile, problem):
+    """Automated subtile scheduler with preamble + interleaved A prefetch.
+
+    Structure:
+      Preamble: all B reads + A[mi=0] reads -> waitcnt (one-time)
+      Per mi group: prefetch A[mi+1] -> 8 MFMAs -> waitcnt
+      MFMA order: (mi, ki, ni) to maximize A operand reuse
+
+    The preamble loads all data needed for mi=0. Each subsequent mi
+    group prefetches A for the next mi during the current group's
+    8 MFMAs (32 cycles >> 20 cycle ds_read latency).
+    """
+    mfma = tile.mfma
+    elem = problem.element_bytes
+    mr = tile.mfma_m_repeat
+    nr = tile.mfma_n_repeat
+    ki_count = tile.k_iterations
+    av = mfma.a_vgprs
+    bv = mfma.b_vgprs
+
+    # Ensure registers allocated
+    b_names = {}
+    for ni in range(nr):
+        for ki in range(ki_count):
+            name = f"v_b_s{ni}k{ki}"
+            if not ctx.has(name):
+                ctx.alloc_vgpr_permanent(bv, name)
+            b_names[(ni, ki)] = name
+
+    a_names = {}
+    for buf in range(2):
+        for ki in range(ki_count):
+            name = f"v_a_b{buf}k{ki}"
+            if not ctx.has(name):
+                ctx.alloc_vgpr_permanent(av, name)
+            a_names[(buf, ki)] = name
+
+    def a_off(mi, ki):
+        return (mi * mfma.m * tile.unroll_k + ki * mfma.k) * elem
+
+    def b_off(ni, ki):
+        return (ni * mfma.n * tile.unroll_k + ki * mfma.k) * elem
+
+    total = mr * nr * ki_count
+    ctx.comment(f"Scheduled: {total} MFMAs ({mr}m x {nr}n x {ki_count}k)")
+
+    # Preamble: load all B + A[0]
+    for ki in range(ki_count):
+        for ni in range(nr):
+            ctx.ds_read(ctx.vreg(b_names[(ni, ki)], 0, bv),
+                        ctx.vreg("v_lds_rd_b"),
+                        offset=b_off(ni, ki), width=bv,
+                        comment=f"pre B n{ni}k{ki}")
+
+    cur_a = 0
+    for ki in range(ki_count):
+        ctx.ds_read(ctx.vreg(a_names[(cur_a, ki)], 0, av),
+                    ctx.vreg("v_lds_rd_a"),
+                    offset=a_off(0, ki), width=av,
+                    comment=f"pre A m0k{ki} b{cur_a}")
+
+    ctx.s_waitcnt("lgkmcnt(0)", comment="wait preamble")
+    ctx.raw("")
+
+    # Per-mi group: prefetch A[mi+1] + nr*ki_count MFMAs
+    for mi in range(mr):
+        # Prefetch A for next mi (if not last)
+        if mi < mr - 1:
+            next_a = 1 - cur_a
+            for ki in range(ki_count):
+                ctx.ds_read(ctx.vreg(a_names[(next_a, ki)], 0, av),
+                            ctx.vreg("v_lds_rd_a"),
+                            offset=a_off(mi + 1, ki), width=av,
+                            comment=f"LR A m{mi+1}k{ki} b{next_a}")
+
+        # MFMAs: iterate ki then ni (group by A operand)
+        for ki in range(ki_count):
+            for ni in range(nr):
+                acc_per = mfma.acc_vgprs
+                acc_off = (mi * nr + ni) * acc_per
+                ctx.inst(
+                    f"v_mfma_f32_{mfma.m}x{mfma.n}x{mfma.k}_f16",
+                    ctx.areg("acc_C", acc_off, acc_per),
+                    ctx.vreg(a_names[(cur_a, ki)], 0, av),
+                    ctx.vreg(b_names[(ni, ki)], 0, bv),
+                    ctx.areg("acc_C", acc_off, acc_per),
+                    comment=f"MFMA m{mi}_n{ni}_k{ki}")
+
+        # Wait for A prefetch (hidden by nr*ki_count MFMAs)
+        if mi < mr - 1:
+            ctx.s_waitcnt("lgkmcnt(0)",
+                          comment=f"wait A[{mi+1}] ({nr*ki_count} MFMAs hid)")
+            cur_a = next_a
+
+        ctx.raw("")
+

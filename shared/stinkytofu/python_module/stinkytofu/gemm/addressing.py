@@ -52,6 +52,25 @@ class AddressComputer:
 
     # -- helpers ------------------------------------------------------------
 
+    @staticmethod
+    def _level_offset(index: int, stride: int) -> int:
+        """Single tile-level contribution: index * stride."""
+        return index * stride
+
+    @staticmethod
+    def _sum_levels(levels: list[tuple[int, int]]) -> int:
+        """Sum tile-level contributions.
+
+        Each entry is ``(index, stride)``; the result is
+        ``sum(index * stride for index, stride in levels)``.
+
+        This makes the hierarchical decomposition of row/col coordinates
+        explicit: workgroup, wave, mfma-tile, and lane levels each
+        contribute one ``(index, stride)`` pair.
+        """
+        return sum(AddressComputer._level_offset(idx, s) for idx, s in levels)
+
+
     @property
     def _elem(self) -> int:
         return self.problem.element_bytes
@@ -96,12 +115,20 @@ class AddressComputer:
     def lds_write_offset_a(self, tid: int) -> int:
         """LDS write byte-offset for thread *tid* writing A."""
         row, col = self.global_load_thread_coords_a(tid)
-        return (row * self.tile.unroll_k + col) * self._elem
+        offset = self._sum_levels([
+            (row, self.tile.unroll_k),   # row in LDS
+            (col, 1),                    # column (K)
+        ])
+        return offset * self._elem
 
     def lds_write_offset_b(self, tid: int) -> int:
         """LDS write byte-offset for thread *tid* writing B."""
         row, col = self.global_load_thread_coords_b(tid)
-        return self._lds_offset_b + (row * self.tile.unroll_k + col) * self._elem
+        offset = self._sum_levels([
+            (row, self.tile.unroll_k),
+            (col, 1),
+        ])
+        return self._lds_offset_b + offset * self._elem
 
     def lds_read_offset_a(self, wave_m: int, mfma_mi: int, ki: int,
                           lane_id: int) -> int:
@@ -115,17 +142,37 @@ class AddressComputer:
         K offset, since the LDS read width packs K automatically.
         """
         mfma = self.tile.mfma
-        row = wave_m * self.tile.m_per_wave + mfma_mi * mfma.m + (lane_id % mfma.m)
-        col = ki * mfma.k
-        return (row * self.tile.unroll_k + col) * self._elem
+        row = self._sum_levels([
+            (wave_m, self.tile.m_per_wave),  # wave level
+            (mfma_mi, mfma.m),               # mfma tile level
+            (lane_id % mfma.m, 1),           # lane level
+        ])
+        col = self._sum_levels([
+            (ki, mfma.k),                    # unroll iteration
+        ])
+        offset = self._sum_levels([
+            (row, self.tile.unroll_k),
+            (col, 1),
+        ])
+        return offset * self._elem
 
     def lds_read_offset_b(self, wave_n: int, mfma_ni: int, ki: int,
                           lane_id: int) -> int:
         """LDS read byte-offset for one B MFMA operand element."""
         mfma = self.tile.mfma
-        row = wave_n * self.tile.n_per_wave + mfma_ni * mfma.n + (lane_id % mfma.n)
-        col = ki * mfma.k
-        return self._lds_offset_b + (row * self.tile.unroll_k + col) * self._elem
+        row = self._sum_levels([
+            (wave_n, self.tile.n_per_wave),
+            (mfma_ni, mfma.n),
+            (lane_id % mfma.n, 1),
+        ])
+        col = self._sum_levels([
+            (ki, mfma.k),
+        ])
+        offset = self._sum_levels([
+            (row, self.tile.unroll_k),
+            (col, 1),
+        ])
+        return self._lds_offset_b + offset * self._elem
 
     def global_store_offset_d(self, wg_m: int, wg_n: int,
                               wave_m: int, wave_n: int,
@@ -133,14 +180,18 @@ class AddressComputer:
                               lane_id: int, ldd: int) -> int:
         """Global byte-offset for storing one element of D."""
         mfma = self.tile.mfma
-        row = (wg_m * self.tile.wg_m
-               + wave_m * self.tile.m_per_wave
-               + mfma_mi * mfma.m
-               + lane_id % mfma.m)
-        col = (wg_n * self.tile.wg_n
-               + wave_n * self.tile.n_per_wave
-               + mfma_ni * mfma.n
-               + lane_id // mfma.m)
+        row = self._sum_levels([
+            (wg_m, self.tile.wg_m),         # workgroup level
+            (wave_m, self.tile.m_per_wave),  # wave level
+            (mfma_mi, mfma.m),              # mfma tile level
+            (lane_id % mfma.m, 1),          # lane level
+        ])
+        col = self._sum_levels([
+            (wg_n, self.tile.wg_n),
+            (wave_n, self.tile.n_per_wave),
+            (mfma_ni, mfma.n),
+            (lane_id // mfma.m, 1),
+        ])
         return (row * ldd + col) * self._elem
 
     # -- Embed transforms (for introspection) ------------------------------
@@ -159,6 +210,23 @@ class AddressComputer:
             [Dim("row", self.tile.wg_n), Dim("col", self.tile.unroll_k)],
             Dim("lds_b_offset", self.tile.wg_n * self.tile.unroll_k),
             [self.tile.unroll_k, 1],
+        )
+
+
+    def global_d_embed(self, ldd: int) -> Embed:
+        """Build Embed transform for D's global offset from tile-level decomposition.
+
+        Maps ``(row, col)`` to a linearized element offset via
+        ``offset = row * ldd + col``.  The row/col values are already
+        the fully-resolved coordinates produced by ``_sum_levels`` in
+        ``global_store_offset_d``.
+        """
+        total_m = self.tile.wg_m  # rows covered by one workgroup tile
+        total_n = self.tile.wg_n  # cols covered by one workgroup tile
+        return Embed(
+            [Dim("row", total_m), Dim("col", total_n)],
+            Dim("d_offset", total_m * ldd),
+            [ldd, 1],
         )
 
     # -- instruction emission -----------------------------------------------
