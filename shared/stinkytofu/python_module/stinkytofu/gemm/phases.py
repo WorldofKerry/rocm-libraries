@@ -938,26 +938,17 @@ def _emit_subtile_compute(ctx, tile, problem):
     def read_a(mi, ki, buf):
         off = a_off(mi, ki)
         name = a_names[(buf, ki)]
-        if off > 0:
-            ctx.v_add(ctx.vreg("v_tmp0"), str(off), ctx.vreg("v_lds_rd_a"),
-                      comment=f"A addr m{mi}k{ki}")
-            addr = ctx.vreg("v_tmp0")
-        else:
-            addr = ctx.vreg("v_lds_rd_a")
-        # Use ds_read_b64 for 2-VGPR operand
-        ctx.ds_read(ctx.vreg(name, 0, av), addr, width=av,
+        # Use ds_read offset field (compile-time constant, no VALU needed)
+        ctx.ds_read(ctx.vreg(name, 0, av), ctx.vreg("v_lds_rd_a"),
+                    offset=off, width=av,
                     comment=f"LR A m{mi}k{ki} buf{buf}")
 
     def read_b(ni, ki):
         off = b_off(ni, ki)
         name = b_names[(ni, ki)]
-        if off > 0:
-            ctx.v_add(ctx.vreg("v_tmp1"), str(off), ctx.vreg("v_lds_rd_b"),
-                      comment=f"B addr n{ni}k{ki}")
-            addr = ctx.vreg("v_tmp1")
-        else:
-            addr = ctx.vreg("v_lds_rd_b")
-        ctx.ds_read(ctx.vreg(name, 0, bv), addr, width=bv,
+        # Use ds_read offset field (compile-time constant, no VALU needed)
+        ctx.ds_read(ctx.vreg(name, 0, bv), ctx.vreg("v_lds_rd_b"),
+                    offset=off, width=bv,
                     comment=f"LR B n{ni}k{ki}")
 
     def do_mfma(mi, ni, ki, a_buf):
