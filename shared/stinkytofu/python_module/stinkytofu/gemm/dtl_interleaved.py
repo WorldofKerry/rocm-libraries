@@ -37,13 +37,30 @@ def _layouts(ctx): return ctx._metadata["layouts"]
 
 
 def _a_off(mi, ki, tile, mfma, elem):
-    pad_e = tile.lds_pad // elem if tile.lds_pad > 0 else 0
-    return (mi * mfma.m * (tile.unroll_k + pad_e) + ki * mfma.k) * elem
+    """LDS byte offset for A operand at (mi, ki).
+    
+    With per-load-line padding: offset includes extra pad bytes
+    for each load-line boundary crossed by the mi index.
+    Without padding (lds_pad=0): simple mi*m*uk*elem + ki*k*elem.
+    """
+    pad_bytes = tile.lds_pad  # bytes of padding per load line
+    threads_per_row = tile.unroll_k // 8
+    rows_per_load = (tile.waves_m * tile.waves_n * tile.wave_size) // threads_per_row
+    row_start = mi * mfma.m  # starting row within wave's M range
+    lines_crossed = row_start // rows_per_load  # load-line boundaries crossed
+    row_stride = tile.unroll_k * elem  # bytes per row (no per-row padding)
+    return row_start * row_stride + lines_crossed * pad_bytes + ki * mfma.k * elem
 
 
 def _b_off(ni, ki, tile, mfma, elem):
-    pad_e = tile.lds_pad // elem if tile.lds_pad > 0 else 0
-    return (ni * mfma.n * (tile.unroll_k + pad_e) + ki * mfma.k) * elem
+    """LDS byte offset for B operand at (ni, ki)."""
+    pad_bytes = tile.lds_pad
+    threads_per_row = tile.unroll_k // 8
+    rows_per_load = (tile.waves_m * tile.waves_n * tile.wave_size) // threads_per_row
+    row_start = ni * mfma.n
+    lines_crossed = row_start // rows_per_load
+    row_stride = tile.unroll_k * elem
+    return row_start * row_stride + lines_crossed * pad_bytes + ki * mfma.k * elem
 
 
 def phase_dtl_interleaved_setup(level, ctx):
@@ -154,9 +171,17 @@ def phase_dtl_interleaved_setup(level, ctx):
               comment="+ col_bytes -> per-thread LDS offset")
     ctx.inst("v_readfirstlane_b32", ctx.sreg("s_lds_wr_a_sg"),
              ctx.vreg("v_tmp0"), comment="LDS write base A")
+    # Compute DTL-specific lds_b_offset (with per-load-line padding)
+    if tile.lds_pad > 0:
+        threads_per_row_ = tile.unroll_k // 8
+        rows_per_load_ = tile.block_size // threads_per_row_
+        num_loads_a_ = tile.wg_m // rows_per_load_
+        dtl_lds_b_offset = tile.wg_m * tile.unroll_k * elem + num_loads_a_ * tile.lds_pad
+    else:
+        dtl_lds_b_offset = layouts.lds_b_offset
     ctx.inst("s_add_u32", ctx.sreg("s_lds_wr_b_sg"),
-             ctx.sreg("s_lds_wr_a_sg"), str(layouts.lds_b_offset),
-             comment=f"LDS write base B = A + {layouts.lds_b_offset}")
+             ctx.sreg("s_lds_wr_a_sg"), str(dtl_lds_b_offset),
+             comment=f"LDS write base B = A + {dtl_lds_b_offset}")
     ctx.raw("")
 
     # LDS read addresses
@@ -176,6 +201,18 @@ def phase_dtl_interleaved_setup(level, ctx):
               ctx.vreg("v_tmp0"), comment="+ lane_row")
     ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(lds_row_stride),
               ctx.vreg("v_lds_rd_a"), comment=f"* {lds_row_stride}")
+    # Add per-load-line padding offset for the wave's starting row
+    if tile.lds_pad > 0:
+        tpr = tile.unroll_k // 8
+        rpl = tile.block_size // tpr
+        # wave_pad = (wave_m * m_per_wave // rpl) * pad
+        # This is constant per wave, computed at runtime via wave_m
+        wave_lines = tile.m_per_wave // rpl
+        if wave_lines > 0:
+            ctx.v_mul(ctx.vreg("v_tmp1"), str(wave_lines * tile.lds_pad),
+                      ctx.vreg("v_wave_m"), comment=f"wave pad = wave_m * {wave_lines * tile.lds_pad}")
+            ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
+                      ctx.vreg("v_tmp1"), comment="+ wave padding")
     ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
               ctx.vreg("v_tmp1"), comment="+ lane_k")
     ctx.v_lshl(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
@@ -189,12 +226,28 @@ def phase_dtl_interleaved_setup(level, ctx):
               ctx.vreg("v_tmp0"), comment="+ lane_row")
     ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(lds_row_stride),
               ctx.vreg("v_lds_rd_b"), comment=f"* {lds_row_stride}")
+    if tile.lds_pad > 0:
+        tpr_b = tile.unroll_k // 8
+        rpl_b = tile.block_size // tpr_b
+        wave_lines_b = tile.n_per_wave // rpl_b
+        if wave_lines_b > 0:
+            ctx.v_mul(ctx.vreg("v_tmp1"), str(wave_lines_b * tile.lds_pad),
+                      ctx.vreg("v_wave_n"), comment=f"wave pad = wave_n * {wave_lines_b * tile.lds_pad}")
+            ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
+                      ctx.vreg("v_tmp1"), comment="+ wave padding")
     ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
               ctx.vreg("v_tmp1"), comment="+ lane_k")
     ctx.v_lshl(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
                int(math.log2(elem)), comment=f"* {elem}")
-    ctx.v_add(ctx.vreg("v_lds_rd_b"), str(layouts.lds_b_offset),
-              ctx.vreg("v_lds_rd_b"), comment="+ lds_b_offset")
+    if tile.lds_pad > 0:
+        threads_per_row__ = tile.unroll_k // 8
+        rows_per_load__ = tile.block_size // threads_per_row__
+        num_loads_a__ = tile.wg_m // rows_per_load__
+        dtl_b_off = tile.wg_m * tile.unroll_k * elem + num_loads_a__ * tile.lds_pad
+    else:
+        dtl_b_off = layouts.lds_b_offset
+    ctx.v_add(ctx.vreg("v_lds_rd_b"), str(dtl_b_off),
+              ctx.vreg("v_lds_rd_b"), comment=f"+ lds_b_offset({dtl_b_off})")
     ctx.raw("")
 
     # Init accumulators
@@ -210,7 +263,8 @@ def _emit_dtl_loads_a(ctx, tile, problem, num_loads):
     elem = problem.element_bytes
     threads_per_row = tile.unroll_k // 8
     rows_per_load = tile.block_size // threads_per_row
-    lds_stride = rows_per_load * tile.unroll_k * elem
+    lds_data_per_load = rows_per_load * tile.unroll_k * elem
+    lds_stride = lds_data_per_load + tile.lds_pad  # add padding per load line
 
     ctx.inst("s_mov_b32", "m0", ctx.sreg("s_lds_wr_a_sg"), comment="m0 = LDS base A")
     ctx.s_mov(ctx.sreg("s_tmp0"), "0", comment="cumulative soffset A")
@@ -231,7 +285,8 @@ def _emit_dtl_loads_b(ctx, tile, problem, num_loads):
     elem = problem.element_bytes
     threads_per_row = tile.unroll_k // 8
     rows_per_load = tile.block_size // threads_per_row
-    lds_stride = rows_per_load * tile.unroll_k * elem
+    lds_data_per_load = rows_per_load * tile.unroll_k * elem
+    lds_stride = lds_data_per_load + tile.lds_pad
 
     ctx.inst("s_mov_b32", "m0", ctx.sreg("s_lds_wr_b_sg"), comment="m0 = LDS base B")
     ctx.s_mov(ctx.sreg("s_tmp0"), "0", comment="cumulative soffset B")
@@ -268,7 +323,17 @@ def phase_dtl_interleaved_k_loop(level, ctx):
     bv = mfma.b_vgprs   # 4
 
     pad_e = tile.lds_pad // elem if tile.lds_pad > 0 else 0
-    lds_half = (tile.wg_m + tile.wg_n) * (tile.unroll_k + pad_e) * elem
+    # For DTL: per-load-line padding (not per-row)
+    if tile.lds_pad > 0:
+        threads_per_row_l = tile.unroll_k // 8
+        rows_per_load_l = tile.block_size // threads_per_row_l
+        num_loads_a_l = tile.wg_m // rows_per_load_l
+        num_loads_b_l = tile.wg_n // rows_per_load_l
+        lds_a_half = tile.wg_m * tile.unroll_k * elem + num_loads_a_l * tile.lds_pad
+        lds_b_half = tile.wg_n * tile.unroll_k * elem + num_loads_b_l * tile.lds_pad
+        lds_half = lds_a_half + lds_b_half
+    else:
+        lds_half = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
     k_stride = tile.unroll_k * elem
     log2_uk = int(math.log2(tile.unroll_k))
 
