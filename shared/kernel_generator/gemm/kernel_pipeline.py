@@ -219,7 +219,7 @@ class GemmKernel:
         else:
             lds_half = int((tile.wg_m + tile.wg_n) * lds_row_stride * elem)
 
-        # No scale LDS regions needed -- scales loaded directly to VGPRs
+        # No scale LDS regions needed -- scales loaded directly from global memory
         lds_scale_half = 0
 
         # Double LDS for double-buffered mode
@@ -259,3 +259,156 @@ class GemmKernel:
         return AsmKernel(
             asm_text=ctx.asm_text(), kernel_name=self.kernel_name,
             problem=self.problem, tile=tile, ctx=ctx, lds_bytes=lds_total)
+
+
+def export_custom_kernel(kernel: "GemmKernel", output_path: str,
+                         kernel_name: str = None) -> str:
+    """Export kernel as a TensileLite Custom Kernel .s file.
+
+    Generates a .s file containing:
+    1. Assembly code with TensileLite kernarg ABI + 1D WG decomposition
+    2. custom.config YAML metadata for TensileLite integration
+    3. amdhsa kernel descriptor
+
+    The .s file can be dropped into TensileLite's CustomKernels/ directory
+    and referenced from a benchmark YAML.
+
+    Args:
+        kernel: Built GemmKernel instance.
+        output_path: Path to write the .s file.
+        kernel_name: Override kernel symbol name. If None, auto-generated
+                     from tile config.
+
+    Returns:
+        The kernel name used.
+    """
+    import os
+
+    tile = kernel.tile
+    problem = kernel.problem
+    mfma = tile.mfma
+
+    # Generate kernel name matching TensileLite convention
+    if kernel_name is None:
+        if mfma.is_mx:
+            prefix = "Custom_Cijk_Alik_Bljk_F4BS_MXA32_MXB32"
+        else:
+            prefix = "Custom_Cijk_Alik_Bljk_HHS"
+        kernel_name = (f"{prefix}_MT{tile.wg_m}x{tile.wg_n}x{tile.unroll_k}"
+                       f"_MI{mfma.m}x{mfma.n}x1_kgen_gfx950")
+
+    # Enable 1D grid for TensileLite compatibility
+    kernel.use_1d_grid = True
+
+    # Emit assembly
+    kernel.kernel_name = kernel_name
+    result = kernel.emit()
+    asm_text = result.asm_text
+
+    # Build custom.config YAML
+    if mfma.is_mx:
+        data_type = "F4"
+        dest_type = "B"  # BF16
+        compute_type = "S"  # FP32
+        mx_block_a = mfma.mx_block
+        mx_block_b = mfma.mx_block
+    else:
+        data_type = "H"
+        dest_type = "H"
+        compute_type = "S"
+        mx_block_a = 0
+        mx_block_b = 0
+
+    mi_input = 32 if mfma.is_mx else mfma.k  # inner K per round
+    config = {
+        "InternalSupportParams": {"KernArgsVersion": 2},
+        "ProblemType": {
+            "OperationType": "GEMM",
+            "DataType": data_type,
+            "DestDataType": dest_type,
+            "ComputeDataType": compute_type,
+            "HighPrecisionAccumulate": True,
+            "TransposeA": 1 if problem.trans_a else 0,
+            "TransposeB": 1 if problem.trans_b else 0,
+            "UseBeta": True,
+            "Batched": True,
+        },
+        "MatrixInstruction": [mfma.m, mfma.n, mfma.k, 1],
+        # MIBlock: [M, N, K_inner, 1, 1, K_rounds]
+        # For f8f6f4 16x16x128: K_inner=32, K_rounds=4
+        "MIBlock": [mfma.m, mfma.n, 32, 1, 1, mfma.k // 32] if mfma.is_mx else [mfma.m, mfma.n, mfma.k, 1, 1, 1],
+        "MIInputPerThread": mi_input,
+        "MIInputPerThreadA": mi_input,
+        "MIInputPerThreadB": mi_input,
+        "WavefrontSize": tile.wave_size,
+        "WorkGroupMapping": 16,
+        "WorkGroupMappingXCC": 2,
+        "WorkGroupMappingXCCGroup": -1,
+        "StaggerU": 0,
+        "EnableMatrixInstruction": True,
+        "MIWaveGroup": [tile.waves_m, tile.waves_n],
+        "MIWaveTile": [tile.mfma_m_repeat, tile.mfma_n_repeat],
+        "DepthU": tile.unroll_k,
+        "DirectToLds": 1,
+        "LocalReadVectorWidth": -1,
+        "GlobalReadVectorWidthA": 32 if mfma.is_mx else 8,
+        "GlobalReadVectorWidthB": 32 if mfma.is_mx else 8,
+        "GlobalSplitU": 1,
+        "GlobalSplitUAlgorithm": "MultipleBuffer",
+        "GlobalSplitUCoalesced": False,
+        "GlobalSplitUWorkGroupMappingRoundRobin": False,
+        "PrefetchGlobalRead": 2,
+        "PrefetchLocalRead": 1,
+        "StreamK": 0,
+        "StreamKAtomic": 0,
+        "StreamKXCCMapping": 0,
+        "TransposeLDS": 0,
+        "NoReject": True,  # bypass TL validation (our kernel handles its own LDS)
+    }
+
+    if mx_block_a > 0:
+        config["ProblemType"]["MXBlockA"] = mx_block_a
+        config["ProblemType"]["MXBlockB"] = mx_block_b
+
+    # Format as YAML (inline for simplicity)
+    import yaml
+    config_yaml = yaml.dump({"custom.config": config},
+                            default_flow_style=False, sort_keys=False)
+
+    # Extract assembly lines (between kernel label and .rodata)
+    # The full .s includes header, assembly, and metadata
+    # We need to restructure: assembly outside ---.../... , metadata inside
+    # TensileLite format: YAML between --- and ..., assembly outside
+
+    # The current asm_text has everything in one block.
+    # Split into: pre-metadata assembly and metadata
+    parts = asm_text.split(".amdgpu_metadata")
+    if len(parts) != 2:
+        raise RuntimeError("Expected exactly one .amdgpu_metadata section")
+
+    pre_metadata = parts[0]  # assembly + .rodata/.amdhsa_kernel
+    metadata_section = ".amdgpu_metadata" + parts[1]
+
+    # Find the --- and ... in the metadata
+    meta_lines = metadata_section.split("\n")
+    yaml_start = next(i for i, l in enumerate(meta_lines) if l.strip() == "---")
+    yaml_end = next(i for i, l in enumerate(meta_lines) if l.strip() == "...")
+
+    # Build the custom kernel .s file
+    # Format: assembly code, then YAML block (--- to ...) with both custom.config
+    # and amdhsa metadata
+    with open(output_path, "w") as f:
+        # Write assembly (before .amdgpu_metadata)
+        f.write(pre_metadata)
+
+        # Write combined YAML section
+        f.write(".amdgpu_metadata\n")
+        f.write("---\n")
+        f.write(config_yaml)
+        # Write amdhsa metadata (skip the --- line, keep everything until ...)
+        for line in meta_lines[yaml_start + 1:yaml_end]:
+            f.write(line + "\n")
+        f.write("...\n")
+        f.write(".end_amdgpu_metadata\n")
+
+    return kernel_name

@@ -534,26 +534,22 @@ def phase_store_d_legacy(level, ctx):
 def phase_store_d(level, ctx):
     """Store accumulators to D using buffer_store_short with a buffer SRD.
 
-    Replaces the legacy global_store_short path that recomputes full 64-bit
-    addresses per (mi, ni) tile.  Here we:
-      1. Set up a raw buffer SRD pointing at D (4 SGPRs, once).
-      2. Compute a per-lane base byte offset (voffset) once.
-      3. For each (mi, ai_pair), compute SGPR soffsets for both rows of
-         the pair, then sweep across ni using the 12-bit immediate offset
-         field for the column delta.
-      4. Pack f32 accumulator pairs with v_cvt_pk_f16_f32 and store each
-         f16 half via buffer_store_short + v_lshrrev_b32 extraction.
+    Supports two layouts:
+    - Row-major (standalone): D[m * N + n], soffset for M, imm for N
+    - Column-major (TensileLite): D[m + n * M], soffset for N, imm for M
 
-    Instruction count: ~15 setup + 3*N_acc core  (~780 for 256x256 tile)
-    vs ~11*N_acc for the legacy path          (~2800 for 256x256 tile).
+    For MXFP4 via TensileLite, output is BFloat16 (v_cvt_pk_bf16_f32).
+    For standalone, output is FP16 (v_cvt_pk_f16_f32).
     """
     tile = _tile(ctx)
     problem = _problem(ctx)
     mfma = tile.mfma
     acc_per = mfma.acc_vgprs
-    # D output is always fp16 (2 bytes/element), regardless of input dtype
     elem = 2
     elem_int = 2
+    # TensileLite uses column-major BF16; standalone uses row-major FP16
+    colmajor = ctx._metadata.get("use_1d_grid", False)
+    use_bf16 = colmajor and mfma.is_mx  # MXFP4 dest is BFloat16 in TL
 
     ctx.comment("=== Store D via buffer SRD ===")
 
@@ -606,56 +602,122 @@ def phase_store_d(level, ctx):
               ctx.vreg("v_addr_d", 1, 1),
               comment="+ wg_base_n -> global_col")
 
-    # base_voffset = (global_row * N + global_col) * elem
-    ctx.inst("v_mul_lo_u32", ctx.vreg("v_addr_d", 0, 1),
-             ctx.sreg("s_N"), ctx.vreg("v_addr_d", 0, 1),
-             comment="global_row * N")
-    ctx.v_add(ctx.vreg("v_addr_d", 0, 1),
-              ctx.vreg("v_addr_d", 0, 1), ctx.vreg("v_addr_d", 1, 1),
-              comment="+ global_col -> linear element index")
-    # Scale to bytes
-    if elem_int == 2:
-        ctx.v_lshl(ctx.vreg("v_addr_d", 0, 1),
-                    ctx.vreg("v_addr_d", 0, 1), 1,
-                    comment="* 2 -> byte offset (f16)")
-    elif elem_int == 4:
-        ctx.v_lshl(ctx.vreg("v_addr_d", 0, 1),
-                    ctx.vreg("v_addr_d", 0, 1), 2,
-                    comment="* 4 -> byte offset (f32)")
+    if colmajor:
+        # Column-major: voffset = (global_row + global_col * M) * elem
+        ctx.inst("v_mul_lo_u32", ctx.vreg("v_addr_d", 1, 1),
+                 ctx.sreg("s_M"), ctx.vreg("v_addr_d", 1, 1),
+                 comment="global_col * M")
+        ctx.v_add(ctx.vreg("v_addr_d", 0, 1),
+                  ctx.vreg("v_addr_d", 0, 1), ctx.vreg("v_addr_d", 1, 1),
+                  comment="+ global_row -> col-major linear index")
     else:
+        # Row-major: voffset = (global_row * N + global_col) * elem
         ctx.inst("v_mul_lo_u32", ctx.vreg("v_addr_d", 0, 1),
-                 str(elem_int), ctx.vreg("v_addr_d", 0, 1),
-                 comment=f"* {elem_int} -> byte offset")
+                 ctx.sreg("s_N"), ctx.vreg("v_addr_d", 0, 1),
+                 comment="global_row * N")
+        ctx.v_add(ctx.vreg("v_addr_d", 0, 1),
+                  ctx.vreg("v_addr_d", 0, 1), ctx.vreg("v_addr_d", 1, 1),
+                  comment="+ global_col -> row-major linear index")
+
+    # Scale to bytes (elem_int == 2 for f16/bf16)
+    ctx.v_lshl(ctx.vreg("v_addr_d", 0, 1),
+                ctx.vreg("v_addr_d", 0, 1), 1,
+                comment="* 2 -> byte offset")
     # v_addr_d[0] = per-lane base byte offset (voffset for buffer ops)
     ctx.raw("")
-
-    # ---- 3. Row stride = N * elem bytes ----
-    ctx.s_lshl(ctx.sreg("s_tmp0"), ctx.sreg("s_N"),
-               int(math.log2(elem)),
-               comment=f"row_stride = N * {elem_int} bytes")
-    ctx.raw("")
-
-    # ---- 4. Store loop: (mi, ai_pair, ni) order ----
-    # For element at (mi, ni, ai):
-    #   soffset = (mi * mfma.m + ai) * row_stride   [runtime, depends on N]
-    #   imm     = ni * mfma.n * elem                 [compile-time constant]
-    # v_cvt_pk_f16_f32 packs ai pairs; each half stored separately since
-    # adjacent ai values are in different (non-contiguous) rows.
 
     total_elems = tile.mfma_m_repeat * tile.mfma_n_repeat * acc_per
     ctx.comment(f"Store {total_elems} elements"
                 f" ({tile.mfma_m_repeat}x{tile.mfma_n_repeat}x{acc_per})"
                 f" via buffer_store_short")
 
-    use_pk_cvt = (acc_per % 2 == 0)
-
-    if use_pk_cvt:
-        _store_d_packed(ctx, tile, mfma, acc_per, elem_int)
+    if colmajor:
+        # Column-major: soffset for N (col_stride = M * elem), imm for M
+        ctx.s_lshl(ctx.sreg("s_tmp0"), ctx.sreg("s_M"), 1,
+                    comment="col_stride = M * 2 bytes")
+        ctx.raw("")
+        _store_d_colmajor(ctx, tile, mfma, acc_per, elem_int, use_bf16)
     else:
-        _store_d_scalar(ctx, tile, mfma, acc_per, elem_int)
+        # Row-major: soffset for M (row_stride = N * elem), imm for N
+        ctx.s_lshl(ctx.sreg("s_tmp0"), ctx.sreg("s_N"), 1,
+                    comment="row_stride = N * 2 bytes")
+        ctx.raw("")
+        use_pk_cvt = (acc_per % 2 == 0)
+        if use_pk_cvt:
+            _store_d_packed(ctx, tile, mfma, acc_per, elem_int)
+        else:
+            _store_d_scalar(ctx, tile, mfma, acc_per, elem_int)
 
     ctx.s_waitcnt("vmcnt(0)", comment="wait for stores")
     ctx.raw("")
+
+
+
+def _store_d_colmajor(ctx, tile, mfma, acc_per, elem_int, use_bf16):
+    """Column-major store for TensileLite ABI.
+
+    Layout: D[m + n * M], stride along M = 1 element, stride along N = M.
+    - soffset: ni * mfma.n * col_stride (N advancement, large, in SGPR)
+    - immediate offset: (mi * mfma.m + ai) * elem (M advancement, small)
+
+    Uses buffer_store_dword to store packed BF16/FP16 pairs (ai, ai+1)
+    at consecutive M addresses, avoiding potential buffer_store_short
+    format conversion issues on gfx950.
+    """
+    cvt_inst = "v_cvt_pk_bf16_f32" if use_bf16 else "v_cvt_pk_f16_f32"
+
+    for ni in range(tile.mfma_n_repeat):
+        # soffset_ni = ni * mfma.n * col_stride
+        if ni == 0:
+            ctx.s_mov(ctx.sreg("s_tmp1"), "0",
+                      comment=f"soffset = 0 (ni={ni})")
+        else:
+            ctx.s_mul(ctx.sreg("s_tmp1"), ctx.sreg("s_tmp0"),
+                      str(ni * mfma.n),
+                      comment=f"soffset = {ni * mfma.n} * col_stride"
+                              f" (ni={ni})")
+
+        for mi in range(tile.mfma_m_repeat):
+            if acc_per % 2 == 0:
+                for ai_base in range(0, acc_per, 2):
+                    ai_lo = ai_base
+                    ai_hi = ai_base + 1
+                    # Column-major: ai_lo and ai_hi are at consecutive M addresses
+                    # so we can store the packed dword (2x bf16) at ai_lo's address
+                    imm_lo = (mi * mfma.m + ai_lo) * elem_int
+
+                    acc_idx_lo = (mi * tile.mfma_n_repeat + ni) * acc_per + ai_lo
+                    acc_idx_hi = (mi * tile.mfma_n_repeat + ni) * acc_per + ai_hi
+
+                    ctx.inst("v_accvgpr_read_b32", ctx.vreg("v_tmp0"),
+                             ctx.areg("acc_C", acc_idx_lo, 1),
+                             comment=f"acc[{acc_idx_lo}] m{mi}_n{ni}_a{ai_lo}")
+                    ctx.inst("v_accvgpr_read_b32", ctx.vreg("v_tmp1"),
+                             ctx.areg("acc_C", acc_idx_hi, 1),
+                             comment=f"acc[{acc_idx_hi}] m{mi}_n{ni}_a{ai_hi}")
+                    ctx.inst(cvt_inst, ctx.vreg("v_store_tmp"),
+                             ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),
+                             comment=f"pk cvt a{ai_lo},a{ai_hi}")
+
+                    # Store packed dword (both bf16 values at consecutive M rows)
+                    _emit_buffer_store_dword(ctx, "v_store_tmp",
+                                             "s_tmp1", imm_lo,
+                                             f"store D m{mi}_n{ni}_a{ai_lo}a{ai_hi}")
+            else:
+                cvt_scalar = "v_cvt_bf16_f32_e32" if use_bf16 else "v_cvt_f16_f32_e32"
+                for ai in range(acc_per):
+                    imm = (mi * mfma.m + ai) * elem_int
+                    acc_idx = (mi * tile.mfma_n_repeat + ni) * acc_per + ai
+
+                    ctx.inst("v_accvgpr_read_b32", ctx.vreg("v_store_tmp"),
+                             ctx.areg("acc_C", acc_idx, 1),
+                             comment=f"acc[{acc_idx}] m{mi}_n{ni}_a{ai}")
+                    ctx.inst(cvt_scalar, ctx.vreg("v_store_tmp"),
+                             ctx.vreg("v_store_tmp"),
+                             comment="f32->bf16" if use_bf16 else "f32->f16")
+                    _emit_buffer_store_short(ctx, "v_store_tmp",
+                                             "s_tmp1", imm,
+                                             f"store D m{mi}_n{ni}_a{ai}")
 
 
 def _store_d_scalar(ctx, tile, mfma, acc_per, elem_int):
@@ -752,6 +814,34 @@ def _store_d_packed(ctx, tile, mfma, acc_per, elem_int):
                 _emit_buffer_store_short(ctx, "v_store_tmp",
                                          "s_soffset_hi", ni_imm,
                                          f"store D m{mi}_n{ni}_a{ai_hi}")
+
+
+
+def _emit_buffer_store_dword(ctx, vdata_name, soffset_name, imm_offset,
+                              comment):
+    """Emit one buffer_store_dword via the D matrix SRD.
+
+    Stores 32 bits (two packed BF16/FP16 values) at consecutive addresses.
+    """
+    vdata = ctx.vreg(vdata_name)
+    voffset = ctx.vreg("v_addr_d", 0, 1)
+    srd = ctx.sreg("s_srd_d", 0, 4)
+    soffset = ctx.sreg(soffset_name)
+
+    if imm_offset == 0:
+        ctx.inst("buffer_store_dword", vdata, voffset, srd,
+                 soffset, "offen", comment=comment)
+    elif imm_offset < 4096:
+        ctx.inst("buffer_store_dword", vdata, voffset, srd,
+                 soffset, f"offen offset:{imm_offset}",
+                 comment=comment)
+    else:
+        ctx.inst("s_add_u32", soffset, soffset, str(imm_offset),
+                 comment=f"fold imm {imm_offset} into soffset")
+        ctx.inst("buffer_store_dword", vdata, voffset, srd,
+                 soffset, "offen", comment=comment)
+        ctx.inst("s_sub_u32", soffset, soffset, str(imm_offset),
+                 comment="restore soffset")
 
 
 def _emit_buffer_store_short(ctx, vdata_name, soffset_name, imm_offset,

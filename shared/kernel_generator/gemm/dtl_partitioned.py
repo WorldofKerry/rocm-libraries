@@ -68,6 +68,7 @@ def phase_mx_scale_setup(level, ctx):
     tile = ctx._metadata["tile"]
     mfma = tile.mfma
     use_real_scales = ctx._metadata.get("use_real_scales", False)
+    use_swizzled_scales = ctx._metadata.get("use_1d_grid", False) and use_real_scales
     if not mfma.is_mx or not use_real_scales:
         return
 
@@ -89,10 +90,16 @@ def phase_mx_scale_setup(level, ctx):
     ctx.s_waitcnt("lgkmcnt(0)", comment="wait scale kernargs")
     ctx.raw("")
 
-    # Scale SRD A: base = ptr_scale_a + wg_id_x * wg_m * stride_scale_a
+    # Scale SRD A
     ctx.comment("Scale SRD A")
-    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"), str(tile.wg_m),
-              comment=f"wg_id_x * {tile.wg_m}")
+    if use_swizzled_scales:
+        # Swizzled: offset = wg_id * (wg_m / 32) * stride
+        ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"),
+                  str(tile.wg_m // 32),
+                  comment=f"wg_id_x * {tile.wg_m // 32}")
+    else:
+        ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"), str(tile.wg_m),
+                  comment=f"wg_id_x * {tile.wg_m}")
     ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
              ctx.sreg("s_stride_scale_a"), comment="* stride_scale_a")
     ctx.inst("s_add_u32", ctx.sreg("s_srd_scale_a", 0, 1),
@@ -107,10 +114,15 @@ def phase_mx_scale_setup(level, ctx):
              "0x20000", comment="flags")
     ctx.raw("")
 
-    # Scale SRD B: base = ptr_scale_b + wg_id_y * wg_n * stride_scale_b
+    # Scale SRD B
     ctx.comment("Scale SRD B")
-    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"), str(tile.wg_n),
-              comment=f"wg_id_y * {tile.wg_n}")
+    if use_swizzled_scales:
+        ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"),
+                  str(tile.wg_n // 32),
+                  comment=f"wg_id_y * {tile.wg_n // 32}")
+    else:
+        ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"), str(tile.wg_n),
+                  comment=f"wg_id_y * {tile.wg_n}")
     ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
              ctx.sreg("s_stride_scale_b"), comment="* stride_scale_b")
     ctx.inst("s_add_u32", ctx.sreg("s_srd_scale_b", 0, 1),
@@ -125,26 +137,73 @@ def phase_mx_scale_setup(level, ctx):
              "0x20000", comment="flags")
     ctx.raw("")
 
-    # Scale voffsets: wave-level base (scale is per-MFMA-tile, same for all lanes)
-    # voffset = wave_m * m_per_wave * stride_scale_a (A) or wave_n * n_per_wave * stride_scale_b (B)
-    # The per-mi/ni offset is added via the instruction's offset: field
-    ctx.comment("Scale A wave-level voffset")
-    ctx.inst("v_mul_lo_u32", ctx.vreg("v_tmp0"),
-             str(tile.m_per_wave), ctx.vreg("v_wave_m"),
-             comment=f"wave_m * {tile.m_per_wave}")
-    ctx.inst("v_mul_lo_u32", ctx.vreg("v_dtl_off_scale_a"),
-             ctx.sreg("s_stride_scale_a"), ctx.vreg("v_tmp0"),
-             comment="wave_m_base * stride_scale_a -> voffset_scale_a")
-    ctx.raw("")
+    # Allocate scale soffset SGPRs for swizzled mode
+    if ctx._metadata.get("use_1d_grid", False):
+        ctx.alloc_sgpr_permanent(1, "s_scale_soff_a0")
+        ctx.alloc_sgpr_permanent(1, "s_scale_soff_a1")
+        ctx.alloc_sgpr_permanent(1, "s_scale_soff_b0")
+        ctx.alloc_sgpr_permanent(1, "s_scale_soff_b1")
 
-    ctx.comment("Scale B wave-level voffset")
-    ctx.inst("v_mul_lo_u32", ctx.vreg("v_tmp0"),
-             str(tile.n_per_wave), ctx.vreg("v_wave_n"),
-             comment=f"wave_n * {tile.n_per_wave}")
-    ctx.inst("v_mul_lo_u32", ctx.vreg("v_dtl_off_scale_b"),
-             ctx.sreg("s_stride_scale_b"), ctx.vreg("v_tmp0"),
-             comment="wave_n_base * stride_scale_b -> voffset_scale_b")
-    ctx.raw("")
+    use_swizzled_scales = ctx._metadata.get("use_1d_grid", False)
+
+    if use_swizzled_scales:
+        # Pre-swizzled scale layout (AITER e8m0_shuffle):
+        # Per-lane voffset = (lane_id % 16) * 4
+        # Per-group soffset = (wave_m * 2 + group) * 256
+        # The 4 bytes at each position contain scales for:
+        #   byte[0]: (mi_lo, ki_lo), byte[1]: (mi_hi, ki_lo)
+        #   byte[2]: (mi_lo, ki_hi), byte[3]: (mi_hi, ki_hi)
+        ctx.comment("Scale swizzled voffset: lane_id * 4")
+        ctx.v_lshl(ctx.vreg("v_dtl_off_scale_a"),
+                   ctx.vreg("v_lane_id"), 2,
+                   comment="lane_id * 4 -> swizzled scale voffset")
+        ctx.inst("v_mov_b32", ctx.vreg("v_dtl_off_scale_b"),
+                 ctx.vreg("v_dtl_off_scale_a"),
+                 comment="scaleB voffset = same")
+        ctx.raw("")
+
+        # Compute SGPR soffsets for each mi-group and ni-group
+        # group0: (wave_m * 2) * 256, group1: (wave_m * 2 + 1) * 256
+        ctx.comment("Scale group soffsets")
+        ctx.v_lshl(ctx.vreg("v_tmp0"), ctx.vreg("v_wave_m"), 1,
+                   comment="wave_m * 2")
+        ctx.inst("v_readfirstlane_b32", ctx.sreg("s_tmp0"),
+                 ctx.vreg("v_tmp0"), comment="wave_m * 2 -> SGPR")
+        ctx.s_lshl(ctx.sreg("s_scale_soff_a0"), ctx.sreg("s_tmp0"), 8,
+                   comment="group0 soffset = wave_m*2 * 256")
+        ctx.inst("s_add_u32", ctx.sreg("s_scale_soff_a1"),
+                 ctx.sreg("s_scale_soff_a0"), "256",
+                 comment="group1 soffset = (wave_m*2+1) * 256")
+        # Same for B with wave_n
+        ctx.v_lshl(ctx.vreg("v_tmp0"), ctx.vreg("v_wave_n"), 1,
+                   comment="wave_n * 2")
+        ctx.inst("v_readfirstlane_b32", ctx.sreg("s_tmp0"),
+                 ctx.vreg("v_tmp0"), comment="wave_n * 2 -> SGPR")
+        ctx.s_lshl(ctx.sreg("s_scale_soff_b0"), ctx.sreg("s_tmp0"), 8,
+                   comment="group0 soffset B = wave_n*2 * 256")
+        ctx.inst("s_add_u32", ctx.sreg("s_scale_soff_b1"),
+                 ctx.sreg("s_scale_soff_b0"), "256",
+                 comment="group1 soffset B = (wave_n*2+1) * 256")
+        ctx.raw("")
+    else:
+        # Linear scale addressing (standalone path)
+        ctx.comment("Scale A wave-level voffset")
+        ctx.inst("v_mul_lo_u32", ctx.vreg("v_tmp0"),
+                 str(tile.m_per_wave), ctx.vreg("v_wave_m"),
+                 comment=f"wave_m * {tile.m_per_wave}")
+        ctx.inst("v_mul_lo_u32", ctx.vreg("v_dtl_off_scale_a"),
+                 ctx.sreg("s_stride_scale_a"), ctx.vreg("v_tmp0"),
+                 comment="wave_m_base * stride_scale_a -> voffset_scale_a")
+        ctx.raw("")
+
+        ctx.comment("Scale B wave-level voffset")
+        ctx.inst("v_mul_lo_u32", ctx.vreg("v_tmp0"),
+                 str(tile.n_per_wave), ctx.vreg("v_wave_n"),
+                 comment=f"wave_n * {tile.n_per_wave}")
+        ctx.inst("v_mul_lo_u32", ctx.vreg("v_dtl_off_scale_b"),
+                 ctx.sreg("s_stride_scale_b"), ctx.vreg("v_tmp0"),
+                 comment="wave_n_base * stride_scale_b -> voffset_scale_b")
+        ctx.raw("")
 
 
 def phase_dtl_partitioned_k_loop(level, ctx):
@@ -165,6 +224,7 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     lds_half = lds_data_half
     mx_block = mfma.mx_block
     use_real_scales = ctx._metadata.get("use_real_scales", False)
+    use_swizzled_scales = ctx._metadata.get("use_1d_grid", False) and use_real_scales
 
     k_stride = int(tile.unroll_k * elem)
     log2_uk = int(math.log2(tile.unroll_k))
@@ -174,8 +234,16 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     num_loads_a = tile.wg_m // rows_per_load
     num_loads_b = tile.wg_n // rows_per_load
 
-    # Scale SRD advance per K-loop: unroll_k / mx_block bytes
-    scale_k_stride = tile.unroll_k // mx_block if (use_real_scales) else 0
+    # Scale SRD advance per K-loop
+    if use_real_scales:
+        if use_swizzled_scales:
+            # Swizzled layout: d3 stride = 256 bytes per K-unroll
+            scale_k_stride = 256
+        else:
+            # Linear: unroll_k / mx_block bytes per row
+            scale_k_stride = tile.unroll_k // mx_block
+    else:
+        scale_k_stride = 0
 
     partition_m = 2
     mfmas_per_mi = nr * ki_count  # 16
@@ -199,23 +267,47 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                 ctx.alloc_vgpr_permanent(av, name)
             a_names[(buf, ki)] = name
 
-    # Scale VGPRs: one per mi (A) and per ni (B), loaded directly from global memory
-    # Each VGPR holds 4 bytes = 4 K-block scales (one per 32 K-elements)
+    # Scale VGPRs: allocation depends on scale format
+    use_swizzled_scales = ctx._metadata.get("use_1d_grid", False) and use_real_scales
     scale_a_names = {}
     scale_b_names = {}
     if use_real_scales:
-        for mi in range(mr):
-            name = f"v_scale_a_m{mi}"
-            if not ctx.has(name):
-                ctx.alloc_vgpr_permanent(1, name)
-            for ki in range(ki_count):
-                scale_a_names[(mi, ki)] = name  # same VGPR for all ki
-        for ni in range(nr):
-            name = f"v_scale_b_n{ni}"
-            if not ctx.has(name):
-                ctx.alloc_vgpr_permanent(1, name)
-            for ki in range(ki_count):
-                scale_b_names[(ni, ki)] = name  # same VGPR for all ki
+        if use_swizzled_scales:
+            # Swizzled: 2 VGPRs for A (group0, group1), 2 for B
+            # Each VGPR has 4 bytes: (mi_lo,ki_lo), (mi_hi,ki_lo), (mi_lo,ki_hi), (mi_hi,ki_hi)
+            # op_sel selects mi pair, op_sel_hi selects ki pair
+            for g in range(2):  # group0 = mi 0,1; group1 = mi 2,3
+                name = f"v_scale_a_g{g}"
+                if not ctx.has(name):
+                    ctx.alloc_vgpr_permanent(1, name)
+                for mi_in_g in range(2):
+                    mi_ = g * 2 + mi_in_g
+                    if mi_ < mr:
+                        for ki in range(ki_count):
+                            scale_a_names[(mi_, ki)] = name
+            for g in range(2):
+                name = f"v_scale_b_g{g}"
+                if not ctx.has(name):
+                    ctx.alloc_vgpr_permanent(1, name)
+                for ni_in_g in range(2):
+                    ni_ = g * 2 + ni_in_g
+                    if ni_ < nr:
+                        for ki in range(ki_count):
+                            scale_b_names[(ni_, ki)] = name
+        else:
+            # Linear: one VGPR per mi (A) and per ni (B)
+            for mi in range(mr):
+                name = f"v_scale_a_m{mi}"
+                if not ctx.has(name):
+                    ctx.alloc_vgpr_permanent(1, name)
+                for ki in range(ki_count):
+                    scale_a_names[(mi, ki)] = name
+            for ni in range(nr):
+                name = f"v_scale_b_n{ni}"
+                if not ctx.has(name):
+                    ctx.alloc_vgpr_permanent(1, name)
+                for ki in range(ki_count):
+                    scale_b_names[(ni, ki)] = name
 
     # ---- K-loop setup ----
     ctx.comment("=== DTL Partitioned K-loop ===")
@@ -230,46 +322,66 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     _emit_dtl_loads_a(ctx, tile, problem, num_loads_a)
     _emit_dtl_loads_b(ctx, tile, problem, num_loads_b)
     if use_real_scales:
-        # Direct VGPR scale loads (global -> VGPR, no LDS)
-        ctx.comment("Load scales A (direct VGPR)")
-        for mi_ in range(mr):
-            # mi offset = mi * mfma.m * stride_scale_a (runtime SGPR)
-            if mi_ == 0:
-                ctx.inst("buffer_load_dword",
-                         ctx.vreg(f"v_scale_a_m{mi_}"),
-                         ctx.vreg("v_dtl_off_scale_a"),
-                         ctx.sreg("s_srd_scale_a", 0, 4),
-                         "0", "offen",
-                         comment=f"scale A mi={mi_}")
-            else:
-                ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_stride_scale_a"),
-                          str(mi_ * mfma.m),
-                          comment=f"mi={mi_} * {mfma.m} * stride_scale_a")
-                ctx.inst("buffer_load_dword",
-                         ctx.vreg(f"v_scale_a_m{mi_}"),
-                         ctx.vreg("v_dtl_off_scale_a"),
-                         ctx.sreg("s_srd_scale_a", 0, 4),
-                         ctx.sreg("s_tmp0"), "offen",
-                         comment=f"scale A mi={mi_}")
-        ctx.comment("Load scales B (direct VGPR)")
-        for ni_ in range(nr):
-            if ni_ == 0:
-                ctx.inst("buffer_load_dword",
-                         ctx.vreg(f"v_scale_b_n{ni_}"),
-                         ctx.vreg("v_dtl_off_scale_b"),
-                         ctx.sreg("s_srd_scale_b", 0, 4),
-                         "0", "offen",
-                         comment=f"scale B ni={ni_}")
-            else:
-                ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_stride_scale_b"),
-                          str(ni_ * mfma.n),
-                          comment=f"ni={ni_} * {mfma.n} * stride_scale_b")
-                ctx.inst("buffer_load_dword",
-                         ctx.vreg(f"v_scale_b_n{ni_}"),
-                         ctx.vreg("v_dtl_off_scale_b"),
-                         ctx.sreg("s_srd_scale_b", 0, 4),
-                         ctx.sreg("s_tmp0"), "offen",
-                         comment=f"scale B ni={ni_}")
+        if use_swizzled_scales:
+            # Swizzled scale loads: 2 groups for A, 2 for B
+            ctx.comment("Load swizzled scales A (2 groups)")
+            ctx.inst("buffer_load_dword", ctx.vreg("v_scale_a_g0"),
+                     ctx.vreg("v_dtl_off_scale_a"),
+                     ctx.sreg("s_srd_scale_a", 0, 4),
+                     ctx.sreg("s_scale_soff_a0"), "offen",
+                     comment="scaleA group0 (mi=0,1)")
+            ctx.inst("buffer_load_dword", ctx.vreg("v_scale_a_g1"),
+                     ctx.vreg("v_dtl_off_scale_a"),
+                     ctx.sreg("s_srd_scale_a", 0, 4),
+                     ctx.sreg("s_scale_soff_a1"), "offen",
+                     comment="scaleA group1 (mi=2,3)")
+            ctx.comment("Load swizzled scales B (2 groups)")
+            ctx.inst("buffer_load_dword", ctx.vreg("v_scale_b_g0"),
+                     ctx.vreg("v_dtl_off_scale_b"),
+                     ctx.sreg("s_srd_scale_b", 0, 4),
+                     ctx.sreg("s_scale_soff_b0"), "offen",
+                     comment="scaleB group0 (ni=0,1)")
+            ctx.inst("buffer_load_dword", ctx.vreg("v_scale_b_g1"),
+                     ctx.vreg("v_dtl_off_scale_b"),
+                     ctx.sreg("s_srd_scale_b", 0, 4),
+                     ctx.sreg("s_scale_soff_b1"), "offen",
+                     comment="scaleB group1 (ni=2,3)")
+        else:
+            # Linear scale loads: one per mi/ni
+            ctx.comment("Load scales A (direct VGPR)")
+            for mi_ in range(mr):
+                if mi_ == 0:
+                    ctx.inst("buffer_load_dword",
+                             ctx.vreg(f"v_scale_a_m{mi_}"),
+                             ctx.vreg("v_dtl_off_scale_a"),
+                             ctx.sreg("s_srd_scale_a", 0, 4),
+                             "0", "offen", comment=f"scale A mi={mi_}")
+                else:
+                    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_stride_scale_a"),
+                              str(mi_ * mfma.m),
+                              comment=f"mi={mi_} * {mfma.m} * stride_scale_a")
+                    ctx.inst("buffer_load_dword",
+                             ctx.vreg(f"v_scale_a_m{mi_}"),
+                             ctx.vreg("v_dtl_off_scale_a"),
+                             ctx.sreg("s_srd_scale_a", 0, 4),
+                             ctx.sreg("s_tmp0"), "offen", comment=f"scale A mi={mi_}")
+            ctx.comment("Load scales B (direct VGPR)")
+            for ni_ in range(nr):
+                if ni_ == 0:
+                    ctx.inst("buffer_load_dword",
+                             ctx.vreg(f"v_scale_b_n{ni_}"),
+                             ctx.vreg("v_dtl_off_scale_b"),
+                             ctx.sreg("s_srd_scale_b", 0, 4),
+                             "0", "offen", comment=f"scale B ni={ni_}")
+                else:
+                    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_stride_scale_b"),
+                              str(ni_ * mfma.n),
+                              comment=f"ni={ni_} * {mfma.n} * stride_scale_b")
+                    ctx.inst("buffer_load_dword",
+                             ctx.vreg(f"v_scale_b_n{ni_}"),
+                             ctx.vreg("v_dtl_off_scale_b"),
+                             ctx.sreg("s_srd_scale_b", 0, 4),
+                             ctx.sreg("s_tmp0"), "offen", comment=f"scale B ni={ni_}")
         ctx.s_waitcnt("vmcnt(0)", comment="wait scale VGPR loads")
     ctx.s_waitcnt("vmcnt(0)", comment="wait DTL")
     ctx.s_barrier(comment="sync")
@@ -305,20 +417,37 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                               acc_off_=acc_off, acc_per_=acc_per):
                     def emit():
                         if use_real_scales and (mi_, ki_) in scale_a_names:
-                            # Phase 2: real scale VGPRs with op_sel
                             sa_name = scale_a_names[(mi_, ki_)]
                             sb_name = scale_b_names[(ni_, ki_)]
-                            # Scale in byte 0 of VGPR; op_sel defaults to 0
-                            ctx.inst(
-                                mfma.instruction_name,
-                                ctx.areg("acc_C", acc_off_, acc_per_),
-                                ctx.vreg(a_names[(buf_, ki_)], 0, av),
-                                ctx.vreg(b_names[(ni_, ki_)], 0, bv),
-                                ctx.areg("acc_C", acc_off_, acc_per_),
-                                ctx.vreg(sa_name),
-                                ctx.vreg(sb_name),
-                                f"cbsz:{mfma.cbsz} blgp:{mfma.blgp}",
-                                comment=f"MFMA m{mi_}_n{ni_}_k{ki_}")
+                            if use_swizzled_scales:
+                                # op_sel:[mi%2, ni%2] selects M/N pair within group
+                                # op_sel_hi:[ki, ki] selects K pair
+                                a_sel = mi_ % 2
+                                b_sel = ni_ % 2
+                                hi_a = ki_
+                                hi_b = ki_
+                                ctx.inst(
+                                    mfma.instruction_name,
+                                    ctx.areg("acc_C", acc_off_, acc_per_),
+                                    ctx.vreg(a_names[(buf_, ki_)], 0, av),
+                                    ctx.vreg(b_names[(ni_, ki_)], 0, bv),
+                                    ctx.areg("acc_C", acc_off_, acc_per_),
+                                    ctx.vreg(sa_name),
+                                    ctx.vreg(sb_name),
+                                    f"op_sel:[{a_sel},{b_sel}] op_sel_hi:[{hi_a},{hi_b}]"
+                                    f" cbsz:{mfma.cbsz} blgp:{mfma.blgp}",
+                                    comment=f"MFMA m{mi_}_n{ni_}_k{ki_}")
+                            else:
+                                ctx.inst(
+                                    mfma.instruction_name,
+                                    ctx.areg("acc_C", acc_off_, acc_per_),
+                                    ctx.vreg(a_names[(buf_, ki_)], 0, av),
+                                    ctx.vreg(b_names[(ni_, ki_)], 0, bv),
+                                    ctx.areg("acc_C", acc_off_, acc_per_),
+                                    ctx.vreg(sa_name),
+                                    ctx.vreg(sb_name),
+                                    f"cbsz:{mfma.cbsz} blgp:{mfma.blgp}",
+                                    comment=f"MFMA m{mi_}_n{ni_}_k{ki_}")
                         elif mfma.is_mx:
                             # Phase 1 fallback: constant scale
                             ctx.inst(
@@ -473,46 +602,66 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     _emit_dtl_loads_a(ctx, tile, problem, num_loads_a)
     _emit_dtl_loads_b(ctx, tile, problem, num_loads_b)
     if use_real_scales:
-        # Direct VGPR scale loads (global -> VGPR, no LDS)
-        ctx.comment("Load scales A (direct VGPR)")
-        for mi_ in range(mr):
-            # mi offset = mi * mfma.m * stride_scale_a (runtime SGPR)
-            if mi_ == 0:
-                ctx.inst("buffer_load_dword",
-                         ctx.vreg(f"v_scale_a_m{mi_}"),
-                         ctx.vreg("v_dtl_off_scale_a"),
-                         ctx.sreg("s_srd_scale_a", 0, 4),
-                         "0", "offen",
-                         comment=f"scale A mi={mi_}")
-            else:
-                ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_stride_scale_a"),
-                          str(mi_ * mfma.m),
-                          comment=f"mi={mi_} * {mfma.m} * stride_scale_a")
-                ctx.inst("buffer_load_dword",
-                         ctx.vreg(f"v_scale_a_m{mi_}"),
-                         ctx.vreg("v_dtl_off_scale_a"),
-                         ctx.sreg("s_srd_scale_a", 0, 4),
-                         ctx.sreg("s_tmp0"), "offen",
-                         comment=f"scale A mi={mi_}")
-        ctx.comment("Load scales B (direct VGPR)")
-        for ni_ in range(nr):
-            if ni_ == 0:
-                ctx.inst("buffer_load_dword",
-                         ctx.vreg(f"v_scale_b_n{ni_}"),
-                         ctx.vreg("v_dtl_off_scale_b"),
-                         ctx.sreg("s_srd_scale_b", 0, 4),
-                         "0", "offen",
-                         comment=f"scale B ni={ni_}")
-            else:
-                ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_stride_scale_b"),
-                          str(ni_ * mfma.n),
-                          comment=f"ni={ni_} * {mfma.n} * stride_scale_b")
-                ctx.inst("buffer_load_dword",
-                         ctx.vreg(f"v_scale_b_n{ni_}"),
-                         ctx.vreg("v_dtl_off_scale_b"),
-                         ctx.sreg("s_srd_scale_b", 0, 4),
-                         ctx.sreg("s_tmp0"), "offen",
-                         comment=f"scale B ni={ni_}")
+        if use_swizzled_scales:
+            # Swizzled scale loads: 2 groups for A, 2 for B
+            ctx.comment("Load swizzled scales A (2 groups)")
+            ctx.inst("buffer_load_dword", ctx.vreg("v_scale_a_g0"),
+                     ctx.vreg("v_dtl_off_scale_a"),
+                     ctx.sreg("s_srd_scale_a", 0, 4),
+                     ctx.sreg("s_scale_soff_a0"), "offen",
+                     comment="scaleA group0 (mi=0,1)")
+            ctx.inst("buffer_load_dword", ctx.vreg("v_scale_a_g1"),
+                     ctx.vreg("v_dtl_off_scale_a"),
+                     ctx.sreg("s_srd_scale_a", 0, 4),
+                     ctx.sreg("s_scale_soff_a1"), "offen",
+                     comment="scaleA group1 (mi=2,3)")
+            ctx.comment("Load swizzled scales B (2 groups)")
+            ctx.inst("buffer_load_dword", ctx.vreg("v_scale_b_g0"),
+                     ctx.vreg("v_dtl_off_scale_b"),
+                     ctx.sreg("s_srd_scale_b", 0, 4),
+                     ctx.sreg("s_scale_soff_b0"), "offen",
+                     comment="scaleB group0 (ni=0,1)")
+            ctx.inst("buffer_load_dword", ctx.vreg("v_scale_b_g1"),
+                     ctx.vreg("v_dtl_off_scale_b"),
+                     ctx.sreg("s_srd_scale_b", 0, 4),
+                     ctx.sreg("s_scale_soff_b1"), "offen",
+                     comment="scaleB group1 (ni=2,3)")
+        else:
+            # Linear scale loads: one per mi/ni
+            ctx.comment("Load scales A (direct VGPR)")
+            for mi_ in range(mr):
+                if mi_ == 0:
+                    ctx.inst("buffer_load_dword",
+                             ctx.vreg(f"v_scale_a_m{mi_}"),
+                             ctx.vreg("v_dtl_off_scale_a"),
+                             ctx.sreg("s_srd_scale_a", 0, 4),
+                             "0", "offen", comment=f"scale A mi={mi_}")
+                else:
+                    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_stride_scale_a"),
+                              str(mi_ * mfma.m),
+                              comment=f"mi={mi_} * {mfma.m} * stride_scale_a")
+                    ctx.inst("buffer_load_dword",
+                             ctx.vreg(f"v_scale_a_m{mi_}"),
+                             ctx.vreg("v_dtl_off_scale_a"),
+                             ctx.sreg("s_srd_scale_a", 0, 4),
+                             ctx.sreg("s_tmp0"), "offen", comment=f"scale A mi={mi_}")
+            ctx.comment("Load scales B (direct VGPR)")
+            for ni_ in range(nr):
+                if ni_ == 0:
+                    ctx.inst("buffer_load_dword",
+                             ctx.vreg(f"v_scale_b_n{ni_}"),
+                             ctx.vreg("v_dtl_off_scale_b"),
+                             ctx.sreg("s_srd_scale_b", 0, 4),
+                             "0", "offen", comment=f"scale B ni={ni_}")
+                else:
+                    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_stride_scale_b"),
+                              str(ni_ * mfma.n),
+                              comment=f"ni={ni_} * {mfma.n} * stride_scale_b")
+                    ctx.inst("buffer_load_dword",
+                             ctx.vreg(f"v_scale_b_n{ni_}"),
+                             ctx.vreg("v_dtl_off_scale_b"),
+                             ctx.sreg("s_srd_scale_b", 0, 4),
+                             ctx.sreg("s_tmp0"), "offen", comment=f"scale B ni={ni_}")
         ctx.s_waitcnt("vmcnt(0)", comment="wait scale VGPR loads")
     ctx.raw("")
 
