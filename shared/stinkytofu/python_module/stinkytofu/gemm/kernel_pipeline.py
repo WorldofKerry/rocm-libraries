@@ -136,7 +136,8 @@ class GemmKernel:
               pgr2_interleaved: bool = False,
               dtl_interleaved: bool = False,
               dtl_scheduled: bool = False,
-              dtl_partitioned: bool = False) -> GemmKernel:
+              dtl_partitioned: bool = False,
+              use_real_scales: bool = False) -> GemmKernel:
         """Build a GemmKernel.  GemmTiling is the source of truth.
 
         Args:
@@ -189,12 +190,14 @@ class GemmKernel:
 
         tile_tree.validate()
 
-        return GemmKernel(
+        k = GemmKernel(
             problem=problem, tile=tile, layouts=layouts,
             tile_tree=tile_tree, tiling=tiling,
             kernel_name=kernel_name,
             mfma_visitor=default_mfma_visitor,
         )
+        k.use_real_scales = use_real_scales
+        return k
 
     def emit(self) -> AsmKernel:
         """Generate the full kernel assembly."""
@@ -238,6 +241,7 @@ class GemmKernel:
             "problem": self.problem,
             "layouts": self.layouts,
             "kernel": self,
+            "use_real_scales": getattr(self, 'use_real_scales', False),
             "lds_scale_half": lds_scale_half,
             "lds_data_half": lds_half - lds_scale_half,
         }

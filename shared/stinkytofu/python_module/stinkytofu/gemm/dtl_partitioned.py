@@ -282,7 +282,7 @@ def phase_dtl_partitioned_k_loop(level, ctx):
 
     # Scale VGPRs: one per (mi, ki) for A and per (ni, ki) for B
     # Each holds 4 bytes = 4 E8M0 K-block scales for one MFMA invocation
-    # Loaded via ds_read_u8 (1 byte per lane); op_sel selects byte 0
+    # Loaded via ds_read_b32 (4 bytes per lane = all K-block scales per row)
     scale_a_names = {}
     scale_b_names = {}
     if use_real_scales:
@@ -540,31 +540,31 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     # Preamble: scale reads + B + A[m0]
     ctx.comment("Preamble: scales + B + A[m0]")
 
-    # Load all scale VGPRs from LDS (ds_read_u8, 1 byte per lane)
+    # Load all scale VGPRs from LDS (ds_read_b32, 4 bytes = all K-block scales)
     if use_real_scales:
         ctx.comment("Scale LDS reads (A + B)")
         for mi in range(mr):
             for ki in range(ki_count):
                 off = _scale_rd_off_a(mi, ki)
                 if off:
-                    ctx.inst("ds_read_u8", ctx.vreg(scale_a_names[(mi, ki)]),
+                    ctx.inst("ds_read_b32", ctx.vreg(scale_a_names[(mi, ki)]),
                              ctx.vreg("v_lds_rd_scale_a"),
                              f"offset:{off}",
                              comment=f"scale A m{mi}k{ki}")
                 else:
-                    ctx.inst("ds_read_u8", ctx.vreg(scale_a_names[(mi, ki)]),
+                    ctx.inst("ds_read_b32", ctx.vreg(scale_a_names[(mi, ki)]),
                              ctx.vreg("v_lds_rd_scale_a"),
                              comment=f"scale A m{mi}k{ki}")
         for ni in range(nr):
             for ki in range(ki_count):
                 off = _scale_rd_off_b(ni, ki)
                 if off:
-                    ctx.inst("ds_read_u8", ctx.vreg(scale_b_names[(ni, ki)]),
+                    ctx.inst("ds_read_b32", ctx.vreg(scale_b_names[(ni, ki)]),
                              ctx.vreg("v_lds_rd_scale_b"),
                              f"offset:{off}",
                              comment=f"scale B n{ni}k{ki}")
                 else:
-                    ctx.inst("ds_read_u8", ctx.vreg(scale_b_names[(ni, ki)]),
+                    ctx.inst("ds_read_b32", ctx.vreg(scale_b_names[(ni, ki)]),
                              ctx.vreg("v_lds_rd_scale_b"),
                              comment=f"scale B n{ni}k{ki}")
         ctx.s_waitcnt("lgkmcnt(0)", comment="wait scale LDS reads")
@@ -579,20 +579,25 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                 ctx.vreg("v_lds_rd_a"),
                 offset=_a_off(0, 0, tile, mfma, elem),
                 width=av, comment="LR A m0k0 b0")
-    for ni in range(nr):
-        ctx.ds_read(ctx.vreg(b_names[(ni, 1)], 0, bv),
-                    ctx.vreg("v_lds_rd_b"),
-                    offset=_b_off(ni, 1, tile, mfma, elem),
-                    width=bv, comment=f"LR B n{ni}k1")
-    ctx.ds_read(ctx.vreg(a_names[(0, 1)], 0, av),
-                ctx.vreg("v_lds_rd_a"),
-                offset=_a_off(0, 1, tile, mfma, elem),
-                width=av, comment="LR A m0k1 b0")
-    ctx.s_waitcnt("lgkmcnt(9)", comment="wait B[ki=0] + A[m0,k0]")
+    preamble_inflight = nr + 1  # B[ki=0] reads + A[m0,k0]
+    if ki_count > 1:
+        for ni in range(nr):
+            ctx.ds_read(ctx.vreg(b_names[(ni, 1)], 0, bv),
+                        ctx.vreg("v_lds_rd_b"),
+                        offset=_b_off(ni, 1, tile, mfma, elem),
+                        width=bv, comment=f"LR B n{ni}k1")
+        ctx.ds_read(ctx.vreg(a_names[(0, 1)], 0, av),
+                    ctx.vreg("v_lds_rd_a"),
+                    offset=_a_off(0, 1, tile, mfma, elem),
+                    width=av, comment="LR A m0k1 b0")
+        preamble_inflight += nr + 1  # B[ki=1] + A[m0,k1]
+    # lgkmcnt max is 15 on gfx9; cap to avoid assembler error
+    wait_cnt = min(preamble_inflight, 15)
+    ctx.s_waitcnt(f"lgkmcnt({wait_cnt})", comment="wait B[ki=0] + A[m0,k0]")
     ctx.raw("")
 
     # ---- Emit scheduled body ----
-    inflight_lgkm = 9
+    inflight_lgkm = preamble_inflight
     mfma_count = 0
 
     for side_ops, mfma_op in schedule.intervals:

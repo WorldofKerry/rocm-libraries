@@ -304,3 +304,88 @@ class TestMXFP4GPU:
             D_gpu.astype(np.float32) - D_ref.astype(np.float32))))
         assert np.allclose(D_gpu, D_ref, atol=1.0, rtol=0.01), \
             f"GPU vs reference mismatch: max_err={max_err}"
+
+    def test_random(self):
+        """Random FP4 data: GPU kernel must match CPU reference within FP4 tolerance."""
+        from stinkytofu.gemm.launcher import GemmLauncher
+
+        M, N, K = 128, 128, 256
+        kernel, co_path = self._build_and_assemble(
+            M, N, K, "/tmp/test_mxfp4_random.co")
+
+        problem = GemmProblem(M, N, K, dtype=DataType.MXFP4)
+        tile = kernel.tile
+        launcher = GemmLauncher(problem, tile, seed=12345)
+
+        # generate_inputs produces random uint8 arrays for A and B
+        rng = np.random.RandomState(12345)
+        launcher._A = rng.randint(0, 256, size=(M, K // 2), dtype=np.uint8)
+        launcher._B = rng.randint(0, 256, size=(N, K // 2), dtype=np.uint8)
+
+        result = launcher.run_asm_kernel(
+            co_path, kernel_name="gemm_kernel",
+            num_warmup=1, num_iters=1)
+
+        D_gpu = result.D
+        assert D_gpu.dtype == np.float16
+        assert D_gpu.shape == (M, N)
+
+        _, _, _, D_ref = launcher.reference_numpy()
+
+        max_err = float(np.max(np.abs(
+            D_gpu.astype(np.float32) - D_ref.astype(np.float32))))
+        assert np.allclose(D_gpu, D_ref, atol=1.0, rtol=0.05), \
+            f"GPU vs reference mismatch: max_err={max_err}"
+
+    @pytest.mark.slow
+    def test_performance(self):
+        """Benchmark 4096x4096x4096 MXFP4 GEMM and compare with hipBLASLt."""
+        import subprocess
+        from stinkytofu.gemm.launcher import GemmLauncher
+
+        M, N, K = 4096, 4096, 4096
+        kernel, co_path = self._build_and_assemble(
+            M, N, K, "/tmp/test_mxfp4_perf.co")
+
+        problem = GemmProblem(M, N, K, dtype=DataType.MXFP4)
+        tile = kernel.tile
+        launcher = GemmLauncher(problem, tile, seed=0)
+
+        result = launcher.run_asm_kernel(
+            co_path, kernel_name="gemm_kernel",
+            num_warmup=5, num_iters=10)
+
+        our_tflops = 2 * M * N * K / result.time_seconds / 1e12
+
+        print(f"\n--- MXFP4 Performance ({M}x{N}x{K}) ---")
+        print(f"  Kernel time : {result.time_seconds * 1000:.3f} ms")
+        print(f"  Our TFLOPS  : {our_tflops:.2f}")
+
+        # Try hipBLASLt comparison
+        hipblaslt_bench = (
+            "/home/kerrwang/repos/rocm-libraries/agent/projects/"
+            "hipblaslt/build/clients/hipblaslt-bench"
+        )
+        hipblaslt_tflops = None
+        try:
+            cmd = [
+                hipblaslt_bench,
+                "-m", str(M), "-n", str(N), "-k", str(K),
+                "--a_type", "fp4_r", "--b_type", "fp4_r",
+                "--c_type", "f16_r", "--d_type", "f16_r",
+                "--compute_type", "f32_r",
+                "--transA", "N", "--transB", "T",
+                "-i", "10",
+            ]
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if out.returncode == 0:
+                # Parse last CSV line; tflops is the last field
+                lines = out.stdout.strip().splitlines()
+                data_line = lines[-1]
+                hipblaslt_tflops = float(data_line.split(",")[-1])
+                print(f"  hipBLASLt   : {hipblaslt_tflops:.2f} TFLOPS")
+        except Exception as e:
+            print(f"  hipBLASLt   : unavailable ({e})")
+
+        if hipblaslt_tflops is None:
+            print("  hipBLASLt   : skipped (binary not found or failed)")
