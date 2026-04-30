@@ -206,15 +206,15 @@ class GemmKernel:
                      for p in self.tile_tree.prologue_phases)
         if is_dtl and tile.lds_pad > 0:
             # DTL uses per-load-line padding (not per-row)
-            threads_per_row = tile.unroll_k // 8
+            threads_per_row = int(tile.unroll_k * elem) // 16
             rows_per_load = tile.block_size // threads_per_row
             num_loads_a = tile.wg_m // rows_per_load
             num_loads_b = tile.wg_n // rows_per_load
-            lds_a = tile.wg_m * tile.unroll_k * elem + num_loads_a * tile.lds_pad
-            lds_b = tile.wg_n * tile.unroll_k * elem + num_loads_b * tile.lds_pad
+            lds_a = int(tile.wg_m * tile.unroll_k * elem) + num_loads_a * tile.lds_pad
+            lds_b = int(tile.wg_n * tile.unroll_k * elem) + num_loads_b * tile.lds_pad
             lds_half = lds_a + lds_b
         else:
-            lds_half = (tile.wg_m + tile.wg_n) * lds_row_stride * elem
+            lds_half = int((tile.wg_m + tile.wg_n) * lds_row_stride * elem)
         # Double LDS for double-buffered mode
         is_db = any(p.name in ("optimized_k_loop", "scheduled_k_loop", "fully_interleaved_k_loop", "pgr2_k_loop", "dtl_k_loop", "interleaved_large_k_loop", "auto_scheduled_k_loop", "pgr2_interleaved_k_loop", "dtl_interleaved_k_loop", "dtl_scheduled_k_loop", "dtl_partitioned_k_loop")
                      for p in self.tile_tree.prologue_phases)

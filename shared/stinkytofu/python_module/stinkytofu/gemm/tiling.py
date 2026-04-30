@@ -260,6 +260,25 @@ class GemmTiling:
         t.lds_pad = lds_pad
         return t
 
+    @staticmethod
+    def mxfp4_standard(
+        wg_m: int = 128, wg_n: int = 128, unroll_k: int = 256,
+        waves_m: int = 2, waves_n: int = 2,
+        wave_size: int = 64,
+    ) -> GemmTiling:
+        """Convenience tiling for MXFP4 GEMM (Phase 1 constant-scale MVP).
+
+        Uses ``v_mfma_scale_f32_16x16x128_f8f6f4`` with a 128x128x256
+        macro tile (2 K-iterations per unroll).
+        """
+        mfma = MfmaConfig.mxfp4_16x16x128()
+        t = GemmTiling.standard(
+            wg_m=wg_m, wg_n=wg_n, unroll_k=unroll_k,
+            waves_m=waves_m, waves_n=waves_n,
+            mfma=mfma, wave_size=wave_size,
+        )
+        return t
+
     # -- Derived quantities (same interface as TileConfig) -----------
 
     @property

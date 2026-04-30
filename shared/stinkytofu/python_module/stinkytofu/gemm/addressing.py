@@ -72,7 +72,7 @@ class AddressComputer:
 
 
     @property
-    def _elem(self) -> int:
+    def _elem(self) -> float:
         return self.problem.element_bytes
 
     @property
@@ -92,7 +92,7 @@ class AddressComputer:
     @property
     def _lds_offset_b(self) -> int:
         """Byte offset where B's LDS region starts."""
-        return self.tile.wg_m * self.tile.unroll_k * self._elem
+        return int(self.tile.wg_m * self.tile.unroll_k * self._elem)
 
     # -- pure-Python offset calculators (for testing / dry run) -------------
 
@@ -119,7 +119,7 @@ class AddressComputer:
             (row, self.tile.unroll_k),   # row in LDS
             (col, 1),                    # column (K)
         ])
-        return offset * self._elem
+        return int(offset * self._elem)
 
     def lds_write_offset_b(self, tid: int) -> int:
         """LDS write byte-offset for thread *tid* writing B."""
@@ -128,7 +128,7 @@ class AddressComputer:
             (row, self.tile.unroll_k),
             (col, 1),
         ])
-        return self._lds_offset_b + offset * self._elem
+        return int(self._lds_offset_b + offset * self._elem)
 
     def lds_read_offset_a(self, wave_m: int, mfma_mi: int, ki: int,
                           lane_id: int) -> int:
@@ -154,7 +154,7 @@ class AddressComputer:
             (row, self.tile.unroll_k),
             (col, 1),
         ])
-        return offset * self._elem
+        return int(offset * self._elem)
 
     def lds_read_offset_b(self, wave_n: int, mfma_ni: int, ki: int,
                           lane_id: int) -> int:
@@ -172,7 +172,7 @@ class AddressComputer:
             (row, self.tile.unroll_k),
             (col, 1),
         ])
-        return self._lds_offset_b + offset * self._elem
+        return int(self._lds_offset_b + offset * self._elem)
 
     def global_store_offset_d(self, wg_m: int, wg_n: int,
                               wave_m: int, wave_n: int,
@@ -192,7 +192,7 @@ class AddressComputer:
             (mfma_ni, mfma.n),
             (lane_id // mfma.m, 1),
         ])
-        return (row * ldd + col) * self._elem
+        return int((row * ldd + col) * self._elem)
 
     # -- Embed transforms (for introspection) ------------------------------
 

@@ -122,7 +122,7 @@ class TestGemmKernelEmit:
     def test_emit_has_store(self):
         kernel = GemmKernel.build(GemmProblem(128, 128, 32))
         result = kernel.emit()
-        stores = [l for l in result.ctx.lines if 'global_store' in l]
+        stores = [l for l in result.ctx.lines if 'global_store' in l or 'buffer_store' in l]
         assert len(stores) > 0
 
 
@@ -136,7 +136,7 @@ class TestPhaseReplacement:
         kernel.tile_tree = kernel.tile_tree.replace_phase(
             "store_d", noop_store)
         result = kernel.emit()
-        stores = [l for l in result.ctx.lines if 'global_store' in l]
+        stores = [l for l in result.ctx.lines if 'global_store' in l or 'buffer_store' in l]
         assert len(stores) == 0
         assert any("store replaced" in l for l in result.ctx.lines)
 

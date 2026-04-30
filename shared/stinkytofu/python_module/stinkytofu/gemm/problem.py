@@ -33,6 +33,7 @@ class DataType(Enum):
     F16 = "f16"
     BF16 = "bf16"
     F32 = "f32"
+    MXFP4 = "mxfp4"
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +56,10 @@ class MfmaConfig:
     a_vgprs: int = 0
     b_vgprs: int = 0
     acc_vgprs: int = 0
+    element_bits: int = 16   # bits per element (16 for fp16, 4 for mxfp4)
+    cbsz: int = 0            # format selector for A operand (4 = FP4)
+    blgp: int = 0            # format selector for B operand (4 = FP4)
+    is_mx: bool = False       # uses MX scale operands
 
     @property
     def flops_per_instruction(self) -> int:
@@ -62,8 +67,18 @@ class MfmaConfig:
         return 2 * self.m * self.n * self.k
 
     @property
+    def element_bytes(self) -> float:
+        """Bytes per element. 0.5 for 4-bit types."""
+        return self.element_bits / 8
+
+    @property
     def instruction_name(self) -> str:
-        """Full MFMA instruction name, e.g. ``v_mfma_f32_16x16x16_f16``."""
+        """Full MFMA instruction name.
+
+        For MX variants: ``v_mfma_scale_f32_16x16x128_f8f6f4``.
+        """
+        if self.is_mx:
+            return f"v_mfma_scale_{self.acc_type}_{self.m}x{self.n}x{self.k}_{self.input_type}"
         return f"v_mfma_{self.acc_type}_{self.m}x{self.n}x{self.k}_{self.input_type}"
 
     @staticmethod
@@ -96,6 +111,22 @@ class MfmaConfig:
             m=16, n=16, k=32, blocks=1,
             input_type="f16", acc_type="f32",
             a_vgprs=4, b_vgprs=4, acc_vgprs=4,
+        )
+
+    @staticmethod
+    def mxfp4_16x16x128() -> MfmaConfig:
+        """``v_mfma_scale_f32_16x16x128_f8f6f4``: MXFP4 on gfx950.
+
+        MI_K=128, 4 VGPRs per A/B operand (128 * 0.5B / 64 lanes = 1B/lane,
+        packed into 4 VGPRs due to instruction format). 4 acc VGPRs.
+        """
+        return MfmaConfig(
+            m=16, n=16, k=128, blocks=1,
+            input_type="f8f6f4", acc_type="f32",
+            a_vgprs=4, b_vgprs=4, acc_vgprs=4,
+            element_bits=4,
+            cbsz=4, blgp=4,
+            is_mx=True,
         )
 
 
@@ -449,8 +480,9 @@ class GemmProblem:
         return self.k if self.trans_b else 1
 
     @property
-    def element_bytes(self) -> int:
-        return {DataType.F16: 2, DataType.BF16: 2, DataType.F32: 4}[self.dtype]
+    def element_bytes(self) -> float:
+        return {DataType.F16: 2, DataType.BF16: 2, DataType.F32: 4,
+                DataType.MXFP4: 0.5}[self.dtype]
 
     def grid_dims(self, tile: TileConfig) -> Tuple[int, int]:
         """Number of workgroups in (M, N) dimensions."""
@@ -464,6 +496,11 @@ class GemmProblem:
         if self.dtype == DataType.F16 and tile.mfma.input_type != "f16":
             raise ValueError(
                 f"Data type {self.dtype} requires f16 MFMA, "
+                f"got {tile.mfma.input_type}"
+            )
+        if self.dtype == DataType.MXFP4 and tile.mfma.input_type != "f8f6f4":
+            raise ValueError(
+                f"Data type {self.dtype} requires f8f6f4 MFMA, "
                 f"got {tile.mfma.input_type}"
             )
 

@@ -112,6 +112,8 @@ class GemmLauncher:
 
     @staticmethod
     def _np_dtype(dt: DataType) -> np.dtype:
+        if dt == DataType.MXFP4:
+            return np.uint8  # packed: 2 FP4 elements per byte
         return {
             DataType.F16: np.float16,
             DataType.BF16: np.float16,  # numpy has no bfloat16; use f16 approx
@@ -125,22 +127,39 @@ class GemmLauncher:
 
         Uses a fixed seed for reproducibility.  A and B are cached so
         repeated calls return the same data.
+
+        For MXFP4: generates random uint8 data (2 FP4 elements per byte).
+        Buffer shapes use K//2 for the packed K dimension.
         """
         p = self.problem
         dtype = self._np_dtype(p.dtype)
         rng = np.random.RandomState(self.seed)
 
         if self._A is None:
-            # Scale inputs to avoid overflow in f16
-            scale = 1.0 / np.sqrt(p.k)
-            self._A = (rng.randn(p.m, p.k) * scale).astype(dtype)
-            # B shape depends on transpose: stored as [N,K] when trans_b
-            if p.trans_b:
-                self._B = (rng.randn(p.n, p.k) * scale).astype(dtype)
+            if p.dtype == DataType.MXFP4:
+                # Packed FP4: 2 elements per byte, shape [M, K//2]
+                self._A = rng.randint(0, 256, size=(p.m, p.k // 2),
+                                      dtype=np.uint8)
+                if p.trans_b:
+                    self._B = rng.randint(0, 256, size=(p.n, p.k // 2),
+                                          dtype=np.uint8)
+                else:
+                    self._B = rng.randint(0, 256, size=(p.k // 2, p.n),
+                                          dtype=np.uint8)
             else:
-                self._B = (rng.randn(p.k, p.n) * scale).astype(dtype)
+                # Scale inputs to avoid overflow in f16
+                scale = 1.0 / np.sqrt(p.k)
+                self._A = (rng.randn(p.m, p.k) * scale).astype(dtype)
+                if p.trans_b:
+                    self._B = (rng.randn(p.n, p.k) * scale).astype(dtype)
+                else:
+                    self._B = (rng.randn(p.k, p.n) * scale).astype(dtype)
 
-        C = np.zeros((p.m, p.n), dtype=dtype)
+        if p.dtype == DataType.MXFP4:
+            # Output is fp16 (MXFP4 GEMM outputs fp16/fp32, not fp4)
+            C = np.zeros((p.m, p.n), dtype=np.float16)
+        else:
+            C = np.zeros((p.m, p.n), dtype=dtype)
         return self._A, self._B, C
 
     # -- CPU reference ------------------------------------------------------
@@ -269,12 +288,12 @@ class GemmLauncher:
         d_D = ctypes.c_void_p()
         elem = p.element_bytes
 
-        _check(hip.hipMalloc(ctypes.byref(d_A), p.m * p.k * elem), "hipMalloc A")
-        _check(hip.hipMalloc(ctypes.byref(d_B), p.k * p.n * elem), "hipMalloc B")
-        _check(hip.hipMalloc(ctypes.byref(d_D), p.m * p.n * elem), "hipMalloc D")
+        _check(hip.hipMalloc(ctypes.byref(d_A), int(p.m * p.k * elem)), "hipMalloc A")
+        _check(hip.hipMalloc(ctypes.byref(d_B), int(p.k * p.n * elem)), "hipMalloc B")
+        _check(hip.hipMalloc(ctypes.byref(d_D), int(p.m * p.n * elem)), "hipMalloc D")
 
-        _check(hip.hipMemcpy(d_A, A.ctypes.data, p.m * p.k * elem, 1), "H2D A")
-        _check(hip.hipMemcpy(d_B, B.ctypes.data, p.k * p.n * elem, 1), "H2D B")
+        _check(hip.hipMemcpy(d_A, A.ctypes.data, int(p.m * p.k * elem), 1), "H2D A")
+        _check(hip.hipMemcpy(d_B, B.ctypes.data, int(p.k * p.n * elem), 1), "H2D B")
 
         # hipModuleLoad + hipModuleGetFunction
         module = ctypes.c_void_p()
@@ -337,7 +356,7 @@ class GemmLauncher:
 
         # Copy result back
         D_out = np.zeros((p.m, p.n), dtype=self._np_dtype(p.dtype))
-        _check(hip.hipMemcpy(D_out.ctypes.data, d_D, p.m * p.n * elem, 2), "D2H D")
+        _check(hip.hipMemcpy(D_out.ctypes.data, d_D, int(p.m * p.n * elem), 2), "D2H D")
 
         # Cleanup
         hip.hipFree(d_A)
@@ -385,9 +404,9 @@ class GemmLauncher:
         d_A = ctypes.c_void_p()
         d_B = ctypes.c_void_p()
         d_D = ctypes.c_void_p()
-        a_bytes = p.m * p.k * elem
-        b_bytes = p.n * p.k * elem  # B is [N, K] for trans_b
-        d_bytes = p.m * p.n * elem
+        a_bytes = int(p.m * p.k * elem)
+        b_bytes = int(p.n * p.k * elem)  # B is [N, K] for trans_b
+        d_bytes = int(p.m * p.n * elem)
 
         _check(hip.hipMalloc(ctypes.byref(d_A), a_bytes), "hipMalloc A")
         _check(hip.hipMalloc(ctypes.byref(d_B), b_bytes), "hipMalloc B")

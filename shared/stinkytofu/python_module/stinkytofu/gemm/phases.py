@@ -377,8 +377,13 @@ def phase_k_loop_label(level, ctx):
 # Store epilogue (uses transforms for address computation)
 # ===================================================================
 
-def phase_store_d(level, ctx):
-    """Store accumulators to D using coordinate transforms.
+def phase_store_d_legacy(level, ctx):
+    """Legacy scalar store epilogue (kept as fallback/reference).
+
+    Emits individual global_store_short per accumulator element with full
+    64-bit address recalculation per (mi, ni) tile.  ~2800 instructions
+    for a 256x256 tile.  Superseded by phase_store_d() which uses
+    buffer_store_short with a buffer SRD.
 
     Uses emit_affine() with dynamic coefficient for the row stride
     (N is runtime).  Computes address once per (mi, ni) tile and
@@ -483,6 +488,259 @@ def phase_store_d(level, ctx):
 
     ctx.s_waitcnt("vmcnt(0)", comment="wait for stores")
     ctx.raw("")
+
+
+def phase_store_d(level, ctx):
+    """Store accumulators to D using buffer_store_short with a buffer SRD.
+
+    Replaces the legacy global_store_short path that recomputes full 64-bit
+    addresses per (mi, ni) tile.  Here we:
+      1. Set up a raw buffer SRD pointing at D (4 SGPRs, once).
+      2. Compute a per-lane base byte offset (voffset) once.
+      3. For each (mi, ai_pair), compute SGPR soffsets for both rows of
+         the pair, then sweep across ni using the 12-bit immediate offset
+         field for the column delta.
+      4. Pack f32 accumulator pairs with v_cvt_pk_f16_f32 and store each
+         f16 half via buffer_store_short + v_lshrrev_b32 extraction.
+
+    Instruction count: ~15 setup + 3*N_acc core  (~780 for 256x256 tile)
+    vs ~11*N_acc for the legacy path          (~2800 for 256x256 tile).
+    """
+    tile = _tile(ctx)
+    problem = _problem(ctx)
+    mfma = tile.mfma
+    acc_per = mfma.acc_vgprs
+    elem = problem.element_bytes
+    elem_int = int(elem)
+
+    ctx.comment("=== Store D via buffer SRD ===")
+
+    # ---- 1. Build raw buffer SRD for D (4 SGPRs) ----
+    ctx.alloc_sgpr_permanent(4, "s_srd_d")
+
+    ctx.comment("SRD for D matrix (raw buffer mode)")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_d", 0, 1),
+             ctx.sreg("s_ptr_D", 0, 1), comment="SRD_D base lo")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_d", 1, 1),
+             ctx.sreg("s_ptr_D", 1, 1), comment="SRD_D base hi")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_d", 2, 1), "0xFFFFFFFF",
+             comment="SRD_D size (unlimited)")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_d", 3, 1), "0x20000",
+             comment="SRD_D flags: raw buffer")
+    ctx.raw("")
+
+    # ---- 2. Per-lane base byte offset for (mi=0, ni=0, ai=0) ----
+    # MFMA output lane mapping (16x16):
+    #   lane_n      = lane_id % mfma.n        (column within MFMA tile)
+    #   lane_m_base = (lane_id / mfma.m) * 4  (base row within MFMA tile)
+    ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.n - 1,
+              comment=f"lane_n = lane_id % {mfma.n}")
+    ctx.v_lshr(ctx.vreg("v_tmp1"), ctx.vreg("v_lane_id"),
+               int(math.log2(mfma.m)), comment=f"lane_id / {mfma.m}")
+    ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_tmp1"), 2,
+               comment="* 4 -> lane_m_base")
+
+    # global_row = wg_id_x * wg_m + wave_m * m_per_wave + lane_m_base
+    ctx.v_mul(ctx.vreg("v_addr_d", 0, 1), str(tile.m_per_wave),
+              ctx.vreg("v_wave_m"), comment=f"wave_m * {tile.m_per_wave}")
+    ctx.v_add(ctx.vreg("v_addr_d", 0, 1),
+              ctx.vreg("v_addr_d", 0, 1), ctx.vreg("v_tmp1"),
+              comment="+ lane_m_base")
+    ctx.s_mul(ctx.sreg("s_tmp1"), ctx.sreg("s_wg_id_x"),
+              str(tile.wg_m), comment=f"wg_id_x * {tile.wg_m}")
+    ctx.v_add(ctx.vreg("v_addr_d", 0, 1), ctx.sreg("s_tmp1"),
+              ctx.vreg("v_addr_d", 0, 1),
+              comment="+ wg_base_m -> global_row")
+
+    # global_col = wg_id_y * wg_n + wave_n * n_per_wave + lane_n
+    ctx.v_mul(ctx.vreg("v_addr_d", 1, 1), str(tile.n_per_wave),
+              ctx.vreg("v_wave_n"), comment=f"wave_n * {tile.n_per_wave}")
+    ctx.v_add(ctx.vreg("v_addr_d", 1, 1),
+              ctx.vreg("v_addr_d", 1, 1), ctx.vreg("v_tmp0"),
+              comment="+ lane_n")
+    ctx.s_mul(ctx.sreg("s_tmp1"), ctx.sreg("s_wg_id_y"),
+              str(tile.wg_n), comment=f"wg_id_y * {tile.wg_n}")
+    ctx.v_add(ctx.vreg("v_addr_d", 1, 1), ctx.sreg("s_tmp1"),
+              ctx.vreg("v_addr_d", 1, 1),
+              comment="+ wg_base_n -> global_col")
+
+    # base_voffset = (global_row * N + global_col) * elem
+    ctx.inst("v_mul_lo_u32", ctx.vreg("v_addr_d", 0, 1),
+             ctx.sreg("s_N"), ctx.vreg("v_addr_d", 0, 1),
+             comment="global_row * N")
+    ctx.v_add(ctx.vreg("v_addr_d", 0, 1),
+              ctx.vreg("v_addr_d", 0, 1), ctx.vreg("v_addr_d", 1, 1),
+              comment="+ global_col -> linear element index")
+    # Scale to bytes
+    if elem_int == 2:
+        ctx.v_lshl(ctx.vreg("v_addr_d", 0, 1),
+                    ctx.vreg("v_addr_d", 0, 1), 1,
+                    comment="* 2 -> byte offset (f16)")
+    elif elem_int == 4:
+        ctx.v_lshl(ctx.vreg("v_addr_d", 0, 1),
+                    ctx.vreg("v_addr_d", 0, 1), 2,
+                    comment="* 4 -> byte offset (f32)")
+    else:
+        ctx.inst("v_mul_lo_u32", ctx.vreg("v_addr_d", 0, 1),
+                 str(elem_int), ctx.vreg("v_addr_d", 0, 1),
+                 comment=f"* {elem_int} -> byte offset")
+    # v_addr_d[0] = per-lane base byte offset (voffset for buffer ops)
+    ctx.raw("")
+
+    # ---- 3. Row stride = N * elem bytes ----
+    ctx.s_lshl(ctx.sreg("s_tmp0"), ctx.sreg("s_N"),
+               int(math.log2(elem)),
+               comment=f"row_stride = N * {elem_int} bytes")
+    ctx.raw("")
+
+    # ---- 4. Store loop: (mi, ai_pair, ni) order ----
+    # For element at (mi, ni, ai):
+    #   soffset = (mi * mfma.m + ai) * row_stride   [runtime, depends on N]
+    #   imm     = ni * mfma.n * elem                 [compile-time constant]
+    # v_cvt_pk_f16_f32 packs ai pairs; each half stored separately since
+    # adjacent ai values are in different (non-contiguous) rows.
+
+    total_elems = tile.mfma_m_repeat * tile.mfma_n_repeat * acc_per
+    ctx.comment(f"Store {total_elems} elements"
+                f" ({tile.mfma_m_repeat}x{tile.mfma_n_repeat}x{acc_per})"
+                f" via buffer_store_short")
+
+    use_pk_cvt = (acc_per % 2 == 0)
+
+    if use_pk_cvt:
+        _store_d_packed(ctx, tile, mfma, acc_per, elem_int)
+    else:
+        _store_d_scalar(ctx, tile, mfma, acc_per, elem_int)
+
+    ctx.s_waitcnt("vmcnt(0)", comment="wait for stores")
+    ctx.raw("")
+
+
+def _store_d_scalar(ctx, tile, mfma, acc_per, elem_int):
+    """Emit buffer_store_short with individual v_cvt_f16_f32_e32 per element.
+
+    Fallback for odd acc_per (uncommon).
+    """
+    for mi in range(tile.mfma_m_repeat):
+        for ai in range(acc_per):
+            row_delta = mi * mfma.m + ai
+            if row_delta == 0:
+                ctx.s_mov(ctx.sreg("s_tmp1"), "0",
+                          comment=f"soffset = 0 (mi={mi} ai={ai})")
+            else:
+                ctx.s_mul(ctx.sreg("s_tmp1"), ctx.sreg("s_tmp0"),
+                          str(row_delta),
+                          comment=f"soffset = {row_delta} * row_stride"
+                                  f" (mi={mi} ai={ai})")
+
+            for ni in range(tile.mfma_n_repeat):
+                acc_idx = (mi * tile.mfma_n_repeat + ni) * acc_per + ai
+                ni_imm = ni * mfma.n * elem_int
+
+                ctx.inst("v_accvgpr_read_b32", ctx.vreg("v_store_tmp"),
+                         ctx.areg("acc_C", acc_idx, 1),
+                         comment=f"acc[{acc_idx}] m{mi}_n{ni}_a{ai}")
+                ctx.inst("v_cvt_f16_f32_e32", ctx.vreg("v_store_tmp"),
+                         ctx.vreg("v_store_tmp"), comment="f32->f16")
+                _emit_buffer_store_short(ctx, "v_store_tmp",
+                                         "s_tmp1", ni_imm,
+                                         f"store D m{mi}_n{ni}_a{ai}")
+
+
+def _store_d_packed(ctx, tile, mfma, acc_per, elem_int):
+    """Emit buffer_store_short with v_cvt_pk_f16_f32 for accumulator pairs.
+
+    Processes ai in pairs (0,1), (2,3), etc.  For each pair:
+      - Precompute soffset_lo and soffset_hi (= soffset_lo + row_stride)
+        so the inner ni loop has no scalar add/sub overhead.
+      - v_cvt_pk_f16_f32 packs both f32 values into {f16_hi, f16_lo}.
+      - Store bits[15:0] with soffset_lo, extract bits[31:16] via
+        v_lshrrev_b32 and store with soffset_hi.
+    """
+    # Extra SGPR for the hi-row soffset (avoids s_add/s_sub per ni)
+    ctx.alloc_sgpr_permanent(1, "s_soffset_hi")
+
+    for mi in range(tile.mfma_m_repeat):
+        for ai_base in range(0, acc_per, 2):
+            ai_lo = ai_base
+            ai_hi = ai_base + 1
+
+            # soffset_lo = (mi * mfma.m + ai_lo) * row_stride
+            row_delta_lo = mi * mfma.m + ai_lo
+            if row_delta_lo == 0:
+                ctx.s_mov(ctx.sreg("s_tmp1"), "0",
+                          comment=f"soffset_lo = 0 (mi={mi} ai={ai_lo})")
+            else:
+                ctx.s_mul(ctx.sreg("s_tmp1"), ctx.sreg("s_tmp0"),
+                          str(row_delta_lo),
+                          comment=f"soffset_lo = {row_delta_lo} * row_stride"
+                                  f" (mi={mi} ai={ai_lo})")
+
+            # soffset_hi = soffset_lo + row_stride
+            ctx.inst("s_add_u32", ctx.sreg("s_soffset_hi"),
+                     ctx.sreg("s_tmp1"), ctx.sreg("s_tmp0"),
+                     comment=f"soffset_hi = soffset_lo + row_stride"
+                             f" (ai={ai_hi})")
+
+            for ni in range(tile.mfma_n_repeat):
+                acc_idx_lo = (mi * tile.mfma_n_repeat + ni) * acc_per + ai_lo
+                acc_idx_hi = (mi * tile.mfma_n_repeat + ni) * acc_per + ai_hi
+                ni_imm = ni * mfma.n * elem_int
+
+                # Read both accumulators and pack-convert
+                ctx.inst("v_accvgpr_read_b32", ctx.vreg("v_tmp0"),
+                         ctx.areg("acc_C", acc_idx_lo, 1),
+                         comment=f"acc[{acc_idx_lo}] m{mi}_n{ni}_a{ai_lo}")
+                ctx.inst("v_accvgpr_read_b32", ctx.vreg("v_tmp1"),
+                         ctx.areg("acc_C", acc_idx_hi, 1),
+                         comment=f"acc[{acc_idx_hi}] m{mi}_n{ni}_a{ai_hi}")
+                ctx.inst("v_cvt_pk_f16_f32", ctx.vreg("v_store_tmp"),
+                         ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),
+                         comment=f"pk cvt a{ai_lo},a{ai_hi}")
+
+                # Store lo half: bits[15:0] = f16(ai_lo)
+                _emit_buffer_store_short(ctx, "v_store_tmp",
+                                         "s_tmp1", ni_imm,
+                                         f"store D m{mi}_n{ni}_a{ai_lo}")
+
+                # Extract hi half and store at ai_hi row
+                ctx.v_lshr(ctx.vreg("v_store_tmp"),
+                           ctx.vreg("v_store_tmp"), 16,
+                           comment="extract hi f16")
+                _emit_buffer_store_short(ctx, "v_store_tmp",
+                                         "s_soffset_hi", ni_imm,
+                                         f"store D m{mi}_n{ni}_a{ai_hi}")
+
+
+def _emit_buffer_store_short(ctx, vdata_name, soffset_name, imm_offset,
+                              comment):
+    """Emit one buffer_store_short via the D matrix SRD.
+
+    If imm_offset exceeds the 12-bit immediate field (4095), the excess
+    is folded into soffset with a temporary s_add/s_sub pair.
+    """
+    vdata = ctx.vreg(vdata_name)
+    voffset = ctx.vreg("v_addr_d", 0, 1)
+    srd = ctx.sreg("s_srd_d", 0, 4)
+    soffset = ctx.sreg(soffset_name)
+
+    if imm_offset == 0:
+        ctx.inst("buffer_store_short", vdata, voffset, srd,
+                 soffset, "offen", comment=comment)
+    elif imm_offset < 4096:
+        ctx.inst("buffer_store_short", vdata, voffset, srd,
+                 soffset, f"offen offset:{imm_offset}",
+                 comment=comment)
+    else:
+        # Immediate too large; fold into soffset temporarily
+        ctx.inst("s_add_u32", soffset, soffset, str(imm_offset),
+                 comment=f"fold imm {imm_offset} into soffset")
+        ctx.inst("buffer_store_short", vdata, voffset, srd,
+                 soffset, "offen", comment=comment)
+        ctx.inst("s_sub_u32", soffset, soffset, str(imm_offset),
+                 comment="restore soffset")
+
+
 
 
 # ===================================================================

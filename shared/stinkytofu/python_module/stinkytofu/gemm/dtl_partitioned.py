@@ -42,10 +42,11 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     av = mfma.a_vgprs
     bv = mfma.b_vgprs
 
-    lds_half = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
-    k_stride = tile.unroll_k * elem
+    lds_half = int((tile.wg_m + tile.wg_n) * tile.unroll_k * elem)
+    k_stride = int(tile.unroll_k * elem)
     log2_uk = int(math.log2(tile.unroll_k))
-    threads_per_row = tile.unroll_k // 8
+    unroll_k_bytes = int(tile.unroll_k * mfma.element_bytes)
+    threads_per_row = unroll_k_bytes // 16
     rows_per_load = tile.block_size // threads_per_row
     num_loads_a = tile.wg_m // rows_per_load
     num_loads_b = tile.wg_n // rows_per_load
@@ -102,13 +103,25 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                 def _mk_mfma(mi_=mi, ni_=ni, ki_=ki, buf_=cur_buf,
                               acc_off_=acc_off, acc_per_=acc_per):
                     def emit():
-                        ctx.inst(
-                            mfma.instruction_name,
-                            ctx.areg("acc_C", acc_off_, acc_per_),
-                            ctx.vreg(a_names[(buf_, ki_)], 0, av),
-                            ctx.vreg(b_names[(ni_, ki_)], 0, bv),
-                            ctx.areg("acc_C", acc_off_, acc_per_),
-                            comment=f"MFMA m{mi_}_n{ni_}_k{ki_}")
+                        if mfma.is_mx:
+                            ctx.inst(
+                                mfma.instruction_name,
+                                ctx.areg("acc_C", acc_off_, acc_per_),
+                                ctx.vreg(a_names[(buf_, ki_)], 0, av),
+                                ctx.vreg(b_names[(ni_, ki_)], 0, bv),
+                                ctx.areg("acc_C", acc_off_, acc_per_),
+                                ctx.vreg("v_mxscale"),
+                                ctx.vreg("v_mxscale"),
+                                f"cbsz:{mfma.cbsz} blgp:{mfma.blgp}",
+                                comment=f"MFMA m{mi_}_n{ni_}_k{ki_}")
+                        else:
+                            ctx.inst(
+                                mfma.instruction_name,
+                                ctx.areg("acc_C", acc_off_, acc_per_),
+                                ctx.vreg(a_names[(buf_, ki_)], 0, av),
+                                ctx.vreg(b_names[(ni_, ki_)], 0, bv),
+                                ctx.areg("acc_C", acc_off_, acc_per_),
+                                comment=f"MFMA m{mi_}_n{ni_}_k{ki_}")
                     return emit
 
                 all_mfma_ops.append(PlacedOp(

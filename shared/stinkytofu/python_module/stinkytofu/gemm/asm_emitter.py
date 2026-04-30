@@ -100,8 +100,8 @@ def alloc_registers(ctx: AsmContext, problem: GemmProblem,
     elem = problem.element_bytes
     a_elems = (tile.wg_m * tile.unroll_k) // tile.block_size
     b_elems = (tile.wg_n * tile.unroll_k) // tile.block_size
-    a_vgprs = max(1, (a_elems * elem + 3) // 4)
-    b_vgprs = max(1, (b_elems * elem + 3) // 4)
+    a_vgprs = max(1, int(a_elems * elem + 3) // 4)
+    b_vgprs = max(1, int(b_elems * elem + 3) // 4)
     ctx.alloc_vgpr_permanent(a_vgprs, "v_gload_a")
     ctx.alloc_vgpr_permanent(b_vgprs, "v_gload_b")
 
@@ -237,6 +237,10 @@ def alloc_registers_dtl(ctx: AsmContext, problem: GemmProblem,
     # MFMA operands (same as non-DTL)
     ctx.alloc_vgpr_permanent(tile.mfma.a_vgprs, "v_a")
     ctx.alloc_vgpr_permanent(tile.mfma.b_vgprs, "v_b")
+
+    # MX scale VGPR (constant scale=1 for Phase 1)
+    if tile.mfma.is_mx:
+        ctx.alloc_vgpr_permanent(1, "v_mxscale")
 
     # Store registers
     ctx.alloc_vgpr_permanent(2, "v_addr_d")

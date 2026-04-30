@@ -188,7 +188,7 @@ class GemmLayouts:
     lds_b_offset: int
 
     # Element size in bytes
-    elem_bytes: int
+    elem_bytes: float
 
     @staticmethod
     def build(problem: GemmProblem, tile: TileConfig) -> GemmLayouts:
@@ -197,11 +197,11 @@ class GemmLayouts:
         uk = tile.unroll_k
         # LDS padding: lds_pad bytes per row for bank conflict avoidance.
         # pad_elems = lds_pad / elem (e.g., 4 bytes / 2 = 2 fp16 elements)
-        pad_elems = tile.lds_pad // elem if tile.lds_pad > 0 else 0
+        pad_elems = int(tile.lds_pad // elem) if tile.lds_pad > 0 else 0
         lds_row_stride = uk + pad_elems  # elements per LDS row including padding
 
         lds_a_elems = tile.wg_m * lds_row_stride
-        lds_b_offset = lds_a_elems * elem
+        lds_b_offset = int(lds_a_elems * elem)
 
         return GemmLayouts(
             lds_a=Embed(

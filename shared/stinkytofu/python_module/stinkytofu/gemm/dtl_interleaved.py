@@ -44,23 +44,23 @@ def _a_off(mi, ki, tile, mfma, elem):
     Without padding (lds_pad=0): simple mi*m*uk*elem + ki*k*elem.
     """
     pad_bytes = tile.lds_pad  # bytes of padding per load line
-    threads_per_row = tile.unroll_k // 8
+    threads_per_row = int(tile.unroll_k * elem) // 16
     rows_per_load = (tile.waves_m * tile.waves_n * tile.wave_size) // threads_per_row
     row_start = mi * mfma.m  # starting row within wave's M range
     lines_crossed = row_start // rows_per_load  # load-line boundaries crossed
-    row_stride = tile.unroll_k * elem  # bytes per row (no per-row padding)
-    return row_start * row_stride + lines_crossed * pad_bytes + ki * mfma.k * elem
+    row_stride = int(tile.unroll_k * elem)  # bytes per row (no per-row padding)
+    return int(row_start * row_stride + lines_crossed * pad_bytes + ki * mfma.k * elem)
 
 
 def _b_off(ni, ki, tile, mfma, elem):
     """LDS byte offset for B operand at (ni, ki)."""
     pad_bytes = tile.lds_pad
-    threads_per_row = tile.unroll_k // 8
+    threads_per_row = int(tile.unroll_k * elem) // 16
     rows_per_load = (tile.waves_m * tile.waves_n * tile.wave_size) // threads_per_row
     row_start = ni * mfma.n
     lines_crossed = row_start // rows_per_load
-    row_stride = tile.unroll_k * elem
-    return row_start * row_stride + lines_crossed * pad_bytes + ki * mfma.k * elem
+    row_stride = int(tile.unroll_k * elem)
+    return int(row_start * row_stride + lines_crossed * pad_bytes + ki * mfma.k * elem)
 
 
 def phase_dtl_interleaved_setup(level, ctx):
@@ -102,7 +102,7 @@ def phase_dtl_interleaved_setup(level, ctx):
     ctx.raw("")
 
     # DTL per-lane offset
-    threads_per_row = tile.unroll_k // 8
+    threads_per_row = int(tile.unroll_k * elem) // 16
     log2_tpr = int(math.log2(threads_per_row))
     ctx.comment(f"DTL offset: {threads_per_row} threads/row")
     ctx.v_lshr(ctx.vreg("v_tmp0"), ctx.vreg("v_tid"), log2_tpr,
@@ -112,9 +112,14 @@ def phase_dtl_interleaved_setup(level, ctx):
     ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_tmp1"), 4,
                comment="* 16 -> col_bytes")
 
-    # K stride
-    ctx.s_lshl(ctx.sreg("s_k_stride"), ctx.sreg("s_K"), int(math.log2(elem)),
-               comment=f"s_k_stride = K * {elem}")
+    # K stride: K * element_bytes
+    if elem >= 1:
+        ctx.s_lshl(ctx.sreg("s_k_stride"), ctx.sreg("s_K"),
+                   int(math.log2(elem)), comment=f"s_k_stride = K * {elem}")
+    else:
+        # Sub-byte: elem=0.5 means K / 2
+        ctx.s_lshr(ctx.sreg("s_k_stride"), ctx.sreg("s_K"),
+                   int(math.log2(1.0 / elem)), comment=f"s_k_stride = K * {elem}")
 
     # DTL voffset = thread_row * K * elem + col_bytes
     ctx.inst("v_mul_lo_u32", ctx.vreg("v_dtl_off_a"),
@@ -168,7 +173,7 @@ def phase_dtl_interleaved_setup(level, ctx):
     # DTL writes contiguously (m0 + lane_id*16), so row stride = unroll_k * elem
     # NOT lds_row_stride (which includes per-row padding for non-DTL).
     # The per-load-line padding is handled by m0 increments.
-    dtl_row_stride = tile.unroll_k * elem  # 128 bytes for uk=64 fp16
+    dtl_row_stride = int(tile.unroll_k * elem)  # 128 bytes for uk=64 fp16
     ctx.v_mul(ctx.vreg("v_tmp0"), str(dtl_row_stride),
               ctx.vreg("v_tmp0"), comment=f"row * {dtl_row_stride}")
     ctx.v_add(ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),
@@ -177,10 +182,10 @@ def phase_dtl_interleaved_setup(level, ctx):
              ctx.vreg("v_tmp0"), comment="LDS write base A")
     # Compute DTL-specific lds_b_offset (with per-load-line padding)
     if tile.lds_pad > 0:
-        threads_per_row_ = tile.unroll_k // 8
+        threads_per_row_ = int(tile.unroll_k * elem) // 16
         rows_per_load_ = tile.block_size // threads_per_row_
         num_loads_a_ = tile.wg_m // rows_per_load_
-        dtl_lds_b_offset = tile.wg_m * tile.unroll_k * elem + num_loads_a_ * tile.lds_pad
+        dtl_lds_b_offset = int(tile.wg_m * tile.unroll_k * elem) + num_loads_a_ * tile.lds_pad
     else:
         dtl_lds_b_offset = layouts.lds_b_offset
     ctx.inst("s_add_u32", ctx.sreg("s_lds_wr_b_sg"),
@@ -208,7 +213,7 @@ def phase_dtl_interleaved_setup(level, ctx):
               ctx.vreg("v_lds_rd_a"), comment=f"* {tile.unroll_k}")
     # Add per-load-line padding offset for the wave's starting row
     if tile.lds_pad > 0:
-        tpr = tile.unroll_k // 8
+        tpr = int(tile.unroll_k * elem) // 16
         rpl = tile.block_size // tpr
         wave_lines = tile.m_per_wave // rpl
         if wave_lines > 0:
@@ -219,8 +224,12 @@ def phase_dtl_interleaved_setup(level, ctx):
                       ctx.vreg("v_tmp0"), comment="+ wave padding")
     ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
               ctx.vreg("v_tmp1"), comment="+ lane_k")
-    ctx.v_lshl(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
-               int(math.log2(elem)), comment=f"* {elem}")
+    if elem >= 1:
+        ctx.v_lshl(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
+                   int(math.log2(elem)), comment=f"* {elem}")
+    else:
+        ctx.v_lshr(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
+                   int(math.log2(1.0 / elem)), comment=f"* {elem} (sub-byte)")
     ctx.raw("")
 
     # LDS read B
@@ -235,10 +244,14 @@ def phase_dtl_interleaved_setup(level, ctx):
               ctx.vreg("v_lds_rd_b"), comment=f"* {tile.unroll_k}")
     ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
               ctx.vreg("v_tmp1"), comment="+ lane_k")
-    ctx.v_lshl(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
-               int(math.log2(elem)), comment=f"* {elem}")
+    if elem >= 1:
+        ctx.v_lshl(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
+                   int(math.log2(elem)), comment=f"* {elem}")
+    else:
+        ctx.v_lshr(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
+                   int(math.log2(1.0 / elem)), comment=f"* {elem} (sub-byte)")
     if tile.lds_pad > 0:
-        tpr_b = tile.unroll_k // 8
+        tpr_b = int(tile.unroll_k * elem) // 16
         rpl_b = tile.block_size // tpr_b
         wave_lines_b = tile.n_per_wave // rpl_b
         if wave_lines_b > 0:
@@ -247,10 +260,10 @@ def phase_dtl_interleaved_setup(level, ctx):
             ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
                       ctx.vreg("v_tmp0"), comment="+ wave padding (bytes)")
     if tile.lds_pad > 0:
-        threads_per_row__ = tile.unroll_k // 8
+        threads_per_row__ = int(tile.unroll_k * elem) // 16
         rows_per_load__ = tile.block_size // threads_per_row__
         num_loads_a__ = tile.wg_m // rows_per_load__
-        dtl_b_off = tile.wg_m * tile.unroll_k * elem + num_loads_a__ * tile.lds_pad
+        dtl_b_off = int(tile.wg_m * tile.unroll_k * elem) + num_loads_a__ * tile.lds_pad
     else:
         dtl_b_off = layouts.lds_b_offset
     ctx.v_add(ctx.vreg("v_lds_rd_b"), str(dtl_b_off),
@@ -264,13 +277,20 @@ def phase_dtl_interleaved_setup(level, ctx):
         ctx.inst("v_accvgpr_write_b32", ctx.areg("acc_C", i, 1), "0")
     ctx.raw("")
 
+    # Init MX constant scale VGPR (E8M0 scale=1.0 in all 4 bytes)
+    if mfma.is_mx:
+        ctx.comment("Init MX constant scale = 1.0 (E8M0 0x7F)")
+        ctx.v_mov(ctx.vreg("v_mxscale"), "0x7F7F7F7F",
+                  comment="scale = 1.0 for all byte lanes")
+        ctx.raw("")
+
 
 def _emit_dtl_loads_a(ctx, tile, problem, num_loads):
     """Issue DTL loads for A matrix."""
     elem = problem.element_bytes
-    threads_per_row = tile.unroll_k // 8
+    threads_per_row = int(tile.unroll_k * elem) // 16
     rows_per_load = tile.block_size // threads_per_row
-    lds_data_per_load = rows_per_load * tile.unroll_k * elem
+    lds_data_per_load = int(rows_per_load * tile.unroll_k * elem)
     lds_stride = lds_data_per_load + tile.lds_pad  # add padding per load line
 
     ctx.inst("s_mov_b32", "m0", ctx.sreg("s_lds_wr_a_sg"), comment="m0 = LDS base A")
@@ -290,9 +310,9 @@ def _emit_dtl_loads_a(ctx, tile, problem, num_loads):
 def _emit_dtl_loads_b(ctx, tile, problem, num_loads):
     """Issue DTL loads for B matrix."""
     elem = problem.element_bytes
-    threads_per_row = tile.unroll_k // 8
+    threads_per_row = int(tile.unroll_k * elem) // 16
     rows_per_load = tile.block_size // threads_per_row
-    lds_data_per_load = rows_per_load * tile.unroll_k * elem
+    lds_data_per_load = int(rows_per_load * tile.unroll_k * elem)
     lds_stride = lds_data_per_load + tile.lds_pad
 
     ctx.inst("s_mov_b32", "m0", ctx.sreg("s_lds_wr_b_sg"), comment="m0 = LDS base B")
@@ -332,19 +352,19 @@ def phase_dtl_interleaved_k_loop(level, ctx):
     pad_e = tile.lds_pad // elem if tile.lds_pad > 0 else 0
     # For DTL: per-load-line padding (not per-row)
     if tile.lds_pad > 0:
-        threads_per_row_l = tile.unroll_k // 8
+        threads_per_row_l = int(tile.unroll_k * elem) // 16
         rows_per_load_l = tile.block_size // threads_per_row_l
         num_loads_a_l = tile.wg_m // rows_per_load_l
         num_loads_b_l = tile.wg_n // rows_per_load_l
-        lds_a_half = tile.wg_m * tile.unroll_k * elem + num_loads_a_l * tile.lds_pad
-        lds_b_half = tile.wg_n * tile.unroll_k * elem + num_loads_b_l * tile.lds_pad
+        lds_a_half = int(tile.wg_m * tile.unroll_k * elem) + num_loads_a_l * tile.lds_pad
+        lds_b_half = int(tile.wg_n * tile.unroll_k * elem) + num_loads_b_l * tile.lds_pad
         lds_half = lds_a_half + lds_b_half
     else:
-        lds_half = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
-    k_stride = tile.unroll_k * elem
+        lds_half = int((tile.wg_m + tile.wg_n) * tile.unroll_k * elem)
+    k_stride = int(tile.unroll_k * elem)
     log2_uk = int(math.log2(tile.unroll_k))
 
-    threads_per_row = tile.unroll_k // 8
+    threads_per_row = int(tile.unroll_k * elem) // 16
     rows_per_load = tile.block_size // threads_per_row
     num_loads_a = tile.wg_m // rows_per_load  # 8
     num_loads_b = tile.wg_n // rows_per_load  # 8
@@ -492,12 +512,23 @@ def phase_dtl_interleaved_k_loop(level, ctx):
 
                 acc_per = mfma.acc_vgprs
                 acc_off = (mi * nr + ni) * acc_per
-                ctx.inst(mfma.instruction_name,
-                         ctx.areg("acc_C", acc_off, acc_per),
-                         ctx.vreg(a_names[(cur_a, ki)], 0, av),
-                         ctx.vreg(b_names[(ni, ki)], 0, bv),
-                         ctx.areg("acc_C", acc_off, acc_per),
-                         comment=f"MFMA m{mi}_n{ni}_k{ki}")
+                if mfma.is_mx:
+                    ctx.inst(mfma.instruction_name,
+                             ctx.areg("acc_C", acc_off, acc_per),
+                             ctx.vreg(a_names[(cur_a, ki)], 0, av),
+                             ctx.vreg(b_names[(ni, ki)], 0, bv),
+                             ctx.areg("acc_C", acc_off, acc_per),
+                             ctx.vreg("v_mxscale"),
+                             ctx.vreg("v_mxscale"),
+                             f"cbsz:{mfma.cbsz} blgp:{mfma.blgp}",
+                             comment=f"MFMA m{mi}_n{ni}_k{ki}")
+                else:
+                    ctx.inst(mfma.instruction_name,
+                             ctx.areg("acc_C", acc_off, acc_per),
+                             ctx.vreg(a_names[(cur_a, ki)], 0, av),
+                             ctx.vreg(b_names[(ni, ki)], 0, bv),
+                             ctx.areg("acc_C", acc_off, acc_per),
+                             comment=f"MFMA m{mi}_n{ni}_k{ki}")
                 mfma_idx += 1
 
         if has_pf:
