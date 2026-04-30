@@ -389,3 +389,73 @@ class TestMXFP4GPU:
 
         if hipblaslt_tflops is None:
             print("  hipBLASLt   : skipped (binary not found or failed)")
+
+
+class TestMXFP4RealScales:
+    """Test MXFP4 with real scale loading from global memory."""
+
+    @staticmethod
+    def _build_real_scales(m, n, k, output_path):
+        tiling = GemmTiling.mxfp4_standard()
+        problem = GemmProblem(m, n, k, dtype=DataType.MXFP4)
+        kernel = GemmKernel.build(problem, tiling=tiling,
+                                  dtl_partitioned=True,
+                                  use_real_scales=True)
+        result = kernel.emit()
+        co_path = result.assemble(output_path=output_path)
+        return kernel, co_path
+
+    def test_real_scales_ones(self):
+        """Real scale=1.0 (0x7F) should match constant scale results."""
+        from stinkytofu.gemm.launcher import GemmLauncher
+
+        M, N, K = 128, 128, 256
+        kernel, co_path = self._build_real_scales(
+            M, N, K, "/tmp/test_mxfp4_realscale_ones.co")
+
+        problem = GemmProblem(M, N, K, dtype=DataType.MXFP4)
+        launcher = GemmLauncher(problem, kernel.tile, seed=42)
+        # All-ones FP4 input (0x22 = two packed 1.0 values)
+        launcher._A = np.full((M, K // 2), 0x22, dtype=np.uint8)
+        launcher._B = np.full((N, K // 2), 0x22, dtype=np.uint8)
+
+        result = launcher.run_asm_kernel(
+            co_path, kernel_name="gemm_kernel",
+            num_warmup=1, num_iters=1)
+
+        D_gpu = result.D
+        expected = 256.0  # K=256, all 1.0*1.0*scale1.0
+        assert D_gpu.dtype == np.float16
+        assert np.all(D_gpu == expected), \
+            f"Expected all {expected}, got min={np.min(D_gpu)} max={np.max(D_gpu)}"
+
+    def test_real_scales_scale2(self):
+        """Scale=2.0 (E8M0 0x80 = 2^1) should double the output vs scale=1.0."""
+        from stinkytofu.gemm.launcher import GemmLauncher
+
+        M, N, K = 128, 128, 256
+        kernel, co_path = self._build_real_scales(
+            M, N, K, "/tmp/test_mxfp4_realscale_2x.co")
+
+        problem = GemmProblem(M, N, K, dtype=DataType.MXFP4)
+        launcher = GemmLauncher(problem, kernel.tile, seed=42)
+        # All-ones FP4 input
+        launcher._A = np.full((M, K // 2), 0x22, dtype=np.uint8)
+        launcher._B = np.full((N, K // 2), 0x22, dtype=np.uint8)
+
+        # Override scale buffers: scale_A=2.0 (0x80), scale_B=1.0 (0x7F)
+        # E8M0: value = 2^(code - 127). 0x80 = 128, 2^(128-127) = 2^1 = 2.0
+        mx_block = 32
+        launcher._scale_A = np.full(M * (K // mx_block), 0x80, dtype=np.uint8)
+        launcher._scale_B = np.full(N * (K // mx_block), 0x7F, dtype=np.uint8)
+
+        result = launcher.run_asm_kernel(
+            co_path, kernel_name="gemm_kernel",
+            num_warmup=1, num_iters=1)
+
+        D_gpu = result.D
+        # With scale_A=2.0: each A element is effectively 2*1.0=2.0
+        # D = sum(2.0 * 1.0 * 1.0) for K=256 = 512.0
+        expected = 512.0
+        assert np.allclose(D_gpu, expected, atol=1.0), \
+            f"Expected ~{expected}, got min={np.min(D_gpu)} max={np.max(D_gpu)}"

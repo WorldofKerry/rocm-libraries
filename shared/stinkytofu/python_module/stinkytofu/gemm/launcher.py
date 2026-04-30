@@ -143,6 +143,8 @@ class GemmLauncher:
         self.seed = seed
         self._A: Optional[np.ndarray] = None
         self._B: Optional[np.ndarray] = None
+        self._scale_A: Optional[np.ndarray] = None
+        self._scale_B: Optional[np.ndarray] = None
 
     # -- numpy dtype mapping ------------------------------------------------
 
@@ -502,11 +504,19 @@ class GemmLauncher:
                    "hipMalloc scale_A")
             _check(hip.hipMalloc(ctypes.byref(d_scale_B), scale_b_bytes),
                    "hipMalloc scale_B")
-            # Fill with 0x7F (E8M0 encoding for scale=1.0)
-            _check(hip.hipMemset(d_scale_A, 0x7F, scale_a_bytes),
-                   "memset scale_A")
-            _check(hip.hipMemset(d_scale_B, 0x7F, scale_b_bytes),
-                   "memset scale_B")
+            # Use provided scale data or default to 0x7F (E8M0 = 1.0)
+            if self._scale_A is not None:
+                _check(hip.hipMemcpy(d_scale_A, self._scale_A.ctypes.data,
+                                     scale_a_bytes, 1), "H2D scale_A")
+            else:
+                _check(hip.hipMemset(d_scale_A, 0x7F, scale_a_bytes),
+                       "memset scale_A=1.0")
+            if self._scale_B is not None:
+                _check(hip.hipMemcpy(d_scale_B, self._scale_B.ctypes.data,
+                                     scale_b_bytes, 1), "H2D scale_B")
+            else:
+                _check(hip.hipMemset(d_scale_B, 0x7F, scale_b_bytes),
+                       "memset scale_B=1.0")
             stride_scale_a = scale_a_cols  # row stride in bytes
             stride_scale_b = scale_b_cols
             kernarg = struct.pack("<QQQiiiQQii",
