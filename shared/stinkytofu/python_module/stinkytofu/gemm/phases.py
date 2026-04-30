@@ -394,7 +394,8 @@ def phase_store_d_legacy(level, ctx):
     layouts = _layouts(ctx)
     mfma = tile.mfma
     acc_per = mfma.acc_vgprs
-    elem = problem.element_bytes
+    # D output is always fp16, regardless of input dtype
+    elem = 2
 
     ctx.comment("Store D via transform")
 
@@ -510,8 +511,9 @@ def phase_store_d(level, ctx):
     problem = _problem(ctx)
     mfma = tile.mfma
     acc_per = mfma.acc_vgprs
-    elem = problem.element_bytes
-    elem_int = int(elem)
+    # D output is always fp16 (2 bytes/element), regardless of input dtype
+    elem = 2
+    elem_int = 2
 
     ctx.comment("=== Store D via buffer SRD ===")
 

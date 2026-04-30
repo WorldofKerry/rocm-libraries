@@ -25,6 +25,31 @@ from .problem import DataType, GemmProblem, TileConfig
 __all__ = ["GemmLauncher", "GemmResult"]
 
 
+# FP4 E2M1 lookup: 4-bit index -> float32 value
+_FP4_E2M1_TABLE = np.array([
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,   # 0000..0111 (positive)
+   -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,  # 1000..1111 (negative)
+], dtype=np.float32)
+
+
+def _unpack_fp4_to_float(packed: np.ndarray) -> np.ndarray:
+    """Unpack uint8 array of packed FP4 E2M1 values to float32.
+
+    Each byte holds 2 FP4 values: low nibble = first element,
+    high nibble = second element.
+
+    Input shape:  ``[rows, cols_packed]``
+    Output shape: ``[rows, cols_packed * 2]``
+    """
+    lo = (packed & 0x0F).astype(np.intp)
+    hi = ((packed >> 4) & 0x0F).astype(np.intp)
+    rows, cols = packed.shape
+    result = np.empty((rows, cols * 2), dtype=np.float32)
+    result[:, 0::2] = _FP4_E2M1_TABLE[lo]
+    result[:, 1::2] = _FP4_E2M1_TABLE[hi]
+    return result
+
+
 def _load_hip() -> ctypes.CDLL:
     """Load libamdhip64.so with proper argtypes to avoid 64-bit pointer truncation."""
     try:
@@ -52,6 +77,17 @@ def _load_hip() -> ctypes.CDLL:
     hip.hipModuleLoad.restype = INT
     hip.hipModuleGetFunction.argtypes = [PVP, VP, CHAR_P]
     hip.hipModuleGetFunction.restype = INT
+    # hipModuleLaunchKernel(func, gridX, gridY, gridZ, blockX, blockY, blockZ,
+    #                       sharedMem, stream, kernelParams, extra)
+    hip.hipModuleLaunchKernel.argtypes = [
+        VP,   # function
+        INT, INT, INT,  # grid dims
+        INT, INT, INT,  # block dims
+        INT,  # shared mem bytes
+        VP,   # stream
+        VP,   # kernelParams (void**)
+        VP,   # extra (void**)
+    ]
     hip.hipModuleLaunchKernel.restype = INT
     hip.hipDeviceSynchronize.restype = INT
     hip.hipModuleUnload.argtypes = [VP]
@@ -177,22 +213,37 @@ class GemmLauncher:
         p = self.problem
         A, B, C = self.generate_inputs()
 
-        # Apply transposes
-        # A stored as [M, K]; if trans_a, op(A) = A^T -> [K, M]
-        A_op = A.astype(np.float32)
-        if p.trans_a:
-            A_op = A_op.T
+        if p.dtype == DataType.MXFP4:
+            # Unpack FP4 -> float32 before matmul
+            # A is [M, K//2] packed -> [M, K]
+            A_op = _unpack_fp4_to_float(A)
+            if p.trans_a:
+                A_op = A_op.T
+            # B: unpack along the K (packed) dimension, then arrange as [K, N]
+            if p.trans_b:
+                # B stored as [N, K//2] -> unpack -> [N, K] -> transpose -> [K, N]
+                B_op = _unpack_fp4_to_float(B).T
+            else:
+                # B stored as [K//2, N] -> .T -> [N, K//2] -> unpack -> [N, K] -> .T -> [K, N]
+                B_op = _unpack_fp4_to_float(B.T).T
+        else:
+            # A stored as [M, K]; if trans_a, op(A) = A^T -> [K, M]
+            A_op = A.astype(np.float32)
+            if p.trans_a:
+                A_op = A_op.T
 
-        # B stored as [N, K] when trans_b, [K, N] otherwise
-        # op(B): if trans_b, B^T -> [K, N]; if not, B -> [K, N]
-        B_op = B.astype(np.float32)
-        if p.trans_b:
-            B_op = B_op.T  # [N, K] -> [K, N]
+            # B stored as [N, K] when trans_b, [K, N] otherwise
+            # op(B): if trans_b, B^T -> [K, N]; if not, B -> [K, N]
+            B_op = B.astype(np.float32)
+            if p.trans_b:
+                B_op = B_op.T  # [N, K] -> [K, N]
 
         # Accumulate in f32
         D_f32 = p.alpha * (A_op @ B_op) + p.beta * C.astype(np.float32)
 
-        D_ref = D_f32.astype(self._np_dtype(p.dtype))
+        # Output is always fp16 for MXFP4, otherwise match input dtype
+        out_dtype = np.float16 if p.dtype == DataType.MXFP4 else self._np_dtype(p.dtype)
+        D_ref = D_f32.astype(out_dtype)
         return A, B, C, D_ref
 
     # -- Verification -------------------------------------------------------
@@ -287,10 +338,12 @@ class GemmLauncher:
         d_B = ctypes.c_void_p()
         d_D = ctypes.c_void_p()
         elem = p.element_bytes
+        # D output is always fp16 (2 bytes) for MXFP4
+        d_elem = 2 if p.dtype == DataType.MXFP4 else elem
 
         _check(hip.hipMalloc(ctypes.byref(d_A), int(p.m * p.k * elem)), "hipMalloc A")
         _check(hip.hipMalloc(ctypes.byref(d_B), int(p.k * p.n * elem)), "hipMalloc B")
-        _check(hip.hipMalloc(ctypes.byref(d_D), int(p.m * p.n * elem)), "hipMalloc D")
+        _check(hip.hipMalloc(ctypes.byref(d_D), int(p.m * p.n * d_elem)), "hipMalloc D")
 
         _check(hip.hipMemcpy(d_A, A.ctypes.data, int(p.m * p.k * elem), 1), "H2D A")
         _check(hip.hipMemcpy(d_B, B.ctypes.data, int(p.k * p.n * elem), 1), "H2D B")
@@ -355,8 +408,9 @@ class GemmLauncher:
         t1 = time.perf_counter()
 
         # Copy result back
-        D_out = np.zeros((p.m, p.n), dtype=self._np_dtype(p.dtype))
-        _check(hip.hipMemcpy(D_out.ctypes.data, d_D, int(p.m * p.n * elem), 2), "D2H D")
+        out_dtype = np.float16 if p.dtype == DataType.MXFP4 else self._np_dtype(p.dtype)
+        D_out = np.zeros((p.m, p.n), dtype=out_dtype)
+        _check(hip.hipMemcpy(D_out.ctypes.data, d_D, int(p.m * p.n * d_elem), 2), "D2H D")
 
         # Cleanup
         hip.hipFree(d_A)
@@ -406,7 +460,9 @@ class GemmLauncher:
         d_D = ctypes.c_void_p()
         a_bytes = int(p.m * p.k * elem)
         b_bytes = int(p.n * p.k * elem)  # B is [N, K] for trans_b
-        d_bytes = int(p.m * p.n * elem)
+        # D output is always fp16 (2 bytes/element) for MXFP4,
+        # regardless of input element size.
+        d_bytes = int(p.m * p.n * (2 if p.dtype == DataType.MXFP4 else elem))
 
         _check(hip.hipMalloc(ctypes.byref(d_A), a_bytes), "hipMalloc A")
         _check(hip.hipMalloc(ctypes.byref(d_B), b_bytes), "hipMalloc B")
@@ -432,10 +488,36 @@ class GemmLauncher:
                "hipModuleGetFunction")
 
         # Pack kernel arguments into a flat buffer matching the kernarg layout
-        # struct { void* A, void* B, void* D, int M, int N, int K }
-        kernarg = struct.pack("QQQiii",
-                              d_A.value, d_B.value, d_D.value,
-                              p.m, p.n, p.k)
+        # For MXFP4 (is_mx), layout adds scale pointers/strides at offset 36.
+        is_mx = hasattr(self.tile, 'mfma') and getattr(self.tile.mfma, 'is_mx', False)
+        d_scale_A = ctypes.c_void_p()
+        d_scale_B = ctypes.c_void_p()
+        if is_mx:
+            mx_block = self.tile.mfma.mx_block
+            scale_a_cols = p.k // mx_block
+            scale_b_cols = p.k // mx_block
+            scale_a_bytes = p.m * scale_a_cols  # 1 byte per E8M0 scale
+            scale_b_bytes = p.n * scale_b_cols
+            _check(hip.hipMalloc(ctypes.byref(d_scale_A), scale_a_bytes),
+                   "hipMalloc scale_A")
+            _check(hip.hipMalloc(ctypes.byref(d_scale_B), scale_b_bytes),
+                   "hipMalloc scale_B")
+            # Fill with 0x7F (E8M0 encoding for scale=1.0)
+            _check(hip.hipMemset(d_scale_A, 0x7F, scale_a_bytes),
+                   "memset scale_A")
+            _check(hip.hipMemset(d_scale_B, 0x7F, scale_b_bytes),
+                   "memset scale_B")
+            stride_scale_a = scale_a_cols  # row stride in bytes
+            stride_scale_b = scale_b_cols
+            kernarg = struct.pack("<QQQiiiQQii",
+                                  d_A.value, d_B.value, d_D.value,
+                                  p.m, p.n, p.k,
+                                  d_scale_A.value, d_scale_B.value,
+                                  stride_scale_a, stride_scale_b)
+        else:
+            kernarg = struct.pack("<QQQiii",
+                                  d_A.value, d_B.value, d_D.value,
+                                  p.m, p.n, p.k)
         # Pad to 64 bytes
         kernarg += b'\x00' * (64 - len(kernarg))
         kernarg_buf = (ctypes.c_char * 64)(*kernarg)
@@ -463,7 +545,16 @@ class GemmLauncher:
         _arg_N = ctypes.c_int(p.n)
         _arg_K = ctypes.c_int(p.k)
 
-        _arg_vals = [_arg_A, _arg_B, _arg_D, _arg_M, _arg_N, _arg_K]
+        if is_mx:
+            # Scale args at kernarg offsets 36-59
+            _arg_sA = ctypes.c_void_p(d_scale_A.value)
+            _arg_sB = ctypes.c_void_p(d_scale_B.value)
+            _arg_stride_sA = ctypes.c_int(stride_scale_a)
+            _arg_stride_sB = ctypes.c_int(stride_scale_b)
+            _arg_vals = [_arg_A, _arg_B, _arg_D, _arg_M, _arg_N, _arg_K,
+                         _arg_sA, _arg_sB, _arg_stride_sA, _arg_stride_sB]
+        else:
+            _arg_vals = [_arg_A, _arg_B, _arg_D, _arg_M, _arg_N, _arg_K]
         args = (ctypes.c_void_p * len(_arg_vals))()
         for i, v in enumerate(_arg_vals):
             args[i] = ctypes.cast(ctypes.pointer(v), ctypes.c_void_p)
@@ -513,13 +604,17 @@ class GemmLauncher:
         hip.hipEventDestroy(ev_stop)
 
         # Copy result back
-        D_out = np.zeros((p.m, p.n), dtype=self._np_dtype(p.dtype))
+        out_dtype = np.float16 if p.dtype == DataType.MXFP4 else self._np_dtype(p.dtype)
+        D_out = np.zeros((p.m, p.n), dtype=out_dtype)
         _check(hip.hipMemcpy(D_out.ctypes.data, d_D, d_bytes, 2), "D2H D")
 
         # Cleanup
         hip.hipFree(d_A)
         hip.hipFree(d_B)
         hip.hipFree(d_D)
+        if is_mx:
+            hip.hipFree(d_scale_A)
+            hip.hipFree(d_scale_B)
         hip.hipFree(d_kernarg)
         hip.hipModuleUnload(module)
 

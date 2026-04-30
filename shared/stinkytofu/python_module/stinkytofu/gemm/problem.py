@@ -59,6 +59,7 @@ class MfmaConfig:
     element_bits: int = 16   # bits per element (16 for fp16, 4 for mxfp4)
     cbsz: int = 0            # format selector for A operand (4 = FP4)
     blgp: int = 0            # format selector for B operand (4 = FP4)
+    mx_block: int = 0         # MX block size (32 for MXFP4, 0 = no MX)
     is_mx: bool = False       # uses MX scale operands
 
     @property
@@ -127,6 +128,7 @@ class MfmaConfig:
             element_bits=4,
             cbsz=4, blgp=4,
             is_mx=True,
+            mx_block=32,
         )
 
 

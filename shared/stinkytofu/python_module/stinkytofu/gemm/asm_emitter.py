@@ -139,6 +139,8 @@ def emit_descriptor(ctx: AsmContext, kernel_name: str,
     sgpr_count = ctx._next["s"]
     acc_count = ctx._next["acc"]
     vgpr_count = accum_offset + acc_count
+    # Kernarg size: 36 base + 24 scale args when MX is enabled, rounded up to 64
+    kernarg_size = 64 if not tile.mfma.is_mx else 64
 
     ctx.raw("")
     ctx.raw(".rodata")
@@ -146,7 +148,7 @@ def emit_descriptor(ctx: AsmContext, kernel_name: str,
     ctx.raw(f".amdhsa_kernel {kernel_name}")
     ctx.raw(f"    .amdhsa_group_segment_fixed_size {lds_total}")
     ctx.raw(f"    .amdhsa_private_segment_fixed_size 0")
-    ctx.raw(f"    .amdhsa_kernarg_size 64")
+    ctx.raw(f"    .amdhsa_kernarg_size {kernarg_size}")
     ctx.raw(f"    .amdhsa_user_sgpr_kernarg_segment_ptr 1")
     ctx.raw(f"    .amdhsa_system_sgpr_workgroup_id_x 1")
     ctx.raw(f"    .amdhsa_system_sgpr_workgroup_id_y 1")
@@ -167,16 +169,24 @@ def emit_descriptor(ctx: AsmContext, kernel_name: str,
     ctx.raw(f"    .sgpr_count:      {sgpr_count}")
     ctx.raw(f"    .vgpr_count:      {vgpr_count}")
     ctx.raw(f"    .agpr_count:      {acc_count}")
-    ctx.raw(f"    .kernarg_segment_size: 64")
+    ctx.raw(f"    .kernarg_segment_size: {kernarg_size}")
     ctx.raw(f"    .kernarg_segment_align: 8")
     ctx.raw(f"    .group_segment_fixed_size: {lds_total}")
     ctx.raw(f"    .private_segment_fixed_size: 0")
     ctx.raw(f"    .wavefront_size:  {tile.wave_size}")
     ctx.raw(f"    .max_flat_workgroup_size: {tile.block_size}")
     ctx.raw(f"    .args:")
-    for off, sz, kind in [(0,8,"global_buffer"), (8,8,"global_buffer"),
+    base_args = [(0,8,"global_buffer"), (8,8,"global_buffer"),
                           (16,8,"global_buffer"), (24,4,"by_value"),
-                          (28,4,"by_value"), (32,4,"by_value")]:
+                          (28,4,"by_value"), (32,4,"by_value")]
+    if tile.mfma.is_mx:
+        base_args += [
+            (36,8,"global_buffer"),  # ptr_scale_A
+            (44,8,"global_buffer"),  # ptr_scale_B
+            (52,4,"by_value"),       # stride_scale_A
+            (56,4,"by_value"),       # stride_scale_B
+        ]
+    for off, sz, kind in base_args:
         ctx.raw(f"      - .offset:         {off}")
         ctx.raw(f"        .size:           {sz}")
         ctx.raw(f"        .value_kind:     {kind}")
@@ -219,6 +229,17 @@ def alloc_registers_dtl(ctx: AsmContext, problem: GemmProblem,
     ctx.alloc_sgpr_permanent(1, "s_soffset_a")    # Scalar offset for 2nd A load
     ctx.alloc_sgpr_permanent(1, "s_soffset_b")    # Scalar offset for 2nd B load
 
+    # MX scale SGPRs (Phase 2: real scale loading)
+    if tile.mfma.is_mx:
+        ctx.alloc_sgpr_permanent(2, "s_ptr_scale_a")  # Scale A pointer from kernargs
+        ctx.alloc_sgpr_permanent(2, "s_ptr_scale_b")  # Scale B pointer from kernargs
+        ctx.alloc_sgpr_permanent(1, "s_stride_scale_a")  # Scale A stride (bytes)
+        ctx.alloc_sgpr_permanent(1, "s_stride_scale_b")  # Scale B stride (bytes)
+        ctx.alloc_sgpr_permanent(4, "s_srd_scale_a")  # Scale A buffer resource descriptor
+        ctx.alloc_sgpr_permanent(4, "s_srd_scale_b")  # Scale B buffer resource descriptor
+        ctx.alloc_sgpr_permanent(1, "s_lds_wr_scale_a_sg")  # LDS write base for scale A
+        ctx.alloc_sgpr_permanent(1, "s_lds_wr_scale_b_sg")  # LDS write base for scale B
+
     # Standard VGPRs
     ctx.alloc_vgpr_permanent(1, "v_tid")
     ctx.alloc_vgpr_permanent(1, "v_wave_id")
@@ -238,9 +259,18 @@ def alloc_registers_dtl(ctx: AsmContext, problem: GemmProblem,
     ctx.alloc_vgpr_permanent(tile.mfma.a_vgprs, "v_a")
     ctx.alloc_vgpr_permanent(tile.mfma.b_vgprs, "v_b")
 
-    # MX scale VGPR (constant scale=1 for Phase 1)
+    # MX scale VGPRs
     if tile.mfma.is_mx:
+        # Constant scale fallback (Phase 1, still used by dtl_interleaved)
         ctx.alloc_vgpr_permanent(1, "v_mxscale")
+        # DTL offset VGPR for scale loads
+        ctx.alloc_vgpr_permanent(1, "v_dtl_off_scale_a")
+        ctx.alloc_vgpr_permanent(1, "v_dtl_off_scale_b")
+        # LDS read addresses for scale data
+        ctx.alloc_vgpr_permanent(1, "v_lds_rd_scale_a")
+        ctx.alloc_vgpr_permanent(1, "v_lds_rd_scale_b")
+        # Per-(mi,ki) and per-(ni,ki) scale VGPRs are allocated dynamically
+        # in dtl_partitioned.py's phase function
 
     # Store registers
     ctx.alloc_vgpr_permanent(2, "v_addr_d")
