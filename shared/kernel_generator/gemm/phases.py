@@ -74,54 +74,38 @@ def phase_load_kernargs(level, ctx):
 
     # 1D WG decomposition (same as dtl_interleaved)
     if ctx._metadata.get("use_1d_grid", False):
-        ctx.comment("1D WG decomposition")
-        ctx.s_mov(ctx.sreg("s_tmp1"), ctx.sreg("s_wg_id_x"), comment="save wg_serial")
-        ctx.inst("v_mov_b32", ctx.vreg("v_tmp0"), str(tile.wg_m),
-                 comment=f"MT_M = {tile.wg_m}")
-        ctx.inst("v_mov_b32", ctx.vreg("v_tmp1"), ctx.sreg("s_M"), comment="M")
-        ctx.inst("v_cvt_f32_u32", ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"))
-        ctx.inst("v_rcp_iflag_f32", ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"),
-                 comment="1.0 / MT_M")
-        ctx.inst("v_cvt_f32_u32", ctx.vreg("v_tmp1"), ctx.vreg("v_tmp1"))
-        ctx.inst("v_mul_f32", ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"),
-                 ctx.vreg("v_tmp1"), comment="M / MT_M")
-        ctx.inst("v_cvt_u32_f32", ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"),
-                 comment="floor(M / MT_M)")
-        _log2_wgm = _math.log2(tile.wg_m)
-        if _log2_wgm == int(_log2_wgm):
-            ctx.inst("v_lshlrev_b32", ctx.vreg("v_tmp1"),
-                     str(int(_log2_wgm)), ctx.vreg("v_tmp0"),
-                     comment=f"floor << {int(_log2_wgm)}")
-        else:
-            ctx.s_mov(ctx.sreg("s_tmp0"), str(tile.wg_m))
-            ctx.inst("v_mul_lo_u32", ctx.vreg("v_tmp1"), ctx.vreg("v_tmp0"),
-                     ctx.sreg("s_tmp0"), comment=f"floor * {tile.wg_m}")
-        ctx.inst("v_sub_u32", ctx.vreg("v_tmp1"), ctx.sreg("s_M"),
-                 ctx.vreg("v_tmp1"), comment="M - floor*MT_M")
-        ctx.inst("v_cmp_ne_u32", "vcc", ctx.vreg("v_tmp1"), "0",
-                 comment="remainder != 0?")
-        ctx.inst("v_addc_co_u32", ctx.vreg("v_tmp0"), "vcc",
-                 ctx.vreg("v_tmp0"), "0", "vcc", comment="numWG_m = ceil(M/MT_M)")
-        ctx.inst("v_readfirstlane_b32", ctx.sreg("s_tmp0"),
-                 ctx.vreg("v_tmp0"), comment="numWG_m -> SGPR")
-        ctx.inst("v_cvt_f32_u32", ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"))
-        ctx.inst("v_rcp_iflag_f32", ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"),
-                 comment="1.0 / numWG_m")
-        ctx.inst("v_cvt_f32_u32", ctx.vreg("v_tmp1"),
-                 ctx.sreg("s_tmp1"), comment="(float)wg_serial")
-        ctx.inst("v_mul_f32", ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"),
-                 ctx.vreg("v_tmp1"), comment="wg_serial / numWG_m")
-        ctx.inst("v_cvt_u32_f32", ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"),
-                 comment="tile_n = floor(wg_serial / numWG_m)")
-        ctx.inst("v_readfirstlane_b32", ctx.sreg("s_wg_id_y"),
-                 ctx.vreg("v_tmp0"), comment="tile_n -> s_wg_id_y")
-        ctx.inst("s_mul_i32", ctx.sreg("s_wg_id_x"),
-                 ctx.sreg("s_wg_id_y"), ctx.sreg("s_tmp0"),
-                 comment="tile_n * numWG_m")
+        # 1D WG decomposition using pure scalar integer math
+        # numWG_m = ceil(M / MT_M), tile_n = serial / numWG_m, tile_m = serial % numWG_m
+        import math as _math
+        _log2_mt = int(_math.log2(tile.wg_m))
+        ctx.s_mov(ctx.sreg("s_tmp1"), ctx.sreg("s_wg_id_x"),
+                  comment="save wg_serial")
+        # numWG_m = (M + MT_M - 1) >> log2(MT_M)
+        ctx.inst("s_add_u32", ctx.sreg("s_tmp0"), ctx.sreg("s_M"),
+                 str(tile.wg_m - 1), comment=f"M + {tile.wg_m - 1}")
+        ctx.inst("s_lshr_b32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+                 str(_log2_mt), comment=f"numWG_m = ceil(M/{tile.wg_m})")
+        # Division: tile_n = serial / numWG_m, tile_m = serial % numWG_m
+        # Use s_ff1 to detect if numWG_m is power-of-2 and use shift
         ctx.inst("s_sub_u32", ctx.sreg("s_wg_id_x"),
+                 ctx.sreg("s_tmp0"), "1", comment="numWG_m - 1")
+        ctx.inst("s_and_b32", ctx.sreg("s_wg_id_y"),
+                 ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"),
+                 comment="numWG_m & (numWG_m-1) == 0 if power-of-2")
+        # For now assume power-of-2 (all our tiles/problems satisfy this)
+        ctx.inst("s_ff1_i32_b32", ctx.sreg("s_wg_id_y"),
+                 ctx.sreg("s_tmp0"), comment="log2(numWG_m)")
+        ctx.inst("s_lshr_b32", ctx.sreg("s_wg_id_y"),
+                 ctx.sreg("s_tmp1"), ctx.sreg("s_wg_id_y"),
+                 comment="tile_n = serial >> log2(numWG_m)")  # s3 = tile_n  (s_wg_id_y)
+        # tile_m = serial & (numWG_m - 1)
+        ctx.inst("s_sub_u32", ctx.sreg("s_wg_id_x"),
+                 ctx.sreg("s_tmp0"), "1", comment="numWG_m - 1")
+        ctx.inst("s_and_b32", ctx.sreg("s_wg_id_x"),
                  ctx.sreg("s_tmp1"), ctx.sreg("s_wg_id_x"),
-                 comment="tile_m = wg_serial - tile_n * numWG_m")
-        ctx.raw("")
+                 comment="tile_m = serial & (numWG_m - 1)")
+
+
 
 
 def phase_thread_indexing(level, ctx):

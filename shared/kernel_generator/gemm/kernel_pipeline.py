@@ -236,6 +236,7 @@ class GemmKernel:
             "use_real_scales": getattr(self, 'use_real_scales', False),
             "lds_scale_half": lds_scale_half,
             "lds_data_half": lds_half - lds_scale_half,
+            "use_1d_grid": getattr(self, "use_1d_grid", False),
         }
         if is_dtl:
             alloc_registers_dtl(ctx, self.problem, tile)
