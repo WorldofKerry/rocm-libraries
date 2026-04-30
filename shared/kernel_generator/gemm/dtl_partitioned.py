@@ -76,16 +76,16 @@ def phase_mx_scale_setup(level, ctx):
 
     ctx.comment("=== MX Scale Setup (direct VGPR, no LDS) ===")
 
-    # Load scale kernargs (offsets 36-59)
+    # Load scale kernargs (TensileLite offsets: MXSA@56, MXSB@72, strides@104,120)
     karg = ctx.sreg("s_kernarg")
-    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_scale_a"), karg, "36",
-             comment="scale A ptr")
-    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_scale_b"), karg, "44",
-             comment="scale B ptr")
-    ctx.inst("s_load_dword", ctx.sreg("s_stride_scale_a"), karg, "52",
-             comment="scale A stride")
-    ctx.inst("s_load_dword", ctx.sreg("s_stride_scale_b"), karg, "56",
-             comment="scale B stride")
+    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_scale_a"), karg, "56",
+             comment="scale A ptr (MXSA)")
+    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_scale_b"), karg, "72",
+             comment="scale B ptr (MXSB)")
+    ctx.inst("s_load_dword", ctx.sreg("s_stride_scale_a"), karg, "104",
+             comment="strideMXSA0")
+    ctx.inst("s_load_dword", ctx.sreg("s_stride_scale_b"), karg, "120",
+             comment="strideMXSB0")
     ctx.s_waitcnt("lgkmcnt(0)", comment="wait scale kernargs")
     ctx.raw("")
 

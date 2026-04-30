@@ -139,8 +139,8 @@ def emit_descriptor(ctx: AsmContext, kernel_name: str,
     sgpr_count = ctx._next["s"]
     acc_count = ctx._next["acc"]
     vgpr_count = accum_offset + acc_count
-    # Kernarg size: 36 base + 24 scale args when MX is enabled, rounded up to 64
-    kernarg_size = 64 if not tile.mfma.is_mx else 64
+    # TensileLite-compatible kernarg sizes
+    kernarg_size = 136 if tile.mfma.is_mx else 104
 
     ctx.raw("")
     ctx.raw(".rodata")
@@ -176,22 +176,70 @@ def emit_descriptor(ctx: AsmContext, kernel_name: str,
     ctx.raw(f"    .wavefront_size:  {tile.wave_size}")
     ctx.raw(f"    .max_flat_workgroup_size: {tile.block_size}")
     ctx.raw(f"    .args:")
-    base_args = [(0,8,"global_buffer"), (8,8,"global_buffer"),
-                          (16,8,"global_buffer"), (24,4,"by_value"),
-                          (28,4,"by_value"), (32,4,"by_value")]
+    # TensileLite batched MXFP4 kernarg layout
     if tile.mfma.is_mx:
-        base_args += [
-            (36,8,"global_buffer"),  # ptr_scale_A
-            (44,8,"global_buffer"),  # ptr_scale_B
-            (52,4,"by_value"),       # stride_scale_A
-            (56,4,"by_value"),       # stride_scale_B
+        args = [
+            (0, 4, "by_value", "Gemm info"),
+            (4, 4, "by_value", "kernel info0"),
+            (8, 4, "by_value", "kernel info1"),
+            (12, 4, "by_value", "numWG"),
+            (16, 4, "by_value", "SizesFree0"),
+            (20, 4, "by_value", "SizesFree1"),
+            (24, 4, "by_value", "SizesFree2"),
+            (28, 4, "by_value", "SizesSum0"),
+            (32, 8, "global_buffer", "D"),
+            (40, 8, "global_buffer", "C"),
+            (48, 8, "global_buffer", "A"),
+            (56, 8, "global_buffer", "MXSA"),
+            (64, 8, "global_buffer", "B"),
+            (72, 8, "global_buffer", "MXSB"),
+            (80, 4, "by_value", "strideD0"),
+            (84, 4, "by_value", "strideD1"),
+            (88, 4, "by_value", "strideC0"),
+            (92, 4, "by_value", "strideC1"),
+            (96, 4, "by_value", "strideA0"),
+            (100, 4, "by_value", "strideA1"),
+            (104, 4, "by_value", "strideMXSA0"),
+            (108, 4, "by_value", "strideMXSA1"),
+            (112, 4, "by_value", "strideB0"),
+            (116, 4, "by_value", "strideB1"),
+            (120, 4, "by_value", "strideMXSB0"),
+            (124, 4, "by_value", "strideMXSB1"),
+            (128, 4, "by_value", "alpha"),
+            (132, 4, "by_value", "beta"),
         ]
-    for off, sz, kind in base_args:
-        ctx.raw(f"      - .offset:         {off}")
+    else:
+        args = [
+            (0, 4, "by_value", "Gemm info"),
+            (4, 4, "by_value", "kernel info0"),
+            (8, 4, "by_value", "kernel info1"),
+            (12, 4, "by_value", "numWG"),
+            (16, 4, "by_value", "SizesFree0"),
+            (20, 4, "by_value", "SizesFree1"),
+            (24, 4, "by_value", "SizesFree2"),
+            (28, 4, "by_value", "SizesSum0"),
+            (32, 8, "global_buffer", "D"),
+            (40, 8, "global_buffer", "C"),
+            (48, 8, "global_buffer", "A"),
+            (56, 8, "global_buffer", "B"),
+            (64, 4, "by_value", "strideD0"),
+            (68, 4, "by_value", "strideD1"),
+            (72, 4, "by_value", "strideC0"),
+            (76, 4, "by_value", "strideC1"),
+            (80, 4, "by_value", "strideA0"),
+            (84, 4, "by_value", "strideA1"),
+            (88, 4, "by_value", "strideB0"),
+            (92, 4, "by_value", "strideB1"),
+            (96, 4, "by_value", "alpha"),
+            (100, 4, "by_value", "beta"),
+        ]
+    for off, sz, kind, name in args:
+        ctx.raw(f"      - .name:           {name}")
+        ctx.raw(f"        .offset:         {off}")
         ctx.raw(f"        .size:           {sz}")
         ctx.raw(f"        .value_kind:     {kind}")
         if kind == "global_buffer":
-            ctx.raw(f"        .address_space:  global")
+            ctx.raw(f"        .address_space:  generic")
     ctx.raw("...")
     ctx.raw(".end_amdgpu_metadata")
 

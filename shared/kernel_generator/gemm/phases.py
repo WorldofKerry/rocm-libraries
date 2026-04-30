@@ -55,17 +55,73 @@ def _layouts(ctx) -> GemmLayouts:
 # ===================================================================
 
 def phase_load_kernargs(level, ctx):
-    """Load kernel arguments from the kernarg segment."""
-    ctx.comment("Load kernel arguments")
+    """Load kernel arguments from TensileLite kernarg segment + WG decomposition."""
+    import math as _math
+    tile = ctx._metadata["tile"]
+    mfma = tile.mfma
+    ctx.comment("Load kernel arguments (TensileLite layout)")
     karg = ctx.sreg("s_kernarg")
-    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_A"), karg, "0", comment="A ptr")
-    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_B"), karg, "8", comment="B ptr")
-    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_D"), karg, "16", comment="D ptr")
-    ctx.inst("s_load_dword", ctx.sreg("s_M"), karg, "24", comment="M")
-    ctx.inst("s_load_dword", ctx.sreg("s_N"), karg, "28", comment="N")
-    ctx.inst("s_load_dword", ctx.sreg("s_K"), karg, "32", comment="K")
+    ctx.inst("s_load_dword", ctx.sreg("s_M"), karg, "16", comment="M")
+    ctx.inst("s_load_dword", ctx.sreg("s_N"), karg, "20", comment="N")
+    ctx.inst("s_load_dword", ctx.sreg("s_K"), karg, "28", comment="K")
+    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_D"), karg, "32", comment="D ptr")
+    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_A"), karg, "48", comment="A ptr")
+    b_offset = "64" if getattr(mfma, 'is_mx', False) else "56"
+    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_B"), karg, b_offset,
+             comment="B ptr")
     ctx.s_waitcnt("lgkmcnt(0)", comment="wait for kernarg loads")
     ctx.raw("")
+
+    # 1D WG decomposition (same as dtl_interleaved)
+    if ctx._metadata.get("use_1d_grid", False):
+        ctx.comment("1D WG decomposition")
+        ctx.s_mov(ctx.sreg("s_tmp1"), ctx.sreg("s_wg_id_x"), comment="save wg_serial")
+        ctx.inst("v_mov_b32", ctx.vreg("v_tmp0"), str(tile.wg_m),
+                 comment=f"MT_M = {tile.wg_m}")
+        ctx.inst("v_mov_b32", ctx.vreg("v_tmp1"), ctx.sreg("s_M"), comment="M")
+        ctx.inst("v_cvt_f32_u32", ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"))
+        ctx.inst("v_rcp_iflag_f32", ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"),
+                 comment="1.0 / MT_M")
+        ctx.inst("v_cvt_f32_u32", ctx.vreg("v_tmp1"), ctx.vreg("v_tmp1"))
+        ctx.inst("v_mul_f32", ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"),
+                 ctx.vreg("v_tmp1"), comment="M / MT_M")
+        ctx.inst("v_cvt_u32_f32", ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"),
+                 comment="floor(M / MT_M)")
+        _log2_wgm = _math.log2(tile.wg_m)
+        if _log2_wgm == int(_log2_wgm):
+            ctx.inst("v_lshlrev_b32", ctx.vreg("v_tmp1"),
+                     str(int(_log2_wgm)), ctx.vreg("v_tmp0"),
+                     comment=f"floor << {int(_log2_wgm)}")
+        else:
+            ctx.s_mov(ctx.sreg("s_tmp0"), str(tile.wg_m))
+            ctx.inst("v_mul_lo_u32", ctx.vreg("v_tmp1"), ctx.vreg("v_tmp0"),
+                     ctx.sreg("s_tmp0"), comment=f"floor * {tile.wg_m}")
+        ctx.inst("v_sub_u32", ctx.vreg("v_tmp1"), ctx.sreg("s_M"),
+                 ctx.vreg("v_tmp1"), comment="M - floor*MT_M")
+        ctx.inst("v_cmp_ne_u32", "vcc", ctx.vreg("v_tmp1"), "0",
+                 comment="remainder != 0?")
+        ctx.inst("v_addc_co_u32", ctx.vreg("v_tmp0"), "vcc",
+                 ctx.vreg("v_tmp0"), "0", "vcc", comment="numWG_m = ceil(M/MT_M)")
+        ctx.inst("v_readfirstlane_b32", ctx.sreg("s_tmp0"),
+                 ctx.vreg("v_tmp0"), comment="numWG_m -> SGPR")
+        ctx.inst("v_cvt_f32_u32", ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"))
+        ctx.inst("v_rcp_iflag_f32", ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"),
+                 comment="1.0 / numWG_m")
+        ctx.inst("v_cvt_f32_u32", ctx.vreg("v_tmp1"),
+                 ctx.sreg("s_tmp1"), comment="(float)wg_serial")
+        ctx.inst("v_mul_f32", ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"),
+                 ctx.vreg("v_tmp1"), comment="wg_serial / numWG_m")
+        ctx.inst("v_cvt_u32_f32", ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"),
+                 comment="tile_n = floor(wg_serial / numWG_m)")
+        ctx.inst("v_readfirstlane_b32", ctx.sreg("s_wg_id_y"),
+                 ctx.vreg("v_tmp0"), comment="tile_n -> s_wg_id_y")
+        ctx.inst("s_mul_i32", ctx.sreg("s_wg_id_x"),
+                 ctx.sreg("s_wg_id_y"), ctx.sreg("s_tmp0"),
+                 comment="tile_n * numWG_m")
+        ctx.inst("s_sub_u32", ctx.sreg("s_wg_id_x"),
+                 ctx.sreg("s_tmp1"), ctx.sreg("s_wg_id_x"),
+                 comment="tile_m = wg_serial - tile_n * numWG_m")
+        ctx.raw("")
 
 
 def phase_thread_indexing(level, ctx):
@@ -2164,11 +2220,11 @@ def phase_dtl_setup(level, ctx):
 
     # Load kernel arguments (same as phase_load_kernargs)
     karg = ctx.sreg("s_kernarg")
-    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_A"), karg, "0", comment="A ptr")
-    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_B"), karg, "8", comment="B ptr")
-    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_D"), karg, "16", comment="D ptr")
-    ctx.inst("s_load_dword", ctx.sreg("s_M"), karg, "24", comment="M")
-    ctx.inst("s_load_dword", ctx.sreg("s_N"), karg, "28", comment="N")
+    ctx.inst("s_load_dword", ctx.sreg("s_M"), karg, "16", comment="M")
+    ctx.inst("s_load_dword", ctx.sreg("s_N"), karg, "20", comment="N")
+    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_D"), karg, "32", comment="D ptr")
+    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_A"), karg, "48", comment="A ptr")
+    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_B"), karg, "56", comment="B ptr")
     ctx.inst("s_load_dword", ctx.sreg("s_K"), karg, "32", comment="K")
     ctx.s_waitcnt("lgkmcnt(0)", comment="wait for kernarg loads")
     ctx.raw("")

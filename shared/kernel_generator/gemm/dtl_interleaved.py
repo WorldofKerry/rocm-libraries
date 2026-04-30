@@ -73,16 +73,85 @@ def phase_dtl_interleaved_setup(level, ctx):
 
     ctx.comment("=== DTL Interleaved Setup ===")
 
-    # Kernargs
+    # TensileLite kernarg layout (batched MXFP4, KernArgsVersion >= 1):
+    #   0-15: header (Gemm info, kernel info0/1, numWG) -- ignored
+    #   16: M, 20: N, 24: batch, 28: K
+    #   32: D, 40: C, 48: A, 56: MXSA, 64: B, 72: MXSB
+    #   80+: strides, alpha, beta
     karg = ctx.sreg("s_kernarg")
-    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_A"), karg, "0", comment="A ptr")
-    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_B"), karg, "8", comment="B ptr")
-    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_D"), karg, "16", comment="D ptr")
-    ctx.inst("s_load_dword", ctx.sreg("s_M"), karg, "24", comment="M")
-    ctx.inst("s_load_dword", ctx.sreg("s_N"), karg, "28", comment="N")
-    ctx.inst("s_load_dword", ctx.sreg("s_K"), karg, "32", comment="K")
+    ctx.inst("s_load_dword", ctx.sreg("s_M"), karg, "16", comment="M")
+    ctx.inst("s_load_dword", ctx.sreg("s_N"), karg, "20", comment="N")
+    ctx.inst("s_load_dword", ctx.sreg("s_K"), karg, "28", comment="K")
+    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_D"), karg, "32", comment="D ptr")
+    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_A"), karg, "48", comment="A ptr")
+    # B ptr offset: 64 for MX (MXSA at 56), 56 for non-MX (no MXSA)
+    b_offset = "64" if mfma.is_mx else "56"
+    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_B"), karg, b_offset,
+             comment="B ptr")
     ctx.s_waitcnt("lgkmcnt(0)", comment="wait kernargs")
     ctx.raw("")
+
+    # 1D WG decomposition (KernArgsVersion >= 1: grid flattened to 1D)
+    if ctx._metadata.get("use_1d_grid", False):
+        # Column-major: tile_m = flat % numWG_m, tile_n = flat / numWG_m
+        ctx.comment("1D WG decomposition: flat wg_serial -> (tile_m, tile_n)")
+        ctx.s_mov(ctx.sreg("s_tmp1"), ctx.sreg("s_wg_id_x"),
+                  comment="save wg_serial")
+        # numWG_m = ceil(M / MT_M) via float reciprocal
+        ctx.inst("v_mov_b32", ctx.vreg("v_tmp0"), str(tile.wg_m),
+                 comment=f"MT_M = {tile.wg_m}")
+        ctx.inst("v_mov_b32", ctx.vreg("v_tmp1"), ctx.sreg("s_M"),
+                 comment="M")
+        ctx.inst("v_cvt_f32_u32", ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"))
+        ctx.inst("v_rcp_iflag_f32", ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"),
+                 comment="1.0 / MT_M")
+        ctx.inst("v_cvt_f32_u32", ctx.vreg("v_tmp1"), ctx.vreg("v_tmp1"))
+        ctx.inst("v_mul_f32", ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"),
+                 ctx.vreg("v_tmp1"), comment="M / MT_M")
+        ctx.inst("v_cvt_u32_f32", ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"),
+                 comment="floor(M / MT_M)")
+        # ceil correction: if floor * MT_M < M, add 1
+        # Use shift for power-of-2 tile sizes, otherwise SGPR multiply
+        import math as _math
+        _log2_wgm = _math.log2(tile.wg_m)
+        if _log2_wgm == int(_log2_wgm):
+            ctx.inst("v_lshlrev_b32", ctx.vreg("v_tmp1"),
+                     str(int(_log2_wgm)), ctx.vreg("v_tmp0"),
+                     comment=f"floor << {int(_log2_wgm)} (= floor * {tile.wg_m})")
+        else:
+            ctx.s_mov(ctx.sreg("s_tmp0"), str(tile.wg_m),
+                      comment=f"MT_M = {tile.wg_m}")
+            ctx.inst("v_mul_lo_u32", ctx.vreg("v_tmp1"), ctx.vreg("v_tmp0"),
+                     ctx.sreg("s_tmp0"), comment=f"floor * {tile.wg_m}")
+        ctx.inst("v_sub_u32", ctx.vreg("v_tmp1"), ctx.sreg("s_M"),
+                 ctx.vreg("v_tmp1"), comment="M - floor*MT_M")
+        ctx.inst("v_cmp_ne_u32", "vcc", ctx.vreg("v_tmp1"), "0",
+                 comment="remainder != 0?")
+        ctx.inst("v_addc_co_u32", ctx.vreg("v_tmp0"), "vcc",
+                 ctx.vreg("v_tmp0"), "0", "vcc",
+                 comment="numWG_m = ceil(M / MT_M)")
+        ctx.inst("v_readfirstlane_b32", ctx.sreg("s_tmp0"),
+                 ctx.vreg("v_tmp0"), comment="numWG_m -> SGPR")
+        # tile_n = wg_serial / numWG_m (float reciprocal)
+        ctx.inst("v_cvt_f32_u32", ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"))
+        ctx.inst("v_rcp_iflag_f32", ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"),
+                 comment="1.0 / numWG_m")
+        ctx.inst("v_cvt_f32_u32", ctx.vreg("v_tmp1"),
+                 ctx.sreg("s_tmp1"), comment="(float)wg_serial")
+        ctx.inst("v_mul_f32", ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"),
+                 ctx.vreg("v_tmp1"), comment="wg_serial / numWG_m")
+        ctx.inst("v_cvt_u32_f32", ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"),
+                 comment="tile_n = floor(wg_serial / numWG_m)")
+        ctx.inst("v_readfirstlane_b32", ctx.sreg("s_wg_id_y"),
+                 ctx.vreg("v_tmp0"), comment="tile_n -> s_wg_id_y")
+        # tile_m = wg_serial - tile_n * numWG_m
+        ctx.inst("s_mul_i32", ctx.sreg("s_wg_id_x"),
+                 ctx.sreg("s_wg_id_y"), ctx.sreg("s_tmp0"),
+                 comment="tile_n * numWG_m")
+        ctx.inst("s_sub_u32", ctx.sreg("s_wg_id_x"),
+                 ctx.sreg("s_tmp1"), ctx.sreg("s_wg_id_x"),
+                 comment="tile_m = wg_serial - tile_n * numWG_m")
+        ctx.raw("")
 
     # Thread indexing
     log2_ws = int(math.log2(tile.wave_size))

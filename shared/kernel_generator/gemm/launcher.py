@@ -432,17 +432,13 @@ class GemmLauncher:
     ) -> GemmResult:
         """Launch the generated GEMM assembly kernel on the GPU.
 
-        The kernel expects these arguments packed in kernarg segment:
-          offset  0: A ptr (8 bytes)
-          offset  8: B ptr (8 bytes)
-          offset 16: D ptr (8 bytes)
-          offset 24: M     (4 bytes)
-          offset 28: N     (4 bytes)
-          offset 32: K     (4 bytes)
-        Total kernarg size: 64 bytes (padded).
-
-        Grid: (M / wg_m, N / wg_n) workgroups
-        Block: block_size threads (e.g., 256)
+        TensileLite kernarg layout (KernArgsVersion >= 1):
+          offset  0-15: header (Gemm info, kernel info0/1, numWG)
+          offset 16: M, 20: N, 24: batch, 28: K
+          offset 32: D, 40: C, 48: A, [56: MXSA], 64: B, [72: MXSB]
+          offset 80+: strides, alpha, beta
+        Grid: flattened 1D (total_wgs, 1, 1)
+        Block: block_size threads
         """
         import struct
 
@@ -489,22 +485,24 @@ class GemmLauncher:
                                         kernel_name.encode()),
                "hipModuleGetFunction")
 
-        # Pack kernel arguments into a flat buffer matching the kernarg layout
-        # For MXFP4 (is_mx), layout adds scale pointers/strides at offset 36.
+        # Pack TensileLite kernarg layout (KernArgsVersion >= 1)
         is_mx = hasattr(self.tile, 'mfma') and getattr(self.tile.mfma, 'is_mx', False)
         d_scale_A = ctypes.c_void_p()
         d_scale_B = ctypes.c_void_p()
+        grid_m, grid_n = p.grid_dims(self.tile)
+        total_wgs = grid_m * grid_n
+        block_size = self.tile.block_size
+
         if is_mx:
             mx_block = self.tile.mfma.mx_block
             scale_a_cols = p.k // mx_block
             scale_b_cols = p.k // mx_block
-            scale_a_bytes = p.m * scale_a_cols  # 1 byte per E8M0 scale
+            scale_a_bytes = p.m * scale_a_cols
             scale_b_bytes = p.n * scale_b_cols
             _check(hip.hipMalloc(ctypes.byref(d_scale_A), scale_a_bytes),
                    "hipMalloc scale_A")
             _check(hip.hipMalloc(ctypes.byref(d_scale_B), scale_b_bytes),
                    "hipMalloc scale_B")
-            # Use provided scale data or default to 0x7F (E8M0 = 1.0)
             if self._scale_A is not None:
                 _check(hip.hipMemcpy(d_scale_A, self._scale_A.ctypes.data,
                                      scale_a_bytes, 1), "H2D scale_A")
@@ -517,57 +515,63 @@ class GemmLauncher:
             else:
                 _check(hip.hipMemset(d_scale_B, 0x7F, scale_b_bytes),
                        "memset scale_B=1.0")
-            stride_scale_a = scale_a_cols  # row stride in bytes
-            stride_scale_b = scale_b_cols
-            kernarg = struct.pack("<QQQiiiQQii",
-                                  d_A.value, d_B.value, d_D.value,
-                                  p.m, p.n, p.k,
-                                  d_scale_A.value, d_scale_B.value,
-                                  stride_scale_a, stride_scale_b)
+            # TensileLite MXFP4 kernarg (136 bytes):
+            # header(16) + sizes(16) + ptrs(48) + strides(48) + alpha/beta(8)
+            kernarg = struct.pack(
+                "<IIII"       # header: gemm_info, info0, info1, numWG
+                "IIII"        # sizes: M, N, batch, K
+                "QQ"          # D, C ptrs
+                "QQ"          # A, MXSA ptrs
+                "QQ"          # B, MXSB ptrs
+                "IIIIIIII"    # strides: D0,D1,C0,C1,A0,A1,MXSA0,MXSA1
+                "IIII"        # strides: B0,B1,MXSB0,MXSB1
+                "ff"          # alpha, beta
+                ,
+                0, 0, 0, total_wgs,                           # header
+                p.m, p.n, 1, p.k,                             # sizes (batch=1)
+                d_D.value, d_D.value,                         # D, C (C=D for beta=0)
+                d_A.value, d_scale_A.value,                   # A, MXSA
+                d_B.value, d_scale_B.value,                   # B, MXSB
+                p.m, p.m * p.n, p.m, p.m * p.n,              # strideD0/1, strideC0/1
+                p.k, p.m * p.k, scale_a_cols, p.m * scale_a_cols,  # strideA0/1, MXSA0/1
+                p.k, p.n * p.k, scale_b_cols, p.n * scale_b_cols,  # strideB0/1, MXSB0/1
+                1.0, 0.0,                                     # alpha, beta
+            )
+            kernarg_size = 136
         else:
-            kernarg = struct.pack("<QQQiii",
-                                  d_A.value, d_B.value, d_D.value,
-                                  p.m, p.n, p.k)
-        # Pad to 64 bytes
-        kernarg += b'\x00' * (64 - len(kernarg))
-        kernarg_buf = (ctypes.c_char * 64)(*kernarg)
+            # TensileLite FP16 kernarg (104 bytes)
+            kernarg = struct.pack(
+                "<IIII"       # header
+                "IIII"        # sizes
+                "QQ"          # D, C ptrs
+                "QQ"          # A, B ptrs
+                "IIIIIIII"    # strides: D0,D1,C0,C1,A0,A1,B0,B1
+                "ff"          # alpha, beta
+                ,
+                0, 0, 0, total_wgs,
+                p.m, p.n, 1, p.k,
+                d_D.value, d_D.value,
+                d_A.value, d_B.value,
+                p.n, p.m * p.n, p.n, p.m * p.n,
+                p.k, p.m * p.k, p.k, p.n * p.k,
+                1.0, 0.0,
+            )
+            kernarg_size = 104
+        kernarg_buf = (ctypes.c_char * kernarg_size)(*kernarg)
         kernarg_ptr = ctypes.cast(kernarg_buf, ctypes.c_void_p)
 
-        # Allocate kernarg on device
+        # Use hipExtModuleLaunchKernel with flat kernarg buffer
+        # Build void** args array matching TensileLite kernarg order
+        # hipModuleLaunchKernel with args=void** packs each arg sequentially
+        # We use the flat buffer approach via HIP_LAUNCH_PARAM_BUFFER_POINTER
         d_kernarg = ctypes.c_void_p()
-        _check(hip.hipMalloc(ctypes.byref(d_kernarg), 64), "hipMalloc kernarg")
-        _check(hip.hipMemcpy(d_kernarg, kernarg_ptr, 64, 1), "H2D kernarg")
+        _check(hip.hipMalloc(ctypes.byref(d_kernarg), kernarg_size),
+               "hipMalloc kernarg")
+        _check(hip.hipMemcpy(d_kernarg, kernarg_ptr, kernarg_size, 1),
+               "H2D kernarg")
 
-        # Grid/block dims
-        grid_m, grid_n = p.grid_dims(self.tile)
-        block_size = self.tile.block_size
-
-        # For hipModuleLaunchKernel with kernarg:
-        # We pass NULL for args and use the kernarg segment
-        # Actually, hipModuleLaunchKernel needs args as void** array
-        # But for assembly kernels using kernarg segment, we use
-        # hipExtModuleLaunchKernel or pass args as individual pointers.
-        # Simpler: use the args array approach with each element pointer.
-        _arg_A = d_A
-        _arg_B = d_B
-        _arg_D = d_D
-        _arg_M = ctypes.c_int(p.m)
-        _arg_N = ctypes.c_int(p.n)
-        _arg_K = ctypes.c_int(p.k)
-
-        if is_mx:
-            # Scale args at kernarg offsets 36-59
-            _arg_sA = ctypes.c_void_p(d_scale_A.value)
-            _arg_sB = ctypes.c_void_p(d_scale_B.value)
-            _arg_stride_sA = ctypes.c_int(stride_scale_a)
-            _arg_stride_sB = ctypes.c_int(stride_scale_b)
-            _arg_vals = [_arg_A, _arg_B, _arg_D, _arg_M, _arg_N, _arg_K,
-                         _arg_sA, _arg_sB, _arg_stride_sA, _arg_stride_sB]
-        else:
-            _arg_vals = [_arg_A, _arg_B, _arg_D, _arg_M, _arg_N, _arg_K]
-        args = (ctypes.c_void_p * len(_arg_vals))()
-        for i, v in enumerate(_arg_vals):
-            args[i] = ctypes.cast(ctypes.pointer(v), ctypes.c_void_p)
+        # Flatten grid to 1D (TensileLite KernArgsVersion >= 1)
+        args = None  # will use flat kernarg via hipExtModuleLaunchKernel
 
         # Assembly kernels declare LDS in the kernel descriptor
         # (.amdhsa_group_segment_fixed_size). Passing non-zero sharedMemBytes
@@ -575,11 +579,43 @@ class GemmLauncher:
         # exceeding hardware limits. Always pass 0 for asm kernels.
         lds_size = 0
 
-        # Warmup
+        # Build args array for hipModuleLaunchKernel (void** of pointers to each arg)
+        import struct as _struct
+        _header = [ctypes.c_uint32(0), ctypes.c_uint32(0),
+                   ctypes.c_uint32(0), ctypes.c_uint32(total_wgs)]
+        _sizes = [ctypes.c_uint32(p.m), ctypes.c_uint32(p.n),
+                  ctypes.c_uint32(1), ctypes.c_uint32(p.k)]
+        _ptrs = [ctypes.c_void_p(d_D.value), ctypes.c_void_p(d_D.value)]  # D, C
+        if is_mx:
+            _ptrs += [ctypes.c_void_p(d_A.value), ctypes.c_void_p(d_scale_A.value),
+                      ctypes.c_void_p(d_B.value), ctypes.c_void_p(d_scale_B.value)]
+            _strides = [
+                ctypes.c_uint32(p.m), ctypes.c_uint32(p.m * p.n),       # D
+                ctypes.c_uint32(p.m), ctypes.c_uint32(p.m * p.n),       # C
+                ctypes.c_uint32(p.k), ctypes.c_uint32(p.m * p.k),       # A
+                ctypes.c_uint32(scale_a_cols), ctypes.c_uint32(p.m * scale_a_cols),  # MXSA
+                ctypes.c_uint32(p.k), ctypes.c_uint32(p.n * p.k),       # B
+                ctypes.c_uint32(scale_b_cols), ctypes.c_uint32(p.n * scale_b_cols),  # MXSB
+            ]
+        else:
+            _ptrs += [ctypes.c_void_p(d_A.value), ctypes.c_void_p(d_B.value)]
+            _strides = [
+                ctypes.c_uint32(p.n), ctypes.c_uint32(p.m * p.n),
+                ctypes.c_uint32(p.n), ctypes.c_uint32(p.m * p.n),
+                ctypes.c_uint32(p.k), ctypes.c_uint32(p.m * p.k),
+                ctypes.c_uint32(p.k), ctypes.c_uint32(p.n * p.k),
+            ]
+        _alpha_beta = [ctypes.c_float(1.0), ctypes.c_float(0.0)]
+        _all_args = _header + _sizes + _ptrs + _strides + _alpha_beta
+        args = (ctypes.c_void_p * len(_all_args))()
+        for i, v in enumerate(_all_args):
+            args[i] = ctypes.cast(ctypes.pointer(v), ctypes.c_void_p)
+
+        # Warmup (1D flattened grid)
         for _ in range(num_warmup):
             _check(hip.hipModuleLaunchKernel(
                 func,
-                grid_m, grid_n, 1,
+                total_wgs, 1, 1,
                 block_size, 1, 1,
                 lds_size, None,
                 args, None,
@@ -596,7 +632,7 @@ class GemmLauncher:
         for _ in range(num_iters):
             _check(hip.hipModuleLaunchKernel(
                 func,
-                grid_m, grid_n, 1,
+                total_wgs, 1, 1,
                 block_size, 1, 1,
                 lds_size, None,
                 args, None,

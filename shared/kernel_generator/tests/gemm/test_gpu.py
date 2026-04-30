@@ -14,6 +14,37 @@ from kernel_generator.gemm.kernel_pipeline import GemmKernel
 from kernel_generator.gemm.problem import GemmProblem, TileConfig, MfmaConfig
 
 
+
+def _build_tl_args(d_A, d_B, d_D, M, N, K, grid_m, grid_n):
+    """Build TensileLite-compatible kernarg as void** array for non-MX FP16.
+
+    Layout: header(16B) + sizes(16B) + ptrs(D,C,A,B) + strides + alpha/beta.
+    Uses 2D grid (no WG decomposition needed).
+    """
+    total_wgs = grid_m * grid_n
+    vals = [
+        # Header (16 bytes, ignored by kernel)
+        ctypes.c_uint32(0), ctypes.c_uint32(0),
+        ctypes.c_uint32(0), ctypes.c_uint32(total_wgs),
+        # Sizes: M, N, batch=1, K
+        ctypes.c_uint32(M), ctypes.c_uint32(N),
+        ctypes.c_uint32(1), ctypes.c_uint32(K),
+        # Pointers: D, C(=D), A, B
+        ctypes.c_void_p(d_D.value), ctypes.c_void_p(d_D.value),
+        ctypes.c_void_p(d_A.value), ctypes.c_void_p(d_B.value),
+        # Strides: D0,D1, C0,C1, A0,A1, B0,B1
+        ctypes.c_uint32(N), ctypes.c_uint32(M * N),
+        ctypes.c_uint32(N), ctypes.c_uint32(M * N),
+        ctypes.c_uint32(K), ctypes.c_uint32(M * K),
+        ctypes.c_uint32(K), ctypes.c_uint32(N * K),
+        # alpha=1.0, beta=0.0
+        ctypes.c_float(1.0), ctypes.c_float(0.0),
+    ]
+    args = (ctypes.c_void_p * len(vals))()
+    for i, v in enumerate(vals):
+        args[i] = ctypes.cast(ctypes.pointer(v), ctypes.c_void_p)
+    return vals, args  # return vals to keep references alive
+
 # --- HIP runtime helpers ---
 
 def _load_hip():
@@ -91,15 +122,9 @@ def _run_gemm(M, N, K, tile=None):
     func = ctypes.c_void_p()
     hip.hipModuleGetFunction(ctypes.byref(func), module, b"gemm_kernel")
 
-    _a = [ctypes.c_void_p(d_A.value), ctypes.c_void_p(d_B.value),
-          ctypes.c_void_p(d_D.value),
-          ctypes.c_int(M), ctypes.c_int(N), ctypes.c_int(K)]
-    args = (ctypes.c_void_p * len(_a))()
-    for i, v in enumerate(_a):
-        args[i] = ctypes.cast(ctypes.pointer(v), ctypes.c_void_p)
-
     lds = (tile_cfg.wg_m + tile_cfg.wg_n) * tile_cfg.unroll_k * elem
     gm, gn = M // tile_cfg.wg_m, N // tile_cfg.wg_n
+    _vals, args = _build_tl_args(d_A, d_B, d_D, M, N, K, gm, gn)
 
     ret = hip.hipModuleLaunchKernel(
         func, gm, gn, 1, tile_cfg.block_size, 1, 1, lds, None, args, None)
@@ -168,15 +193,11 @@ class TestGPUCorrectness:
         hip.hipModuleLoad(ctypes.byref(module), co.encode())
         func = ctypes.c_void_p()
         hip.hipModuleGetFunction(ctypes.byref(func), module, b"gemm_kernel")
-        _a = [ctypes.c_void_p(d_A.value), ctypes.c_void_p(d_B.value),
-              ctypes.c_void_p(d_D.value),
-              ctypes.c_int(M), ctypes.c_int(N), ctypes.c_int(K)]
-        args = (ctypes.c_void_p * len(_a))()
-        for i, v in enumerate(_a):
-            args[i] = ctypes.cast(ctypes.pointer(v), ctypes.c_void_p)
         lds = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
+        gm, gn = M // tile.wg_m, N // tile.wg_n
+        _vals, args = _build_tl_args(d_A, d_B, d_D, M, N, K, gm, gn)
         hip.hipModuleLaunchKernel(
-            func, 1, 1, 1, tile.block_size, 1, 1, lds, None, args, None)
+            func, gm, gn, 1, tile.block_size, 1, 1, lds, None, args, None)
         hip.hipDeviceSynchronize()
 
         D = np.zeros((M, N), dtype=np.float16)
@@ -213,15 +234,11 @@ class TestGPUCorrectness:
         hip.hipModuleLoad(ctypes.byref(module), co.encode())
         func = ctypes.c_void_p()
         hip.hipModuleGetFunction(ctypes.byref(func), module, b"gemm_kernel")
-        _a = [ctypes.c_void_p(d_A.value), ctypes.c_void_p(d_B.value),
-              ctypes.c_void_p(d_D.value),
-              ctypes.c_int(M), ctypes.c_int(N), ctypes.c_int(K)]
-        args = (ctypes.c_void_p * len(_a))()
-        for i, v in enumerate(_a):
-            args[i] = ctypes.cast(ctypes.pointer(v), ctypes.c_void_p)
         lds = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
+        gm, gn = M // tile.wg_m, N // tile.wg_n
+        _vals, args = _build_tl_args(d_A, d_B, d_D, M, N, K, gm, gn)
         hip.hipModuleLaunchKernel(
-            func, 1, 1, 1, tile.block_size, 1, 1, lds, None, args, None)
+            func, gm, gn, 1, tile.block_size, 1, 1, lds, None, args, None)
         hip.hipDeviceSynchronize()
 
         D = np.zeros((M, N), dtype=np.float16)
@@ -257,14 +274,9 @@ class TestGPUPerformance:
         hip.hipModuleLoad(ctypes.byref(module), co.encode())
         func = ctypes.c_void_p()
         hip.hipModuleGetFunction(ctypes.byref(func), module, b"gemm_kernel")
-        _a = [ctypes.c_void_p(d_A.value), ctypes.c_void_p(d_B.value),
-              ctypes.c_void_p(d_D.value),
-              ctypes.c_int(M), ctypes.c_int(N), ctypes.c_int(K)]
-        args = (ctypes.c_void_p * len(_a))()
-        for i, v in enumerate(_a):
-            args[i] = ctypes.cast(ctypes.pointer(v), ctypes.c_void_p)
         lds = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
         gm, gn = M // tile.wg_m, N // tile.wg_n
+        _vals, args = _build_tl_args(d_A, d_B, d_D, M, N, K, gm, gn)
 
         # Warmup
         for _ in range(3):
@@ -328,15 +340,9 @@ class TestPipelinedKernel:
         func = ctypes.c_void_p()
         hip.hipModuleGetFunction(ctypes.byref(func), module, b"gemm_kernel")
 
-        _a = [ctypes.c_void_p(d_A.value), ctypes.c_void_p(d_B.value),
-              ctypes.c_void_p(d_D.value),
-              ctypes.c_int(M), ctypes.c_int(N), ctypes.c_int(K)]
-        args = (ctypes.c_void_p * len(_a))()
-        for i, v in enumerate(_a):
-            args[i] = ctypes.cast(ctypes.pointer(v), ctypes.c_void_p)
-
         lds = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
         gm, gn = M // tile.wg_m, N // tile.wg_n
+        _vals, args = _build_tl_args(d_A, d_B, d_D, M, N, K, gm, gn)
         ret = hip.hipModuleLaunchKernel(
             func, gm, gn, 1, tile.block_size, 1, 1, lds, None, args, None)
         assert ret == 0, f"Launch failed: {ret}"
@@ -372,12 +378,9 @@ class TestPipelinedKernel:
             hip.hipModuleLoad(ctypes.byref(module), co.encode())
             func = ctypes.c_void_p()
             hip.hipModuleGetFunction(ctypes.byref(func), module, b"gemm_kernel")
-            _a = [ctypes.c_void_p(d_A.value),ctypes.c_void_p(d_B.value),
-                  ctypes.c_void_p(d_D.value),ctypes.c_int(M),ctypes.c_int(N),ctypes.c_int(K)]
-            args = (ctypes.c_void_p*len(_a))()
-            for i,v in enumerate(_a): args[i] = ctypes.cast(ctypes.pointer(v), ctypes.c_void_p)
             lds = (tile.wg_m+tile.wg_n)*tile.unroll_k*elem
             gm, gn = M//tile.wg_m, N//tile.wg_n
+            _vals, args = _build_tl_args(d_A, d_B, d_D, M, N, K, gm, gn)
             for _ in range(3):
                 hip.hipModuleLaunchKernel(func, gm, gn, 1, tile.block_size, 1, 1, lds, None, args, None)
             hip.hipDeviceSynchronize()
@@ -437,14 +440,8 @@ def _run_variant(M, N, K, **build_kwargs):
         hip.hipModuleGetFunction(ctypes.byref(func), module,
                                   result.kernel_name.encode())
 
-        _a = [ctypes.c_void_p(d_A.value), ctypes.c_void_p(d_B.value),
-              ctypes.c_void_p(d_D.value),
-              ctypes.c_int(M), ctypes.c_int(N), ctypes.c_int(K)]
-        args = (ctypes.c_void_p * len(_a))()
-        for i, v in enumerate(_a):
-            args[i] = ctypes.cast(ctypes.pointer(v), ctypes.c_void_p)
-
         gm, gn = problem.grid_dims(tile)
+        _vals, args = _build_tl_args(d_A, d_B, d_D, M, N, K, gm, gn)
         ret = hip.hipModuleLaunchKernel(
             func, gm, gn, 1, tile.block_size, 1, 1, 0, None, args, None)
         assert ret == 0, f"Launch failed: {ret}"
