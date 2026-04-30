@@ -521,6 +521,7 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     ctx.raw("")
 
     ctx.label("dtl_skip_all")
+    ctx.s_barrier(comment="sync DTL writes before preamble reads")
     ctx.raw("")
 
     # Preamble: scale reads + B + A[m0]
