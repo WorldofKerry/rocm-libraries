@@ -54,29 +54,16 @@ def _scale_region_bytes(tile, dim_size):
     return dim_size * (tile.unroll_k // mx_block)
 
 
-def _emit_dtl_loads_scale(ctx, tile, srd_name, lds_wr_sg_name,
-                          dtl_off_name, dim_size):
-    """Issue one buffer_load_dword DTL load for a scale tensor.
-
-    Scale tile for one half-buffer:
-      dim_size * (unroll_k / mx_block) bytes (e.g. 128*8 = 1024 bytes).
-
-    With 256 threads * 4 bytes/thread = 1024 bytes, exactly one
-    buffer_load_dword instruction fills the scale LDS region.
-    """
-    ctx.inst("s_mov_b32", "m0", ctx.sreg(lds_wr_sg_name),
-             comment=f"m0 = LDS base {srd_name}")
-    ctx.inst("buffer_load_dword",
-             ctx.vreg(dtl_off_name), ctx.sreg(srd_name, 0, 4),
-             "0", "offen offset:0, lds",
-             comment=f"DTL scale {srd_name}")
-
-
 def phase_mx_scale_setup(level, ctx):
-    """Set up scale SRDs, DTL offsets, and LDS read addresses.
+    """Set up scale SRDs for direct VGPR loading (no LDS).
 
-    Runs after phase_dtl_interleaved_setup which already loaded the
-    base kernargs (ptrs, M, N, K) and set up data SRDs.
+    Scale data is small enough to load directly from global memory
+    into VGPRs, bypassing LDS entirely. This keeps the full 64KB LDS
+    budget for data A/B.
+
+    Each MFMA tile needs 4 scale bytes (one per K-block of 32 elements).
+    The scale is per-MFMA-tile (shared across all lanes), loaded via
+    buffer_load_dword into a VGPR, then broadcast.
     """
     tile = ctx._metadata["tile"]
     mfma = tile.mfma
@@ -85,9 +72,9 @@ def phase_mx_scale_setup(level, ctx):
         return
 
     mx_block = mfma.mx_block
-    scale_k_cols = tile.unroll_k // mx_block  # scale columns per unroll (8)
+    scale_k_cols = tile.unroll_k // mx_block
 
-    ctx.comment("=== MX Scale Setup (Phase 2) ===")
+    ctx.comment("=== MX Scale Setup (direct VGPR, no LDS) ===")
 
     # Load scale kernargs (offsets 36-59)
     karg = ctx.sreg("s_kernarg")
@@ -100,43 +87,6 @@ def phase_mx_scale_setup(level, ctx):
     ctx.inst("s_load_dword", ctx.sreg("s_stride_scale_b"), karg, "56",
              comment="scale B stride")
     ctx.s_waitcnt("lgkmcnt(0)", comment="wait scale kernargs")
-    ctx.raw("")
-
-    # Scale DTL per-thread offset
-    # Scale tile: [dim_size, scale_k_cols] row-major, 1 byte per element
-    # Using buffer_load_dword (4 bytes/thread), 256 threads * 4 = 1024 bytes
-    scale_threads_per_row = scale_k_cols // 4  # 8/4 = 2
-    log2_stpr = int(math.log2(scale_threads_per_row)) if scale_threads_per_row > 1 else 0
-    ctx.comment(f"Scale DTL offset: {scale_threads_per_row} threads/row, "
-                f"{scale_k_cols} cols")
-    if scale_threads_per_row > 1:
-        ctx.v_lshr(ctx.vreg("v_tmp0"), ctx.vreg("v_tid"), log2_stpr,
-                   comment="scale_thread_row = tid >> log2(tpr)")
-        ctx.v_and(ctx.vreg("v_tmp1"), ctx.vreg("v_tid"),
-                  scale_threads_per_row - 1,
-                  comment="scale_thread_col_grp")
-    else:
-        ctx.v_mov(ctx.vreg("v_tmp0"), ctx.vreg("v_tid"),
-                  comment="scale_thread_row = tid")
-        ctx.v_mov(ctx.vreg("v_tmp1"), "0", comment="scale_thread_col_grp = 0")
-    ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_tmp1"), 2,
-               comment="* 4 -> col_bytes")
-
-    # Scale A DTL voffset = thread_row * stride_scale_a + col_bytes
-    ctx.inst("v_mul_lo_u32", ctx.vreg("v_dtl_off_scale_a"),
-             ctx.sreg("s_stride_scale_a"), ctx.vreg("v_tmp0"),
-             comment="row * stride_scale_a")
-    ctx.v_add(ctx.vreg("v_dtl_off_scale_a"),
-              ctx.vreg("v_dtl_off_scale_a"), ctx.vreg("v_tmp1"),
-              comment="+ col_bytes")
-
-    # Scale B DTL voffset = thread_row * stride_scale_b + col_bytes
-    ctx.inst("v_mul_lo_u32", ctx.vreg("v_dtl_off_scale_b"),
-             ctx.sreg("s_stride_scale_b"), ctx.vreg("v_tmp0"),
-             comment="row * stride_scale_b")
-    ctx.v_add(ctx.vreg("v_dtl_off_scale_b"),
-              ctx.vreg("v_dtl_off_scale_b"), ctx.vreg("v_tmp1"),
-              comment="+ col_bytes")
     ctx.raw("")
 
     # Scale SRD A: base = ptr_scale_a + wg_id_x * wg_m * stride_scale_a
@@ -175,52 +125,25 @@ def phase_mx_scale_setup(level, ctx):
              "0x20000", comment="flags")
     ctx.raw("")
 
-    # Scale LDS write bases (offset into LDS for scale regions)
-    scale_a_lds_off = _scale_lds_offset_a(tile)
-    scale_b_lds_off = _scale_lds_offset_b(tile)
-    ctx.comment("Scale LDS write bases")
-    ctx.s_mov(ctx.sreg("s_lds_wr_scale_a_sg"), str(scale_a_lds_off),
-              comment=f"scale A LDS base = {scale_a_lds_off}")
-    ctx.s_mov(ctx.sreg("s_lds_wr_scale_b_sg"), str(scale_b_lds_off),
-              comment=f"scale B LDS base = {scale_b_lds_off}")
+    # Scale voffsets: wave-level base (scale is per-MFMA-tile, same for all lanes)
+    # voffset = wave_m * m_per_wave * stride_scale_a (A) or wave_n * n_per_wave * stride_scale_b (B)
+    # The per-mi/ni offset is added via the instruction's offset: field
+    ctx.comment("Scale A wave-level voffset")
+    ctx.inst("v_mul_lo_u32", ctx.vreg("v_tmp0"),
+             str(tile.m_per_wave), ctx.vreg("v_wave_m"),
+             comment=f"wave_m * {tile.m_per_wave}")
+    ctx.inst("v_mul_lo_u32", ctx.vreg("v_dtl_off_scale_a"),
+             ctx.sreg("s_stride_scale_a"), ctx.vreg("v_tmp0"),
+             comment="wave_m_base * stride_scale_a -> voffset_scale_a")
     ctx.raw("")
 
-    # Scale LDS read address per lane
-    # Scale in LDS: [dim, scale_k_cols] row-major, 1 byte per element
-    # Lane L reads row = wave_m + L%16, col = L/16 (for A)
-    # v_lds_rd_scale_a = scale_a_lds_off + (wave_m_start + L%16) * scale_k_cols
-    ctx.comment("Scale LDS read addresses")
-    # lane_row = lane_id % 16
-    ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), 15,
-              comment="lane_row = lane_id % 16")
-    # A: base_row = wave_m * m_per_wave + lane_row
-    ctx.v_mul(ctx.vreg("v_lds_rd_scale_a"), str(tile.m_per_wave),
-              ctx.vreg("v_wave_m"),
-              comment=f"wave_m * {tile.m_per_wave}")
-    ctx.v_add(ctx.vreg("v_lds_rd_scale_a"),
-              ctx.vreg("v_lds_rd_scale_a"), ctx.vreg("v_tmp0"),
-              comment="+ lane_row")
-    ctx.v_mul(ctx.vreg("v_lds_rd_scale_a"), str(scale_k_cols),
-              ctx.vreg("v_lds_rd_scale_a"),
-              comment=f"* {scale_k_cols} (bytes/row)")
-    ctx.v_add(ctx.vreg("v_lds_rd_scale_a"),
-              str(scale_a_lds_off), ctx.vreg("v_lds_rd_scale_a"),
-              comment=f"+ scale_a_lds_base ({scale_a_lds_off})")
-    ctx.raw("")
-
-    # B: base_row = wave_n * n_per_wave + lane_row
-    ctx.v_mul(ctx.vreg("v_lds_rd_scale_b"), str(tile.n_per_wave),
-              ctx.vreg("v_wave_n"),
-              comment=f"wave_n * {tile.n_per_wave}")
-    ctx.v_add(ctx.vreg("v_lds_rd_scale_b"),
-              ctx.vreg("v_lds_rd_scale_b"), ctx.vreg("v_tmp0"),
-              comment="+ lane_row")
-    ctx.v_mul(ctx.vreg("v_lds_rd_scale_b"), str(scale_k_cols),
-              ctx.vreg("v_lds_rd_scale_b"),
-              comment=f"* {scale_k_cols} (bytes/row)")
-    ctx.v_add(ctx.vreg("v_lds_rd_scale_b"),
-              str(scale_b_lds_off), ctx.vreg("v_lds_rd_scale_b"),
-              comment=f"+ scale_b_lds_base ({scale_b_lds_off})")
+    ctx.comment("Scale B wave-level voffset")
+    ctx.inst("v_mul_lo_u32", ctx.vreg("v_tmp0"),
+             str(tile.n_per_wave), ctx.vreg("v_wave_n"),
+             comment=f"wave_n * {tile.n_per_wave}")
+    ctx.inst("v_mul_lo_u32", ctx.vreg("v_dtl_off_scale_b"),
+             ctx.sreg("s_stride_scale_b"), ctx.vreg("v_tmp0"),
+             comment="wave_n_base * stride_scale_b -> voffset_scale_b")
     ctx.raw("")
 
 
@@ -280,24 +203,23 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                 ctx.alloc_vgpr_permanent(av, name)
             a_names[(buf, ki)] = name
 
-    # Scale VGPRs: one per (mi, ki) for A and per (ni, ki) for B
-    # Each holds 4 bytes = 4 E8M0 K-block scales for one MFMA invocation
-    # Loaded via ds_read_b32 (4 bytes per lane = all K-block scales per row)
+    # Scale VGPRs: one per mi (A) and per ni (B), loaded directly from global memory
+    # Each VGPR holds 4 bytes = 4 K-block scales (one per 32 K-elements)
     scale_a_names = {}
     scale_b_names = {}
     if use_real_scales:
         for mi in range(mr):
+            name = f"v_scale_a_m{mi}"
+            if not ctx.has(name):
+                ctx.alloc_vgpr_permanent(1, name)
             for ki in range(ki_count):
-                name = f"v_scale_a_m{mi}k{ki}"
-                if not ctx.has(name):
-                    ctx.alloc_vgpr_permanent(1, name)
-                scale_a_names[(mi, ki)] = name
+                scale_a_names[(mi, ki)] = name  # same VGPR for all ki
         for ni in range(nr):
+            name = f"v_scale_b_n{ni}"
+            if not ctx.has(name):
+                ctx.alloc_vgpr_permanent(1, name)
             for ki in range(ki_count):
-                name = f"v_scale_b_n{ni}k{ki}"
-                if not ctx.has(name):
-                    ctx.alloc_vgpr_permanent(1, name)
-                scale_b_names[(ni, ki)] = name
+                scale_b_names[(ni, ki)] = name  # same VGPR for all ki
 
     # ---- K-loop setup ----
     ctx.comment("=== DTL Partitioned K-loop ===")
@@ -312,12 +234,47 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     _emit_dtl_loads_a(ctx, tile, problem, num_loads_a)
     _emit_dtl_loads_b(ctx, tile, problem, num_loads_b)
     if use_real_scales:
-        _emit_dtl_loads_scale(ctx, tile, "s_srd_scale_a",
-                              "s_lds_wr_scale_a_sg", "v_dtl_off_scale_a",
-                              tile.wg_m)
-        _emit_dtl_loads_scale(ctx, tile, "s_srd_scale_b",
-                              "s_lds_wr_scale_b_sg", "v_dtl_off_scale_b",
-                              tile.wg_n)
+        # Direct VGPR scale loads (global -> VGPR, no LDS)
+        ctx.comment("Load scales A (direct VGPR)")
+        for mi_ in range(mr):
+            # mi offset = mi * mfma.m * stride_scale_a (runtime SGPR)
+            if mi_ == 0:
+                ctx.inst("buffer_load_dword",
+                         ctx.vreg(f"v_scale_a_m{mi_}"),
+                         ctx.vreg("v_dtl_off_scale_a"),
+                         ctx.sreg("s_srd_scale_a", 0, 4),
+                         "0", "offen",
+                         comment=f"scale A mi={mi_}")
+            else:
+                ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_stride_scale_a"),
+                          str(mi_ * mfma.m),
+                          comment=f"mi={mi_} * {mfma.m} * stride_scale_a")
+                ctx.inst("buffer_load_dword",
+                         ctx.vreg(f"v_scale_a_m{mi_}"),
+                         ctx.vreg("v_dtl_off_scale_a"),
+                         ctx.sreg("s_srd_scale_a", 0, 4),
+                         ctx.sreg("s_tmp0"), "offen",
+                         comment=f"scale A mi={mi_}")
+        ctx.comment("Load scales B (direct VGPR)")
+        for ni_ in range(nr):
+            if ni_ == 0:
+                ctx.inst("buffer_load_dword",
+                         ctx.vreg(f"v_scale_b_n{ni_}"),
+                         ctx.vreg("v_dtl_off_scale_b"),
+                         ctx.sreg("s_srd_scale_b", 0, 4),
+                         "0", "offen",
+                         comment=f"scale B ni={ni_}")
+            else:
+                ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_stride_scale_b"),
+                          str(ni_ * mfma.n),
+                          comment=f"ni={ni_} * {mfma.n} * stride_scale_b")
+                ctx.inst("buffer_load_dword",
+                         ctx.vreg(f"v_scale_b_n{ni_}"),
+                         ctx.vreg("v_dtl_off_scale_b"),
+                         ctx.sreg("s_srd_scale_b", 0, 4),
+                         ctx.sreg("s_tmp0"), "offen",
+                         comment=f"scale B ni={ni_}")
+        ctx.s_waitcnt("vmcnt(0)", comment="wait scale VGPR loads")
     ctx.s_waitcnt("vmcnt(0)", comment="wait DTL")
     ctx.s_barrier(comment="sync")
     ctx.raw("")
@@ -515,23 +472,52 @@ def phase_dtl_partitioned_k_loop(level, ctx):
              comment="wr_b += db")
 
     # Toggle scale LDS write bases
-    if use_real_scales:
-        ctx.inst("s_add_u32", ctx.sreg("s_lds_wr_scale_a_sg"),
-                 ctx.sreg("s_lds_wr_scale_a_sg"), ctx.sreg("s_lds_db_step"),
-                 comment="wr_scale_a += db")
-        ctx.inst("s_add_u32", ctx.sreg("s_lds_wr_scale_b_sg"),
-                 ctx.sreg("s_lds_wr_scale_b_sg"), ctx.sreg("s_lds_db_step"),
-                 comment="wr_scale_b += db")
+
 
     _emit_dtl_loads_a(ctx, tile, problem, num_loads_a)
     _emit_dtl_loads_b(ctx, tile, problem, num_loads_b)
     if use_real_scales:
-        _emit_dtl_loads_scale(ctx, tile, "s_srd_scale_a",
-                              "s_lds_wr_scale_a_sg", "v_dtl_off_scale_a",
-                              tile.wg_m)
-        _emit_dtl_loads_scale(ctx, tile, "s_srd_scale_b",
-                              "s_lds_wr_scale_b_sg", "v_dtl_off_scale_b",
-                              tile.wg_n)
+        # Direct VGPR scale loads (global -> VGPR, no LDS)
+        ctx.comment("Load scales A (direct VGPR)")
+        for mi_ in range(mr):
+            # mi offset = mi * mfma.m * stride_scale_a (runtime SGPR)
+            if mi_ == 0:
+                ctx.inst("buffer_load_dword",
+                         ctx.vreg(f"v_scale_a_m{mi_}"),
+                         ctx.vreg("v_dtl_off_scale_a"),
+                         ctx.sreg("s_srd_scale_a", 0, 4),
+                         "0", "offen",
+                         comment=f"scale A mi={mi_}")
+            else:
+                ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_stride_scale_a"),
+                          str(mi_ * mfma.m),
+                          comment=f"mi={mi_} * {mfma.m} * stride_scale_a")
+                ctx.inst("buffer_load_dword",
+                         ctx.vreg(f"v_scale_a_m{mi_}"),
+                         ctx.vreg("v_dtl_off_scale_a"),
+                         ctx.sreg("s_srd_scale_a", 0, 4),
+                         ctx.sreg("s_tmp0"), "offen",
+                         comment=f"scale A mi={mi_}")
+        ctx.comment("Load scales B (direct VGPR)")
+        for ni_ in range(nr):
+            if ni_ == 0:
+                ctx.inst("buffer_load_dword",
+                         ctx.vreg(f"v_scale_b_n{ni_}"),
+                         ctx.vreg("v_dtl_off_scale_b"),
+                         ctx.sreg("s_srd_scale_b", 0, 4),
+                         "0", "offen",
+                         comment=f"scale B ni={ni_}")
+            else:
+                ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_stride_scale_b"),
+                          str(ni_ * mfma.n),
+                          comment=f"ni={ni_} * {mfma.n} * stride_scale_b")
+                ctx.inst("buffer_load_dword",
+                         ctx.vreg(f"v_scale_b_n{ni_}"),
+                         ctx.vreg("v_dtl_off_scale_b"),
+                         ctx.sreg("s_srd_scale_b", 0, 4),
+                         ctx.sreg("s_tmp0"), "offen",
+                         comment=f"scale B ni={ni_}")
+        ctx.s_waitcnt("vmcnt(0)", comment="wait scale VGPR loads")
     ctx.raw("")
 
     ctx.label("dtl_skip_all")
@@ -540,35 +526,6 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     # Preamble: scale reads + B + A[m0]
     ctx.comment("Preamble: scales + B + A[m0]")
 
-    # Load all scale VGPRs from LDS (ds_read_b32, 4 bytes = all K-block scales)
-    if use_real_scales:
-        ctx.comment("Scale LDS reads (A + B)")
-        for mi in range(mr):
-            for ki in range(ki_count):
-                off = _scale_rd_off_a(mi, ki)
-                if off:
-                    ctx.inst("ds_read_b32", ctx.vreg(scale_a_names[(mi, ki)]),
-                             ctx.vreg("v_lds_rd_scale_a"),
-                             f"offset:{off}",
-                             comment=f"scale A m{mi}k{ki}")
-                else:
-                    ctx.inst("ds_read_b32", ctx.vreg(scale_a_names[(mi, ki)]),
-                             ctx.vreg("v_lds_rd_scale_a"),
-                             comment=f"scale A m{mi}k{ki}")
-        for ni in range(nr):
-            for ki in range(ki_count):
-                off = _scale_rd_off_b(ni, ki)
-                if off:
-                    ctx.inst("ds_read_b32", ctx.vreg(scale_b_names[(ni, ki)]),
-                             ctx.vreg("v_lds_rd_scale_b"),
-                             f"offset:{off}",
-                             comment=f"scale B n{ni}k{ki}")
-                else:
-                    ctx.inst("ds_read_b32", ctx.vreg(scale_b_names[(ni, ki)]),
-                             ctx.vreg("v_lds_rd_scale_b"),
-                             comment=f"scale B n{ni}k{ki}")
-        ctx.s_waitcnt("lgkmcnt(0)", comment="wait scale LDS reads")
-        ctx.raw("")
 
     for ni in range(nr):
         ctx.ds_read(ctx.vreg(b_names[(ni, 0)], 0, bv),

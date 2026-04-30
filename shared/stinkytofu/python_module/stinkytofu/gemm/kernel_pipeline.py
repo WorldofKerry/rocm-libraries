@@ -219,16 +219,8 @@ class GemmKernel:
         else:
             lds_half = int((tile.wg_m + tile.wg_n) * lds_row_stride * elem)
 
-        # MX scale regions appended after data regions (per half-buffer)
+        # No scale LDS regions needed -- scales loaded directly to VGPRs
         lds_scale_half = 0
-        use_real_scales = getattr(self, 'use_real_scales', False)
-        if use_real_scales and tile.mfma.is_mx and tile.mfma.mx_block > 0:
-            mx_block = tile.mfma.mx_block
-            # 1 byte per scale element (E8M0), one scale per mx_block data elements
-            scale_a_bytes = tile.wg_m * (tile.unroll_k // mx_block) * 1
-            scale_b_bytes = tile.wg_n * (tile.unroll_k // mx_block) * 1
-            lds_scale_half = scale_a_bytes + scale_b_bytes
-            lds_half += lds_scale_half
 
         # Double LDS for double-buffered mode
         is_db = any(p.name in ("optimized_k_loop", "scheduled_k_loop", "fully_interleaved_k_loop", "pgr2_k_loop", "dtl_k_loop", "interleaved_large_k_loop", "auto_scheduled_k_loop", "pgr2_interleaved_k_loop", "dtl_interleaved_k_loop", "dtl_scheduled_k_loop", "dtl_partitioned_k_loop")
