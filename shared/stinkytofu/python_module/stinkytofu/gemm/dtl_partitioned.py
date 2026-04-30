@@ -454,8 +454,11 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     for mi, path in enumerate(lr_paths):
         mi_start_slot = mi * mfmas_per_mi * 2
         mi_end_slot = (mi + 1) * mfmas_per_mi * 2
-        slot_a = mi_start_slot + 4
-        slot_b = mi_start_slot + 20
+        range_size = mi_end_slot - mi_start_slot
+        # Place ki=0 read early, ki=1 read later (both within mi's range).
+        # Clamp slot_b so it doesn't exceed the range (fixes 4x4 tile configs).
+        slot_a = mi_start_slot + min(4, range_size - 2)
+        slot_b = mi_start_slot + min(20, range_size - 2)
         for i, op in enumerate(path.ops):
             target = slot_a if i == 0 else slot_b
             placed = False

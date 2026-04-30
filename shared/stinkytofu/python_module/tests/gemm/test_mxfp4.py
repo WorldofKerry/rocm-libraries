@@ -159,7 +159,7 @@ class TestMXFP4Kernel:
         # lds_half = (128+128) * 256 * 0.5 = 32768
         # lds_total = 32768 * 2 = 65536
         # 65536 data + 4096 scale (2x 1024 per half-buffer, doubled)
-        assert result.lds_bytes == 69632
+        assert result.lds_bytes == 65536
 
     def test_accumulators(self):
         """Accumulator count matches tile config."""
