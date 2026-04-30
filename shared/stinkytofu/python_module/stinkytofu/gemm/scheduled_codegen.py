@@ -377,7 +377,7 @@ def emit_scheduled_kernel(
                 # Emit MFMA
                 acc_off = (mi * nr + ni) * acc_per
                 ctx.inst(
-                    f"v_mfma_f32_{mfma.m}x{mfma.n}x{mfma.k}_f16",
+                    mfma.instruction_name,
                     ctx.areg("acc_C", acc_off, acc_per),
                     ctx.vreg(a_reg_map[(cur_a, ki)], 0, av),
                     ctx.vreg(b_reg_map[(ni, ki)], 0, bv),

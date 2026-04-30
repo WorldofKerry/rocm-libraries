@@ -400,3 +400,181 @@ class TestPipelinedKernel:
 
         assert pipe_tflops > base_tflops * 0.8, \
             f"Pipelined ({pipe_tflops:.1f}) should not regress vs baseline ({base_tflops:.1f})"
+
+
+# --- Variant kernel tests ---
+
+def _run_variant(M, N, K, **build_kwargs):
+    """Generate, assemble, launch a kernel variant, return (D_gpu, D_ref)."""
+    hip = HIP
+    problem = GemmProblem(m=M, n=N, k=K)
+    kernel = GemmKernel.build(problem, **build_kwargs)
+    result = kernel.emit()
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as tmpdir:
+        co_path = os.path.join(tmpdir, f"test_{M}_{N}_{K}.co")
+        co = result.assemble(output_path=co_path)
+
+        tile = kernel.tile
+        elem = 2
+        d_A, d_B, d_D = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+        hip.hipMalloc(ctypes.byref(d_A), M * K * elem)
+        hip.hipMalloc(ctypes.byref(d_B), N * K * elem)
+        hip.hipMalloc(ctypes.byref(d_D), M * N * elem)
+
+        rng = np.random.RandomState(42)
+        scale = 1.0 / np.sqrt(K)
+        A = (rng.randn(M, K) * scale).astype(np.float16)
+        B = (rng.randn(N, K) * scale).astype(np.float16)
+
+        hip.hipMemcpy(d_A, A.ctypes.data_as(ctypes.c_void_p), M * K * elem, 1)
+        hip.hipMemcpy(d_B, B.ctypes.data_as(ctypes.c_void_p), N * K * elem, 1)
+        hip.hipMemset(d_D, 0, M * N * elem)
+
+        module = ctypes.c_void_p()
+        hip.hipModuleLoad(ctypes.byref(module), co_path.encode())
+        func = ctypes.c_void_p()
+        hip.hipModuleGetFunction(ctypes.byref(func), module,
+                                  result.kernel_name.encode())
+
+        _a = [ctypes.c_void_p(d_A.value), ctypes.c_void_p(d_B.value),
+              ctypes.c_void_p(d_D.value),
+              ctypes.c_int(M), ctypes.c_int(N), ctypes.c_int(K)]
+        args = (ctypes.c_void_p * len(_a))()
+        for i, v in enumerate(_a):
+            args[i] = ctypes.cast(ctypes.pointer(v), ctypes.c_void_p)
+
+        gm, gn = problem.grid_dims(tile)
+        ret = hip.hipModuleLaunchKernel(
+            func, gm, gn, 1, tile.block_size, 1, 1, 0, None, args, None)
+        assert ret == 0, f"Launch failed: {ret}"
+        ret = hip.hipDeviceSynchronize()
+        assert ret == 0, f"Sync failed: {ret}"
+
+        D_gpu = np.zeros((M, N), dtype=np.float16)
+        hip.hipMemcpy(D_gpu.ctypes.data_as(ctypes.c_void_p), d_D,
+                       M * N * elem, 2)
+
+        hip.hipFree(d_A)
+        hip.hipFree(d_B)
+        hip.hipFree(d_D)
+        hip.hipModuleUnload(module)
+
+    D_ref = (A.astype(np.float32) @ B.astype(np.float32).T).astype(np.float16)
+    return D_gpu, D_ref
+
+
+@requires_gpu
+class TestBaselineKernel:
+    """Baseline kernel (no optimizations, no DTL, no prefetch)."""
+
+    @pytest.mark.parametrize("M,N,K", [
+        (128, 128, 32),
+        (128, 128, 128),
+        (256, 256, 64),
+    ])
+    def test_correct(self, M, N, K):
+        D_gpu, D_ref = _run_gemm(M, N, K)
+        max_err = np.max(np.abs(D_gpu.astype(np.float32)
+                                - D_ref.astype(np.float32)))
+        assert max_err < 0.01, f"Baseline {M}x{N}x{K}: max_err={max_err}"
+
+
+@requires_gpu
+class TestDTLScheduledKernel:
+    """DTL + flat ScheduleGraph auto-interleaving."""
+
+    @pytest.mark.parametrize("M,N,K", [
+        (256, 256, 64),
+        (256, 256, 128),
+        (4096, 4096, 4096),
+    ])
+    def test_correct(self, M, N, K):
+        D_gpu, D_ref = _run_variant(M, N, K, dtl_scheduled=True)
+        max_err = np.max(np.abs(D_gpu.astype(np.float32)
+                                - D_ref.astype(np.float32)))
+        assert max_err < 0.001, \
+            f"dtl_scheduled {M}x{N}x{K}: max_err={max_err}"
+
+
+@requires_gpu
+class TestDTLPartitionedKernel:
+    """DTL + partition-based scheduling with SlotPlacer interleaving."""
+
+    @pytest.mark.parametrize("M,N,K", [
+        (256, 256, 64),
+        (256, 256, 128),
+        (4096, 4096, 4096),
+    ])
+    def test_correct(self, M, N, K):
+        D_gpu, D_ref = _run_variant(M, N, K, dtl_partitioned=True)
+        max_err = np.max(np.abs(D_gpu.astype(np.float32)
+                                - D_ref.astype(np.float32)))
+        assert max_err < 0.001, \
+            f"dtl_partitioned {M}x{N}x{K}: max_err={max_err}"
+
+    def test_emit_structure(self):
+        """Verify the kernel uses the expected tile config."""
+        problem = GemmProblem(m=4096, n=4096, k=4096)
+        kernel = GemmKernel.build(problem, dtl_partitioned=True)
+        assert kernel.tile.wg_m == 256
+        assert kernel.tile.wg_n == 256
+        assert kernel.tile.unroll_k == 64
+        result = kernel.emit()
+        assert result.vgpr_count <= 128, \
+            f"VGPR count {result.vgpr_count} too high"
+        assert result.acc_count == 256
+
+
+@requires_gpu
+class TestSmallBaseline:
+    """Baseline kernel at the smallest valid tile size (128x128x32)."""
+
+    def test_correct(self):
+        D_gpu, D_ref = _run_gemm(128, 128, 32)
+        max_err = np.max(np.abs(D_gpu.astype(np.float32)
+                                - D_ref.astype(np.float32)))
+        assert max_err < 0.01, f"Small baseline: max_err={max_err}"
+
+
+@requires_gpu
+class TestDTLInterleavedKernel:
+    """DTL + hand-tuned interleaved schedule (reference variant)."""
+
+    @pytest.mark.parametrize("M,N,K", [
+        (256, 256, 64),
+        (256, 256, 128),
+    ])
+    def test_correct(self, M, N, K):
+        D_gpu, D_ref = _run_variant(M, N, K, dtl_interleaved=True)
+        max_err = np.max(np.abs(D_gpu.astype(np.float32)
+                                - D_ref.astype(np.float32)))
+        assert max_err < 0.001, \
+            f"dtl_interleaved {M}x{N}x{K}: max_err={max_err}"
+
+
+@requires_gpu
+class TestSmallBaseline:
+    """Baseline kernel at smallest valid tile size."""
+
+    def test_128x128x32(self):
+        D_gpu, D_ref = _run_gemm(128, 128, 32)
+        max_err = np.max(np.abs(D_gpu.astype(np.float32)
+                                - D_ref.astype(np.float32)))
+        assert max_err < 0.01, f"Baseline 128x128x32: max_err={max_err}"
+
+
+@requires_gpu
+class TestDTLInterleavedKernel:
+    """DTL + hand-tuned A-prefetch interleaving (reference kernel)."""
+
+    @pytest.mark.parametrize("M,N,K", [
+        (256, 256, 64),
+        (256, 256, 128),
+    ])
+    def test_correct(self, M, N, K):
+        D_gpu, D_ref = _run_variant(M, N, K, dtl_interleaved=True)
+        max_err = np.max(np.abs(D_gpu.astype(np.float32)
+                                - D_ref.astype(np.float32)))
+        assert max_err < 0.001, \
+            f"dtl_interleaved {M}x{N}x{K}: max_err={max_err}"

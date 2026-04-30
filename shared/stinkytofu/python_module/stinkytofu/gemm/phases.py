@@ -530,7 +530,7 @@ def default_mfma_visitor(level: TileLevel, ctx: AsmContext) -> None:
 
     acc_per = mfma.acc_vgprs
     acc_off = (mi * tile.mfma_n_repeat + ni) * acc_per
-    ctx.inst(f"v_mfma_f32_{mfma.m}x{mfma.n}x{mfma.k}_f16",
+    ctx.inst(mfma.instruction_name,
              ctx.areg("acc_C", acc_off, acc_per),
              ctx.vreg("v_a", 0, mfma.a_vgprs),
              ctx.vreg("v_b", 0, mfma.b_vgprs),
@@ -869,7 +869,7 @@ def _emit_interleaved_compute(ctx, tile, problem):
         acc_per = mfma.acc_vgprs
         acc_off = (mi * tile.mfma_n_repeat + ni) * acc_per
         ctx.inst(
-            f"v_mfma_f32_{mfma.m}x{mfma.n}x{mfma.k}_f16",
+            mfma.instruction_name,
             ctx.areg("acc_C", acc_off, acc_per),
             ctx.vreg(a_bufs[cur_buf], 0, mfma.a_vgprs),
             ctx.vreg(b_bufs[cur_buf], 0, mfma.b_vgprs),
@@ -1074,7 +1074,7 @@ def _emit_subtile_compute_legacy(ctx, tile, problem):
         acc_per = mfma.acc_vgprs
         acc_off = (mi * nr + ni) * acc_per
         ctx.inst(
-            f"v_mfma_f32_{mfma.m}x{mfma.n}x{mfma.k}_f16",
+            mfma.instruction_name,
             ctx.areg("acc_C", acc_off, acc_per),
             ctx.vreg(a_names[(a_buf, ki)], 0, av),
             ctx.vreg(b_names[(ni, ki)], 0, bv),
@@ -1206,7 +1206,7 @@ def _emit_scheduled_compute(ctx, tile, problem):
                 acc_per = mfma.acc_vgprs
                 acc_off = (mi * nr + ni) * acc_per
                 ctx.inst(
-                    f"v_mfma_f32_{mfma.m}x{mfma.n}x{mfma.k}_f16",
+                    mfma.instruction_name,
                     ctx.areg("acc_C", acc_off, acc_per),
                     ctx.vreg(a_names[(cur_a, ki)], 0, av),
                     ctx.vreg(b_names[(ni, ki)], 0, bv),
@@ -1316,7 +1316,7 @@ def phase_fully_interleaved_k_loop(level, ctx):
         acc_per = mfma.acc_vgprs
         acc_off = (mi * nr + ni) * acc_per
         ctx.inst(
-            f"v_mfma_f32_{mfma.m}x{mfma.n}x{mfma.k}_f16",
+            mfma.instruction_name,
             ctx.areg("acc_C", acc_off, acc_per),
             ctx.vreg(a_names[(a_buf, ki)], 0, av),
             ctx.vreg(b_names[(ni, ki)], 0, bv),
@@ -1676,7 +1676,7 @@ def phase_pgr2_k_loop(level, ctx):
                     acc_per = mfma.acc_vgprs
                     acc_off = (mi * nr + ni) * acc_per
                     ctx.inst(
-                        f"v_mfma_f32_{mfma.m}x{mfma.n}x{mfma.k}_f16",
+                        mfma.instruction_name,
                         ctx.areg("acc_C", acc_off, acc_per),
                         ctx.vreg(a_names[(cur_a, ki)], 0, av),
                         ctx.vreg(b_names[(ni, ki)], 0, bv),
@@ -2251,7 +2251,7 @@ def phase_dtl_k_loop(level, ctx):
                 acc_per = mfma.acc_vgprs
                 acc_off = (mi * nr + ni) * acc_per
                 ctx.inst(
-                    f"v_mfma_f32_{mfma.m}x{mfma.n}x{mfma.k}_f16",
+                    mfma.instruction_name,
                     ctx.areg("acc_C", acc_off, acc_per),
                     ctx.vreg(a_names[(cur_a, ki)], 0, av),
                     ctx.vreg(b_names[(ni, ki)], 0, bv),
@@ -2356,7 +2356,7 @@ def phase_interleaved_large_k_loop(level, ctx):
     def do_mfma(mi, ni, ki, a_buf):
         acc_per = mfma.acc_vgprs
         acc_off = (mi * nr + ni) * acc_per
-        ctx.inst(f"v_mfma_f32_{mfma.m}x{mfma.n}x{mfma.k}_f16",
+        ctx.inst(mfma.instruction_name,
                  ctx.areg("acc_C", acc_off, acc_per),
                  ctx.vreg(a_names[(a_buf, ki)], 0, av),
                  ctx.vreg(b_names[(ni, ki)], 0, bv),

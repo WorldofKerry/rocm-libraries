@@ -114,7 +114,7 @@ def phase_auto_scheduled_k_loop(level, ctx):
 
                 g.add_mfma(mi=mi, ni=ni, ki=ki, deps=deps,
                     emit_fn=lambda _mi=_mi2, _ni=_ni, _ki=_ki2, _buf=_buf2, _ao=_ao:
-                        ctx.inst(f"v_mfma_f32_{mfma.m}x{mfma.n}x{mfma.k}_f16",
+                        ctx.inst(mfma.instruction_name,
                             ctx.areg("acc_C", _ao, acc_per),
                             ctx.vreg(a_reg[(_buf, _ki)], 0, av),
                             ctx.vreg(b_reg[(_ni, _ki)], 0, bv),

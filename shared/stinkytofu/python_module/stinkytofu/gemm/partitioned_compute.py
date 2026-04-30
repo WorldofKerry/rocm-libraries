@@ -151,7 +151,7 @@ def emit_partitioned_compute(
                         ni = ni_start + local_ni
                         acc_off = (mi * nr + ni) * acc_per
                         ctx.inst(
-                            f"v_mfma_f32_{mfma.m}x{mfma.n}x{mfma.k}_f16",
+                            mfma.instruction_name,
                             ctx.areg("acc_C", acc_off, acc_per),
                             ctx.vreg(a_names[(cur_a, ki)], 0, av),
                             ctx.vreg(b_map[(local_ni, ki)], 0, bv),

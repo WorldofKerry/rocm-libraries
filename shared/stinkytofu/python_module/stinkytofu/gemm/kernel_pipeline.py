@@ -134,7 +134,9 @@ class GemmKernel:
               interleaved_large: bool = False,
               auto_scheduled: bool = False,
               pgr2_interleaved: bool = False,
-              dtl_interleaved: bool = False) -> GemmKernel:
+              dtl_interleaved: bool = False,
+              dtl_scheduled: bool = False,
+              dtl_partitioned: bool = False) -> GemmKernel:
         """Build a GemmKernel.  GemmTiling is the source of truth.
 
         Args:
@@ -156,7 +158,11 @@ class GemmKernel:
             if tile is not None:
                 tiling = GemmTiling.from_tile_config(tile)
             else:
-                if optimized or scheduled or interleaved or pgr2 or dtl or interleaved_large or auto_scheduled or pgr2_interleaved or dtl_interleaved:
+                if dtl_interleaved or dtl_scheduled or dtl_partitioned:
+                    # DTL variants need 256x256x64 for 128 MFMAs
+                    tiling = GemmTiling.high_perf(
+                        wg_m=256, wg_n=256, unroll_k=64)
+                elif optimized or scheduled or interleaved or pgr2 or dtl or interleaved_large or auto_scheduled or pgr2_interleaved:
                     tiling = GemmTiling.high_perf()
                 else:
                     tiling = GemmTiling.standard()
@@ -177,7 +183,9 @@ class GemmKernel:
                 interleaved_large=interleaved_large,
                 auto_scheduled=auto_scheduled,
                 pgr2_interleaved=pgr2_interleaved,
-                dtl_interleaved=dtl_interleaved)
+                dtl_interleaved=dtl_interleaved,
+                dtl_scheduled=dtl_scheduled,
+                dtl_partitioned=dtl_partitioned)
 
         tile_tree.validate()
 
@@ -208,7 +216,7 @@ class GemmKernel:
         else:
             lds_half = (tile.wg_m + tile.wg_n) * lds_row_stride * elem
         # Double LDS for double-buffered mode
-        is_db = any(p.name in ("optimized_k_loop", "scheduled_k_loop", "fully_interleaved_k_loop", "pgr2_k_loop", "dtl_k_loop", "interleaved_large_k_loop", "auto_scheduled_k_loop", "pgr2_interleaved_k_loop", "dtl_interleaved_k_loop")
+        is_db = any(p.name in ("optimized_k_loop", "scheduled_k_loop", "fully_interleaved_k_loop", "pgr2_k_loop", "dtl_k_loop", "interleaved_large_k_loop", "auto_scheduled_k_loop", "pgr2_interleaved_k_loop", "dtl_interleaved_k_loop", "dtl_scheduled_k_loop", "dtl_partitioned_k_loop")
                      for p in self.tile_tree.prologue_phases)
         lds_total = lds_half * 2 if is_db else lds_half
 

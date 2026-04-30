@@ -25,6 +25,52 @@ from .problem import DataType, GemmProblem, TileConfig
 __all__ = ["GemmLauncher", "GemmResult"]
 
 
+def _load_hip() -> ctypes.CDLL:
+    """Load libamdhip64.so with proper argtypes to avoid 64-bit pointer truncation."""
+    try:
+        hip = ctypes.CDLL("libamdhip64.so")
+    except OSError:
+        raise RuntimeError("libamdhip64.so not found; is ROCm installed?")
+
+    VP = ctypes.c_void_p
+    PVP = ctypes.POINTER(ctypes.c_void_p)
+    SZ = ctypes.c_size_t
+    INT = ctypes.c_int
+    CHAR_P = ctypes.c_char_p
+
+    hip.hipSetDevice.argtypes = [INT]
+    hip.hipSetDevice.restype = INT
+    hip.hipMalloc.argtypes = [PVP, SZ]
+    hip.hipMalloc.restype = INT
+    hip.hipFree.argtypes = [VP]
+    hip.hipFree.restype = INT
+    hip.hipMemcpy.argtypes = [VP, VP, SZ, INT]
+    hip.hipMemcpy.restype = INT
+    hip.hipMemset.argtypes = [VP, INT, SZ]
+    hip.hipMemset.restype = INT
+    hip.hipModuleLoad.argtypes = [PVP, CHAR_P]
+    hip.hipModuleLoad.restype = INT
+    hip.hipModuleGetFunction.argtypes = [PVP, VP, CHAR_P]
+    hip.hipModuleGetFunction.restype = INT
+    hip.hipModuleLaunchKernel.restype = INT
+    hip.hipDeviceSynchronize.restype = INT
+    hip.hipModuleUnload.argtypes = [VP]
+    hip.hipModuleUnload.restype = INT
+    hip.hipEventCreate.argtypes = [PVP]
+    hip.hipEventCreate.restype = INT
+    hip.hipEventRecord.argtypes = [VP, VP]
+    hip.hipEventRecord.restype = INT
+    hip.hipEventSynchronize.argtypes = [VP]
+    hip.hipEventSynchronize.restype = INT
+    hip.hipEventElapsedTime.argtypes = [ctypes.POINTER(ctypes.c_float), VP, VP]
+    hip.hipEventElapsedTime.restype = INT
+    hip.hipEventDestroy.argtypes = [VP]
+    hip.hipEventDestroy.restype = INT
+
+    return hip
+
+
+
 @dataclass
 class GemmResult:
     """Result of a GEMM execution."""
@@ -211,11 +257,7 @@ class GemmLauncher:
         p = self.problem
         A, B, C = self.generate_inputs()
 
-        # Load HIP runtime
-        try:
-            hip = ctypes.CDLL("libamdhip64.so")
-        except OSError:
-            raise RuntimeError("libamdhip64.so not found; is ROCm installed?")
+        hip = _load_hip()
 
         def _check(ret, msg="HIP error"):
             if ret != 0:
@@ -333,10 +375,7 @@ class GemmLauncher:
         A, B, C = self.generate_inputs()
         elem = p.element_bytes
 
-        try:
-            hip = ctypes.CDLL("libamdhip64.so")
-        except OSError:
-            raise RuntimeError("libamdhip64.so not found; is ROCm installed?")
+        hip = _load_hip()
 
         def _check(ret, msg="HIP error"):
             if ret != 0:
@@ -425,15 +464,16 @@ class GemmLauncher:
                 lds_size, None,
                 args, None,
             ), "hipModuleLaunchKernel warmup")
-            _check(hip.hipDeviceSynchronize(), "sync warmup")
+        _check(hip.hipDeviceSynchronize(), "sync warmup")
 
-        # Timed runs
-        total_time = 0.0
+        # Timed runs using HIP events for accurate GPU timing
+        ev_start = ctypes.c_void_p()
+        ev_stop = ctypes.c_void_p()
+        _check(hip.hipEventCreate(ctypes.byref(ev_start)), "hipEventCreate")
+        _check(hip.hipEventCreate(ctypes.byref(ev_stop)), "hipEventCreate")
+
+        _check(hip.hipEventRecord(ev_start, None), "hipEventRecord start")
         for _ in range(num_iters):
-            # Reset D to zero
-            _check(hip.hipMemset(d_D, 0, d_bytes), "memset D")
-
-            t0 = time.perf_counter()
             _check(hip.hipModuleLaunchKernel(
                 func,
                 grid_m, grid_n, 1,
@@ -441,11 +481,17 @@ class GemmLauncher:
                 lds_size, None,
                 args, None,
             ), "hipModuleLaunchKernel")
-            _check(hip.hipDeviceSynchronize(), "sync")
-            t1 = time.perf_counter()
-            total_time += (t1 - t0)
+        _check(hip.hipEventRecord(ev_stop, None), "hipEventRecord stop")
+        _check(hip.hipEventSynchronize(ev_stop), "hipEventSynchronize")
 
-        avg_time = total_time / num_iters
+        elapsed_ms = ctypes.c_float()
+        _check(hip.hipEventElapsedTime(ctypes.byref(elapsed_ms),
+                                        ev_start, ev_stop),
+               "hipEventElapsedTime")
+        avg_time = elapsed_ms.value / 1000.0 / num_iters
+
+        hip.hipEventDestroy(ev_start)
+        hip.hipEventDestroy(ev_stop)
 
         # Copy result back
         D_out = np.zeros((p.m, p.n), dtype=self._np_dtype(p.dtype))

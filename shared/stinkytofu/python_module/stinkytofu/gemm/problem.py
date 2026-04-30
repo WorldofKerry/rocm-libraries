@@ -61,6 +61,11 @@ class MfmaConfig:
         """FLOPs per single MFMA invocation (multiply + accumulate)."""
         return 2 * self.m * self.n * self.k
 
+    @property
+    def instruction_name(self) -> str:
+        """Full MFMA instruction name, e.g. ``v_mfma_f32_16x16x16_f16``."""
+        return f"v_mfma_{self.acc_type}_{self.m}x{self.n}x{self.k}_{self.input_type}"
+
     @staticmethod
     def f16_16x16x16() -> MfmaConfig:
         """``v_mfma_f32_16x16x16_f16``: 16x16 output, K=16, 4 acc VGPRs."""
