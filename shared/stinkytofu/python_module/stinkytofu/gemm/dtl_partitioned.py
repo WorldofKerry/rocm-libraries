@@ -160,15 +160,11 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     av = mfma.a_vgprs
     bv = mfma.b_vgprs
 
-    # LDS half-buffer size: data + scale regions
+    # LDS half-buffer size: data only (scales loaded directly to VGPRs)
     lds_data_half = int((tile.wg_m + tile.wg_n) * tile.unroll_k * elem)
-    lds_scale_half = 0
+    lds_half = lds_data_half
     mx_block = mfma.mx_block
     use_real_scales = ctx._metadata.get("use_real_scales", False)
-    if use_real_scales:
-        scale_k_cols = tile.unroll_k // mx_block
-        lds_scale_half = (tile.wg_m + tile.wg_n) * scale_k_cols
-    lds_half = lds_data_half + lds_scale_half
 
     k_stride = int(tile.unroll_k * elem)
     log2_uk = int(math.log2(tile.unroll_k))
