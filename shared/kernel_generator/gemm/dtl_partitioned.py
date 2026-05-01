@@ -340,6 +340,23 @@ def phase_dtl_partitioned_k_loop(level, ctx):
               comment=f"DB step = {lds_half}")
     ctx.raw("")
 
+    # Precompute scale soffsets into SGPRs to avoid s_mul in K-loop
+    if use_real_scales and not use_swizzled_scales:
+        ctx.comment("Precompute scale soffsets")
+        for mi_ in range(1, mr):
+            soff_name = f"s_soff_sa_{mi_}"
+            ctx.alloc_sgpr_permanent(1, soff_name)
+            ctx.s_mul(ctx.sreg(soff_name), ctx.sreg("s_stride_scale_a"),
+                      str(mi_ * mfma.m),
+                      comment=f"soff_a[{mi_}] = stride * {mi_ * mfma.m}")
+        for ni_ in range(1, nr):
+            soff_name = f"s_soff_sb_{ni_}"
+            ctx.alloc_sgpr_permanent(1, soff_name)
+            ctx.s_mul(ctx.sreg(soff_name), ctx.sreg("s_stride_scale_b"),
+                      str(ni_ * mfma.n),
+                      comment=f"soff_b[{ni_}] = stride * {ni_ * mfma.n}")
+        ctx.raw("")
+
     # Prologue: DTL load first tile
     ctx.comment("Prologue: DTL tile 0")
     _emit_dtl_loads_a(ctx, tile, problem, num_loads_a)
@@ -374,37 +391,25 @@ def phase_dtl_partitioned_k_loop(level, ctx):
             ctx.comment("Load scales A subtile 0 (direct VGPR)")
             for mi_ in range(partition_m):  # only subtile 0
                 if mi_ == 0:
-                    ctx.inst("buffer_load_dword",
-                             ctx.vreg(f"v_scale_a_m{mi_}"),
-                             ctx.vreg("v_dtl_off_scale_a"),
-                             ctx.sreg("s_srd_scale_a", 0, 4),
-                             "0", "offen", comment=f"scale A mi={mi_}")
+                    soff = "0"
                 else:
-                    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_stride_scale_a"),
-                              str(mi_ * mfma.m),
-                              comment=f"mi={mi_} * {mfma.m} * stride_scale_a")
-                    ctx.inst("buffer_load_dword",
-                             ctx.vreg(f"v_scale_a_m{mi_}"),
-                             ctx.vreg("v_dtl_off_scale_a"),
-                             ctx.sreg("s_srd_scale_a", 0, 4),
-                             ctx.sreg("s_tmp0"), "offen", comment=f"scale A mi={mi_}")
+                    soff = ctx.sreg(f"s_soff_sa_{mi_}")
+                ctx.inst("buffer_load_dword",
+                         ctx.vreg(f"v_scale_a_m{mi_}"),
+                         ctx.vreg("v_dtl_off_scale_a"),
+                         ctx.sreg("s_srd_scale_a", 0, 4),
+                         soff, "offen", comment=f"scale A mi={mi_}")
             ctx.comment("Load scales B (direct VGPR)")
             for ni_ in range(nr):
                 if ni_ == 0:
-                    ctx.inst("buffer_load_dword",
-                             ctx.vreg(f"v_scale_b_n{ni_}"),
-                             ctx.vreg("v_dtl_off_scale_b"),
-                             ctx.sreg("s_srd_scale_b", 0, 4),
-                             "0", "offen", comment=f"scale B ni={ni_}")
+                    soff = "0"
                 else:
-                    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_stride_scale_b"),
-                              str(ni_ * mfma.n),
-                              comment=f"ni={ni_} * {mfma.n} * stride_scale_b")
-                    ctx.inst("buffer_load_dword",
-                             ctx.vreg(f"v_scale_b_n{ni_}"),
-                             ctx.vreg("v_dtl_off_scale_b"),
-                             ctx.sreg("s_srd_scale_b", 0, 4),
-                             ctx.sreg("s_tmp0"), "offen", comment=f"scale B ni={ni_}")
+                    soff = ctx.sreg(f"s_soff_sb_{ni_}")
+                ctx.inst("buffer_load_dword",
+                         ctx.vreg(f"v_scale_b_n{ni_}"),
+                         ctx.vreg("v_dtl_off_scale_b"),
+                         ctx.sreg("s_srd_scale_b", 0, 4),
+                         soff, "offen", comment=f"scale B ni={ni_}")
     if use_real_scales and not use_swizzled_scales:
         # Scale loads (newest vmem ops) can stay in-flight past barrier;
         # only DTL loads (oldest) must complete for LDS coherency.
@@ -538,13 +543,7 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                 target_mi = (st + 1) * partition_m + mi_in_st
                 def _mk_scale_load(mi_=target_mi):
                     def emit():
-                        if mi_ == 0:
-                            soff = "0"
-                        else:
-                            ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_stride_scale_a"),
-                                      str(mi_ * mfma.m),
-                                      comment=f"soff mi={mi_}")
-                            soff = ctx.sreg("s_tmp0")
+                        soff = "0" if mi_ == 0 else ctx.sreg(f"s_soff_sa_{mi_}")
                         ctx.inst("buffer_load_dword",
                                  ctx.vreg(f"v_scale_a_m{mi_}"),
                                  ctx.vreg("v_dtl_off_scale_a"),
@@ -667,12 +666,7 @@ def phase_dtl_partitioned_k_loop(level, ctx):
             reg = f"v_scale_a_m{mi_}"
             def _mk_pf_a(m=mi_):
                 def emit():
-                    if m == 0:
-                        soff = "0"
-                    else:
-                        ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_stride_scale_a"),
-                                  str(m * mfma.m), comment=f"soff mi={m}")
-                        soff = ctx.sreg("s_tmp0")
+                    soff = "0" if m == 0 else ctx.sreg(f"s_soff_sa_{m}")
                     ctx.inst("buffer_load_dword",
                              ctx.vreg(f"v_scale_a_m{m}"),
                              ctx.vreg("v_dtl_off_scale_a"),
@@ -687,12 +681,7 @@ def phase_dtl_partitioned_k_loop(level, ctx):
             reg = f"v_scale_b_n{ni_}"
             def _mk_pf_b(n=ni_):
                 def emit():
-                    if n == 0:
-                        soff = "0"
-                    else:
-                        ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_stride_scale_b"),
-                                  str(n * mfma.n), comment=f"ni={n} * {mfma.n} * stride")
-                        soff = ctx.sreg("s_tmp0")
+                    soff = "0" if n == 0 else ctx.sreg(f"s_soff_sb_{n}")
                     ctx.inst("buffer_load_dword",
                              ctx.vreg(f"v_scale_b_n{n}"),
                              ctx.vreg("v_dtl_off_scale_b"),
