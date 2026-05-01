@@ -214,15 +214,23 @@ def _emit_swizzled_ds_read(ctx, dst, base_reg, offset, ki, tile, mfma, elem,
     """Emit ds_read with LDS swizzle support.
     
     For ki=0, reads directly from base_reg.
-    For ki>0 with lds_swizzle, XORs base_reg with the swizzle constant
-    into a temp VGPR before reading.
+    For ki>0 with lds_swizzle, uses precomputed v_lds_rd_a_k1 / v_lds_rd_b_k1
+    (set up once per iteration) instead of recomputing XOR each time.
     """
     if getattr(tile, 'lds_swizzle', False) and ki > 0:
-        xor_bytes = _swizzle_xor_bytes(tile, mfma, elem)
-        ctx.inst("v_xor_b32", ctx.vreg("v_tmp4"),
-                 base_reg, str(xor_bytes),
-                 comment=f"swizzle ki={ki}: XOR {xor_bytes}")
-        ctx.ds_read(dst, ctx.vreg("v_tmp4"), offset=offset,
+        # Use precomputed swizzled base register
+        if base_reg == ctx.vreg("v_lds_rd_a"):
+            swz_reg = ctx.vreg("v_lds_rd_a_k1")
+        elif base_reg == ctx.vreg("v_lds_rd_b"):
+            swz_reg = ctx.vreg("v_lds_rd_b_k1")
+        else:
+            # Fallback: compute inline
+            xor_bytes = _swizzle_xor_bytes(tile, mfma, elem)
+            ctx.inst("v_xor_b32", ctx.vreg("v_tmp4"),
+                     base_reg, str(xor_bytes),
+                     comment=f"swizzle ki={ki}: XOR {xor_bytes}")
+            swz_reg = ctx.vreg("v_tmp4")
+        ctx.ds_read(dst, swz_reg, offset=offset,
                     width=width, comment=comment)
     else:
         ctx.ds_read(dst, base_reg, offset=offset,
@@ -563,12 +571,24 @@ def phase_dtl_partitioned_k_loop(level, ctx):
         PlacedOp(emit_fn=lambda n=_pf_inflight: ctx.s_waitcnt(
                  f"vmcnt({n})", comment=f"wait DTL (leave {n} prefetch in-flight)"),
                  op_type="wait", comment="vmcnt"),
-        PlacedOp(emit_fn=lambda: ctx.v_add(ctx.vreg("v_lds_rd_a"),
+        PlacedOp(emit_fn=lambda: (
+                 ctx.v_add(ctx.vreg("v_lds_rd_a"),
                  ctx.sreg("s_lds_db_step"), ctx.vreg("v_lds_rd_a"),
-                 comment="rd_a += db"), op_type="salu", comment="toggle_a"),
-        PlacedOp(emit_fn=lambda: ctx.v_add(ctx.vreg("v_lds_rd_b"),
+                 comment="rd_a += db"),
+                 ctx.inst("v_xor_b32", ctx.vreg("v_lds_rd_a_k1"),
+                 ctx.vreg("v_lds_rd_a"),
+                 str(_swizzle_xor_bytes(tile, mfma, elem)),
+                 comment="rd_a_k1 = rd_a ^ swz") if getattr(tile, 'lds_swizzle', False) and ki_count > 1 else None
+                 ), op_type="salu", comment="toggle_a"),
+        PlacedOp(emit_fn=lambda: (
+                 ctx.v_add(ctx.vreg("v_lds_rd_b"),
                  ctx.sreg("s_lds_db_step"), ctx.vreg("v_lds_rd_b"),
-                 comment="rd_b += db"), op_type="salu", comment="toggle_b"),
+                 comment="rd_b += db"),
+                 ctx.inst("v_xor_b32", ctx.vreg("v_lds_rd_b_k1"),
+                 ctx.vreg("v_lds_rd_b"),
+                 str(_swizzle_xor_bytes(tile, mfma, elem)),
+                 comment="rd_b_k1 = rd_b ^ swz") if getattr(tile, 'lds_swizzle', False) and ki_count > 1 else None
+                 ), op_type="salu", comment="toggle_b"),
     ]
     # Toggle scale LDS read addresses if MX
     if use_real_scales:
@@ -829,6 +849,17 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                       comment=f"wait scales (leave {num_dtl} DTL in-flight)")
     elif use_real_scales:
         ctx.s_waitcnt("vmcnt(0)", comment="wait scale VGPR loads")
+    ctx.raw("")
+
+    # Precompute swizzled LDS read bases for ki=1
+    if getattr(tile, 'lds_swizzle', False) and ki_count > 1:
+        xor_val = _swizzle_xor_bytes(tile, mfma, elem)
+        ctx.inst("v_xor_b32", ctx.vreg("v_lds_rd_a_k1"),
+                 ctx.vreg("v_lds_rd_a"), str(xor_val),
+                 comment=f"precompute rd_a_k1 = rd_a ^ {xor_val}")
+        ctx.inst("v_xor_b32", ctx.vreg("v_lds_rd_b_k1"),
+                 ctx.vreg("v_lds_rd_b"), str(xor_val),
+                 comment=f"precompute rd_b_k1 = rd_b ^ {xor_val}")
     ctx.raw("")
 
     # ---- Emit scheduled body ----
