@@ -347,7 +347,8 @@ class GemmTiling:
                        pgr2_interleaved: bool = False,
                        dtl_interleaved: bool = False,
                        dtl_scheduled: bool = False,
-                       dtl_partitioned: bool = False) -> TileLevel:
+                       dtl_partitioned: bool = False,
+                       wave_abi: bool = False) -> TileLevel:
         """Build the full tile tree with phases from TileDim chains.
 
         The chain structure determines the tree levels:
@@ -382,7 +383,7 @@ class GemmTiling:
 
         # Wave: per-wave compute tile
         # K-loop data movement phases go here (non-pipelined)
-        if pipelined or optimized or scheduled or interleaved or pgr2 or dtl or interleaved_large or auto_scheduled or pgr2_interleaved or dtl_interleaved or dtl_scheduled or dtl_partitioned:
+        if pipelined or optimized or scheduled or interleaved or pgr2 or dtl or interleaved_large or auto_scheduled or pgr2_interleaved or dtl_interleaved or dtl_scheduled or dtl_partitioned or wave_abi:
             # Pipelined/optimized: K-loop phase handles compute internally.
             # Wave gets a no-op emit so the tree walker skips it.
             wave_level = TileLevel(
@@ -399,7 +400,18 @@ class GemmTiling:
                 epilogue_phases=list(WAVE_EPILOGUE_PHASES))
 
         # Workgroup: setup + K-loop structure + store
-        if dtl_partitioned:
+        if wave_abi:
+            from .dtl_interleaved import WAVE_ABI_PROLOGUE_PHASES
+            from .dtl_partitioned import phase_mx_scale_setup
+            from .tile import TilePhase
+            # Wave ABI uses partitioned K-loop with wave ABI setup
+            from .dtl_partitioned import phase_dtl_partitioned_k_loop
+            wg_pro = [
+                TilePhase("wave_abi_setup", WAVE_ABI_PROLOGUE_PHASES[0].emit),
+                TilePhase("mx_scale_setup", phase_mx_scale_setup),
+                TilePhase("dtl_partitioned_k_loop", phase_dtl_partitioned_k_loop),
+            ]
+        elif dtl_partitioned:
             from .dtl_partitioned import DTL_PARTITIONED_PROLOGUE_PHASES
             wg_pro = list(DTL_PARTITIONED_PROLOGUE_PHASES)
         elif dtl_scheduled:

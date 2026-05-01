@@ -459,3 +459,74 @@ class TestMXFP4RealScales:
         expected = 512.0
         assert np.allclose(D_gpu, expected, atol=1.0), \
             f"Expected ~{expected}, got min={np.min(D_gpu)} max={np.max(D_gpu)}"
+
+
+class TestWaveABIKernel:
+    """Test Wave ABI kernel generation for rocRoller/hipBLASLt integration."""
+
+    def test_wave_abi_emit(self):
+        """Wave ABI kernel emits valid assembly."""
+        from kernel_generator.gemm.kernel_pipeline import GemmKernel
+        from kernel_generator.gemm.tiling import GemmTiling
+
+        mx = MfmaConfig.mxfp4_16x16x128()
+        t = GemmTiling.high_perf(wg_m=128, wg_n=128, unroll_k=256, mfma=mx)
+        p = GemmProblem(4096, 4096, 4096, dtype=DataType.MXFP4)
+        k = GemmKernel.build(p, tiling=t, wave_abi=True, use_real_scales=True)
+
+        result = k.emit()
+        assert len(result.asm_text) > 0
+        # Wave ABI setup should appear in the assembly
+        assert "Wave ABI Setup" in result.asm_text
+        # Should NOT have TensileLite kernarg offsets
+        assert "TensileLite" not in result.asm_text
+
+    def test_wave_abi_assemble(self):
+        """Wave ABI kernel assembles to .co successfully."""
+        from kernel_generator.gemm.kernel_pipeline import GemmKernel, export_wave_kernel
+        from kernel_generator.gemm.tiling import GemmTiling
+        import os
+
+        mx = MfmaConfig.mxfp4_16x16x128()
+        t = GemmTiling.high_perf(wg_m=128, wg_n=128, unroll_k=256, mfma=mx)
+        p = GemmProblem(4096, 4096, 4096, dtype=DataType.MXFP4)
+        k = GemmKernel.build(p, tiling=t, wave_abi=True, use_real_scales=True)
+
+        name, co = export_wave_kernel(k, "/tmp/test_wave_abi.co")
+        assert name == "wave_mxfp4_128x128x256_kgen"
+        assert os.path.exists(co)
+        assert os.path.getsize(co) > 0
+
+    def test_wave_abi_kernarg_offsets(self):
+        """Wave ABI kernel uses correct kernarg offsets for all fields."""
+        from kernel_generator.gemm.kernel_pipeline import GemmKernel
+        from kernel_generator.gemm.tiling import GemmTiling
+
+        mx = MfmaConfig.mxfp4_16x16x128()
+        t = GemmTiling.high_perf(wg_m=128, wg_n=128, unroll_k=256, mfma=mx)
+        p = GemmProblem(4096, 4096, 4096, dtype=DataType.MXFP4)
+        k = GemmKernel.build(p, tiling=t, wave_abi=True, use_real_scales=True)
+
+        result = k.emit()
+        asm = result.asm_text
+
+        # Verify Wave ABI kernarg offsets are present
+        # ptr_a at 0, ptr_a_scale at 8, ptr_b at 16, ptr_b_scale at 24
+        # ptr_c at 32, M at 40, N at 48, K at 56
+        for offset in ["0", "8", "16", "24", "32", "40", "48", "56"]:
+            assert f", {offset}" in asm or f" {offset}" in asm, \
+                f"Expected kernarg offset {offset} in assembly"
+
+    def test_wave_abi_kernel_name_prefix(self):
+        """Wave ABI kernel name starts with 'wave_' for ABI dispatch."""
+        from kernel_generator.gemm.kernel_pipeline import GemmKernel, export_wave_kernel
+        from kernel_generator.gemm.tiling import GemmTiling
+
+        mx = MfmaConfig.mxfp4_16x16x128()
+        t = GemmTiling.high_perf(wg_m=128, wg_n=128, unroll_k=256, mfma=mx)
+        p = GemmProblem(4096, 4096, 4096, dtype=DataType.MXFP4)
+        k = GemmKernel.build(p, tiling=t, wave_abi=True, use_real_scales=True)
+
+        name, _ = export_wave_kernel(k, "/tmp/test_wave_name.co")
+        assert name.startswith("wave_"), \
+            f"Kernel name must start with 'wave_' for hipBLASLt dispatch, got '{name}'"

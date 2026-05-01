@@ -68,7 +68,7 @@ def phase_mx_scale_setup(level, ctx):
     tile = ctx._metadata["tile"]
     mfma = tile.mfma
     use_real_scales = ctx._metadata.get("use_real_scales", False)
-    use_swizzled_scales = ctx._metadata.get("use_1d_grid", False) and use_real_scales
+    use_swizzled_scales = (ctx._metadata.get("use_1d_grid", False) or ctx._metadata.get("use_wave_abi", False)) and use_real_scales
     if not mfma.is_mx or not use_real_scales:
         return
 
@@ -77,18 +77,20 @@ def phase_mx_scale_setup(level, ctx):
 
     ctx.comment("=== MX Scale Setup (direct VGPR, no LDS) ===")
 
-    # Load scale kernargs (TensileLite offsets: MXSA@56, MXSB@72, strides@104,120)
-    karg = ctx.sreg("s_kernarg")
-    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_scale_a"), karg, "56",
-             comment="scale A ptr (MXSA)")
-    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_scale_b"), karg, "72",
-             comment="scale B ptr (MXSB)")
-    ctx.inst("s_load_dword", ctx.sreg("s_stride_scale_a"), karg, "104",
-             comment="strideMXSA0")
-    ctx.inst("s_load_dword", ctx.sreg("s_stride_scale_b"), karg, "120",
-             comment="strideMXSB0")
-    ctx.s_waitcnt("lgkmcnt(0)", comment="wait scale kernargs")
-    ctx.raw("")
+    # Wave ABI already loads scale ptrs/strides in setup phase
+    if not ctx._metadata.get("use_wave_abi", False):
+        # TensileLite kernarg offsets: MXSA@56, MXSB@72, strides@104,120
+        karg = ctx.sreg("s_kernarg")
+        ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_scale_a"), karg, "56",
+                 comment="scale A ptr (MXSA)")
+        ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_scale_b"), karg, "72",
+                 comment="scale B ptr (MXSB)")
+        ctx.inst("s_load_dword", ctx.sreg("s_stride_scale_a"), karg, "104",
+                 comment="strideMXSA0")
+        ctx.inst("s_load_dword", ctx.sreg("s_stride_scale_b"), karg, "120",
+                 comment="strideMXSB0")
+        ctx.s_waitcnt("lgkmcnt(0)", comment="wait scale kernargs")
+        ctx.raw("")
 
     # Scale SRD A
     ctx.comment("Scale SRD A")
@@ -138,13 +140,13 @@ def phase_mx_scale_setup(level, ctx):
     ctx.raw("")
 
     # Allocate scale soffset SGPRs for swizzled mode
-    if ctx._metadata.get("use_1d_grid", False):
+    if ctx._metadata.get("use_1d_grid", False) or ctx._metadata.get("use_wave_abi", False):
         ctx.alloc_sgpr_permanent(1, "s_scale_soff_a0")
         ctx.alloc_sgpr_permanent(1, "s_scale_soff_a1")
         ctx.alloc_sgpr_permanent(1, "s_scale_soff_b0")
         ctx.alloc_sgpr_permanent(1, "s_scale_soff_b1")
 
-    use_swizzled_scales = ctx._metadata.get("use_1d_grid", False)
+    use_swizzled_scales = ctx._metadata.get("use_1d_grid", False) or ctx._metadata.get("use_wave_abi", False)
 
     if use_swizzled_scales:
         # Pre-swizzled scale layout (AITER e8m0_shuffle):
@@ -224,7 +226,7 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     lds_half = lds_data_half
     mx_block = mfma.mx_block
     use_real_scales = ctx._metadata.get("use_real_scales", False)
-    use_swizzled_scales = ctx._metadata.get("use_1d_grid", False) and use_real_scales
+    use_swizzled_scales = (ctx._metadata.get("use_1d_grid", False) or ctx._metadata.get("use_wave_abi", False)) and use_real_scales
 
     k_stride = int(tile.unroll_k * elem)
     log2_uk = int(math.log2(tile.unroll_k))
@@ -268,7 +270,7 @@ def phase_dtl_partitioned_k_loop(level, ctx):
             a_names[(buf, ki)] = name
 
     # Scale VGPRs: allocation depends on scale format
-    use_swizzled_scales = ctx._metadata.get("use_1d_grid", False) and use_real_scales
+    use_swizzled_scales = (ctx._metadata.get("use_1d_grid", False) or ctx._metadata.get("use_wave_abi", False)) and use_real_scales
     scale_a_names = {}
     scale_b_names = {}
     if use_real_scales:

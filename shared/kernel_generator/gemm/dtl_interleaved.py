@@ -28,7 +28,8 @@ from .problem import GemmProblem, TileConfig
 from .tile import TilePhase
 from .phases import phase_load_kernargs, phase_store_d
 
-__all__ = ["phase_dtl_interleaved_k_loop", "DTL_INTERLEAVED_PROLOGUE_PHASES"]
+__all__ = ["phase_dtl_interleaved_k_loop", "DTL_INTERLEAVED_PROLOGUE_PHASES",
+           "phase_wave_abi_setup", "WAVE_ABI_PROLOGUE_PHASES"]
 
 
 def _tile(ctx): return ctx._metadata["tile"]
@@ -61,6 +62,257 @@ def _b_off(ni, ki, tile, mfma, elem):
     lines_crossed = row_start // rows_per_load
     row_stride = int(tile.unroll_k * elem)
     return int(row_start * row_stride + lines_crossed * pad_bytes + ki * mfma.k * elem)
+
+
+def phase_wave_abi_setup(level, ctx):
+    """Setup for WaveGemmKernelArgs ABI (rocRoller custom kernel path).
+
+    WaveGemmKernelArgs layout (104 bytes, all u64):
+        0:  ptr_a              -- kernel's A (hipBLASLt's B, swapped)
+        8:  ptr_a_scale        -- kernel's ScaleA
+       16:  ptr_b              -- kernel's B (hipBLASLt's A, swapped)
+       24:  ptr_b_scale        -- kernel's ScaleB
+       32:  ptr_c              -- D output
+       40:  m                  -- kernel's M (u64)
+       48:  n                  -- kernel's N (u64)
+       56:  k                  -- K (u64)
+       64:  stride_a_dim0      -- A row stride in bytes (u64)
+       72:  stride_a_scale_dim0-- k/32 (u64)
+       80:  stride_b_dim0      -- B row stride in bytes (u64)
+       88:  stride_b_scale_dim0-- k/32 (u64)
+       96:  stride_c_dim0      -- D column stride (u64)
+
+    Grid is 2D: grid.x = tilesM, grid.y = tilesN.
+    No 1D decomposition needed.
+    """
+    tile = _tile(ctx)
+    problem = _problem(ctx)
+    elem = problem.element_bytes
+    mfma = tile.mfma
+    layouts = _layouts(ctx)
+
+    ctx.comment("=== Wave ABI Setup (rocRoller custom kernel) ===")
+    ctx._metadata["use_wave_abi"] = True
+
+    # Load kernargs -- all fields are u64, load dwordx2 and use low 32 bits
+    karg = ctx.sreg("s_kernarg")
+    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_A"), karg, "0",
+             comment="ptr_a (kernel A)")
+    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_scale_a"), karg, "8",
+             comment="ptr_a_scale")
+    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_B"), karg, "16",
+             comment="ptr_b (kernel B)")
+    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_scale_b"), karg, "24",
+             comment="ptr_b_scale")
+    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_D"), karg, "32",
+             comment="ptr_c (D output)")
+    # M, N, K are u64 -- load low 32 bits via s_load_dword (little-endian)
+    ctx.inst("s_load_dword", ctx.sreg("s_M"), karg, "40",
+             comment="M = low dword of m (u64)")
+    ctx.inst("s_load_dword", ctx.sreg("s_N"), karg, "48",
+             comment="N = low dword of n (u64)")
+    ctx.inst("s_load_dword", ctx.sreg("s_K"), karg, "56",
+             comment="K = low dword of k (u64)")
+    # Scale strides (u64, load low 32 bits)
+    ctx.inst("s_load_dword", ctx.sreg("s_stride_scale_a"), karg, "72",
+             comment="stride_a_scale_dim0 (low 32)")
+    ctx.inst("s_load_dword", ctx.sreg("s_stride_scale_b"), karg, "88",
+             comment="stride_b_scale_dim0 (low 32)")
+    ctx.s_waitcnt("lgkmcnt(0)", comment="wait kernargs")
+    ctx.raw("")
+
+    # 2D grid: s_wg_id_x = tile M index, s_wg_id_y = tile N index (no decomp)
+
+    # Compute K stride in bytes: K * element_bytes
+    if elem >= 1:
+        ctx.s_lshl(ctx.sreg("s_k_stride"), ctx.sreg("s_K"),
+                   int(math.log2(elem)), comment=f"s_k_stride = K * {elem}")
+    else:
+        ctx.s_lshr(ctx.sreg("s_k_stride"), ctx.sreg("s_K"),
+                   int(math.log2(1.0 / elem)), comment=f"s_k_stride = K * {elem}")
+
+    # Thread indexing
+    log2_ws = int(math.log2(tile.wave_size))
+    ctx.v_lshr(ctx.vreg("v_wave_id"), ctx.vreg("v_tid"), log2_ws,
+               comment=f"wave_id = tid >> {log2_ws}")
+    ctx.v_and(ctx.vreg("v_lane_id"), ctx.vreg("v_tid"), tile.wave_size - 1,
+              comment=f"lane_id = tid & {tile.wave_size - 1}")
+    log2_wn = int(math.log2(tile.waves_n)) if tile.waves_n > 1 else 0
+    if tile.waves_n > 1:
+        ctx.v_lshr(ctx.vreg("v_wave_m"), ctx.vreg("v_wave_id"), log2_wn,
+                   comment=f"wave_m = wave_id >> {log2_wn}")
+        ctx.v_and(ctx.vreg("v_wave_n"), ctx.vreg("v_wave_id"),
+                  tile.waves_n - 1, comment=f"wave_n = wave_id & {tile.waves_n - 1}")
+    else:
+        ctx.v_mov(ctx.vreg("v_wave_m"), ctx.vreg("v_wave_id"), comment="wave_m")
+        ctx.v_mov(ctx.vreg("v_wave_n"), "0", comment="wave_n = 0")
+    ctx.raw("")
+
+    # DTL per-lane offset
+    threads_per_row = int(tile.unroll_k * elem) // 16
+    log2_tpr = int(math.log2(threads_per_row))
+    ctx.comment(f"DTL offset: {threads_per_row} threads/row")
+    ctx.v_lshr(ctx.vreg("v_tmp0"), ctx.vreg("v_tid"), log2_tpr,
+               comment="thread_row")
+    ctx.v_and(ctx.vreg("v_tmp1"), ctx.vreg("v_tid"), threads_per_row - 1,
+              comment="thread_col_group")
+    ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_tmp1"), 4,
+               comment="* 16 -> col_bytes")
+
+    # DTL voffset = thread_row * K * elem + col_bytes
+    ctx.inst("v_mul_lo_u32", ctx.vreg("v_dtl_off_a"),
+             ctx.sreg("s_k_stride"), ctx.vreg("v_tmp0"), comment="row * K*elem")
+    ctx.v_add(ctx.vreg("v_dtl_off_a"), ctx.vreg("v_dtl_off_a"),
+              ctx.vreg("v_tmp1"), comment="+ col_bytes")
+    ctx.v_mov(ctx.vreg("v_dtl_off_b"), ctx.vreg("v_dtl_off_a"),
+              comment="B offset = same")
+    ctx.raw("")
+
+    # SRD A
+    ctx.comment("SRD A")
+    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"), str(tile.wg_m),
+              comment=f"wg_id * {tile.wg_m}")
+    ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+             ctx.sreg("s_k_stride"), comment="* K*elem")
+    ctx.inst("s_add_u32", ctx.sreg("s_srd_a", 0, 1),
+             ctx.sreg("s_ptr_A", 0, 1), ctx.sreg("s_tmp0"), comment="SRD_A lo")
+    ctx.inst("s_addc_u32", ctx.sreg("s_srd_a", 1, 1),
+             ctx.sreg("s_ptr_A", 1, 1), "0", comment="SRD_A hi")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_a", 2, 1), "0xFFFFFFFF", comment="limit")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_a", 3, 1), "0x20000", comment="flags")
+    ctx.raw("")
+
+    # SRD B
+    ctx.comment("SRD B")
+    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"), str(tile.wg_n),
+              comment=f"wg_id * {tile.wg_n}")
+    ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+             ctx.sreg("s_k_stride"), comment="* K*elem")
+    ctx.inst("s_add_u32", ctx.sreg("s_srd_b", 0, 1),
+             ctx.sreg("s_ptr_B", 0, 1), ctx.sreg("s_tmp0"), comment="SRD_B lo")
+    ctx.inst("s_addc_u32", ctx.sreg("s_srd_b", 1, 1),
+             ctx.sreg("s_ptr_B", 1, 1), "0", comment="SRD_B hi")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_b", 2, 1), "0xFFFFFFFF", comment="limit")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_b", 3, 1), "0x20000", comment="flags")
+    ctx.raw("")
+
+    # Scalar offsets for multi-line DTL loads
+    rows_per_load = tile.block_size // threads_per_row
+    ctx.comment(f"Scalar offset for DTL lines ({rows_per_load} rows/load)")
+    ctx.s_mul(ctx.sreg("s_soffset_a"), ctx.sreg("s_k_stride"),
+              str(rows_per_load), comment=f"soffset = {rows_per_load} * K*elem")
+    ctx.s_mov(ctx.sreg("s_soffset_b"), ctx.sreg("s_soffset_a"), comment="same")
+    ctx.raw("")
+
+    # LDS write base for DTL
+    ctx.comment("LDS write base for DTL")
+    dtl_row_stride = int(tile.unroll_k * elem)
+    ctx.v_mul(ctx.vreg("v_tmp0"), str(dtl_row_stride),
+              ctx.vreg("v_tmp0"), comment=f"row * {dtl_row_stride}")
+    ctx.v_add(ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),
+              comment="+ col_bytes -> per-thread LDS offset")
+    ctx.inst("v_readfirstlane_b32", ctx.sreg("s_lds_wr_a_sg"),
+             ctx.vreg("v_tmp0"), comment="LDS write base A")
+    if tile.lds_pad > 0:
+        threads_per_row_ = int(tile.unroll_k * elem) // 16
+        rows_per_load_ = tile.block_size // threads_per_row_
+        num_loads_a_ = tile.wg_m // rows_per_load_
+        dtl_lds_b_offset = int(tile.wg_m * tile.unroll_k * elem) + num_loads_a_ * tile.lds_pad
+    else:
+        dtl_lds_b_offset = layouts.lds_b_offset
+    ctx.inst("s_add_u32", ctx.sreg("s_lds_wr_b_sg"),
+             ctx.sreg("s_lds_wr_a_sg"), str(dtl_lds_b_offset),
+             comment=f"LDS write base B = A + {dtl_lds_b_offset}")
+    ctx.raw("")
+
+    # LDS read addresses
+    k_per_group = mfma.k // (tile.wave_size // mfma.m)
+    ctx.comment("LDS read addresses")
+    ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.m - 1,
+              comment=f"lane_row = lane_id % {mfma.m}")
+    ctx.v_lshr(ctx.vreg("v_tmp1"), ctx.vreg("v_lane_id"),
+               int(math.log2(mfma.m)), comment=f"lane_id / {mfma.m}")
+    ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_tmp1"),
+               int(math.log2(k_per_group)), comment=f"* {k_per_group}")
+
+    # LDS read A
+    ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(tile.m_per_wave),
+              ctx.vreg("v_wave_m"), comment=f"wave_m * {tile.m_per_wave}")
+    ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
+              ctx.vreg("v_tmp0"), comment="+ lane_row")
+    ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(tile.unroll_k),
+              ctx.vreg("v_lds_rd_a"), comment=f"* {tile.unroll_k}")
+    if tile.lds_pad > 0:
+        tpr = int(tile.unroll_k * elem) // 16
+        rpl = tile.block_size // tpr
+        wave_lines = tile.m_per_wave // rpl
+        if wave_lines > 0:
+            ctx.v_mul(ctx.vreg("v_tmp0"), str(wave_lines * tile.lds_pad),
+                      ctx.vreg("v_wave_m"),
+                      comment=f"wave pad = wave_m * {wave_lines * tile.lds_pad}")
+            ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
+                      ctx.vreg("v_tmp0"), comment="+ wave padding")
+    ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
+              ctx.vreg("v_tmp1"), comment="+ lane_k")
+    if elem >= 1:
+        ctx.v_lshl(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
+                   int(math.log2(elem)), comment=f"* {elem}")
+    else:
+        ctx.v_lshr(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
+                   int(math.log2(1.0 / elem)), comment=f"* {elem} (sub-byte)")
+    ctx.raw("")
+
+    # LDS read B
+    ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.m - 1,
+              comment=f"lane_row = lane_id % {mfma.m} (re-derive)")
+    ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(tile.n_per_wave),
+              ctx.vreg("v_wave_n"), comment=f"wave_n * {tile.n_per_wave}")
+    ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
+              ctx.vreg("v_tmp0"), comment="+ lane_row")
+    ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(tile.unroll_k),
+              ctx.vreg("v_lds_rd_b"), comment=f"* {tile.unroll_k}")
+    ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
+              ctx.vreg("v_tmp1"), comment="+ lane_k")
+    if elem >= 1:
+        ctx.v_lshl(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
+                   int(math.log2(elem)), comment=f"* {elem}")
+    else:
+        ctx.v_lshr(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
+                   int(math.log2(1.0 / elem)), comment=f"* {elem} (sub-byte)")
+    if tile.lds_pad > 0:
+        tpr_b = int(tile.unroll_k * elem) // 16
+        rpl_b = tile.block_size // tpr_b
+        wave_lines_b = tile.n_per_wave // rpl_b
+        if wave_lines_b > 0:
+            ctx.v_mul(ctx.vreg("v_tmp0"), str(wave_lines_b * tile.lds_pad),
+                      ctx.vreg("v_wave_n"),
+                      comment=f"wave pad = wave_n * {wave_lines_b * tile.lds_pad}")
+            ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
+                      ctx.vreg("v_tmp0"), comment="+ wave padding (bytes)")
+    if tile.lds_pad > 0:
+        threads_per_row__ = int(tile.unroll_k * elem) // 16
+        rows_per_load__ = tile.block_size // threads_per_row__
+        num_loads_a__ = tile.wg_m // rows_per_load__
+        dtl_b_off = int(tile.wg_m * tile.unroll_k * elem) + num_loads_a__ * tile.lds_pad
+    else:
+        dtl_b_off = layouts.lds_b_offset
+    ctx.v_add(ctx.vreg("v_lds_rd_b"), str(dtl_b_off),
+              ctx.vreg("v_lds_rd_b"), comment=f"+ lds_b_offset({dtl_b_off})")
+    ctx.raw("")
+
+    # Init accumulators
+    acc_total = tile.mfma_m_repeat * tile.mfma_n_repeat * tile.mfma.acc_vgprs
+    ctx.comment(f"Init {acc_total} accumulators")
+    for i in range(acc_total):
+        ctx.inst("v_accvgpr_write_b32", ctx.areg("acc_C", i, 1), "0")
+    ctx.raw("")
+
+    # Init MX constant scale VGPR
+    if mfma.is_mx:
+        ctx.comment("Init MX constant scale = 1.0 (E8M0 0x7F)")
+        ctx.v_mov(ctx.vreg("v_mxscale"), "0x7F7F7F7F",
+                  comment="scale = 1.0 for all byte lanes")
+        ctx.raw("")
 
 
 def phase_dtl_interleaved_setup(level, ctx):
@@ -588,5 +840,11 @@ def phase_dtl_interleaved_k_loop(level, ctx):
 
 DTL_INTERLEAVED_PROLOGUE_PHASES = [
     TilePhase("dtl_interleaved_setup", phase_dtl_interleaved_setup),
+    TilePhase("dtl_interleaved_k_loop", phase_dtl_interleaved_k_loop),
+]
+
+
+WAVE_ABI_PROLOGUE_PHASES = [
+    TilePhase("wave_abi_setup", phase_wave_abi_setup),
     TilePhase("dtl_interleaved_k_loop", phase_dtl_interleaved_k_loop),
 ]

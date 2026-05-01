@@ -137,6 +137,7 @@ class GemmKernel:
               dtl_interleaved: bool = False,
               dtl_scheduled: bool = False,
               dtl_partitioned: bool = False,
+              wave_abi: bool = False,
               use_real_scales: bool = False) -> GemmKernel:
         """Build a GemmKernel.  GemmTiling is the source of truth.
 
@@ -159,11 +160,11 @@ class GemmKernel:
             if tile is not None:
                 tiling = GemmTiling.from_tile_config(tile)
             else:
-                if dtl_interleaved or dtl_scheduled or dtl_partitioned:
+                if dtl_interleaved or dtl_scheduled or dtl_partitioned or wave_abi:
                     # DTL variants need 256x256x64 for 128 MFMAs
                     tiling = GemmTiling.high_perf(
                         wg_m=256, wg_n=256, unroll_k=64)
-                elif optimized or scheduled or interleaved or pgr2 or dtl or interleaved_large or auto_scheduled or pgr2_interleaved:
+                elif optimized or scheduled or interleaved or pgr2 or dtl or interleaved_large or auto_scheduled or pgr2_interleaved or wave_abi:
                     tiling = GemmTiling.high_perf()
                 else:
                     tiling = GemmTiling.standard()
@@ -186,7 +187,8 @@ class GemmKernel:
                 pgr2_interleaved=pgr2_interleaved,
                 dtl_interleaved=dtl_interleaved,
                 dtl_scheduled=dtl_scheduled,
-                dtl_partitioned=dtl_partitioned)
+                dtl_partitioned=dtl_partitioned,
+                wave_abi=wave_abi)
 
         tile_tree.validate()
 
@@ -205,7 +207,7 @@ class GemmKernel:
         elem = self.problem.element_bytes
         pad_elems = tile.lds_pad // elem if tile.lds_pad > 0 else 0
         lds_row_stride = tile.unroll_k + pad_elems
-        is_dtl = any(p.name in ("dtl_setup", "dtl_interleaved_setup")
+        is_dtl = any(p.name in ("dtl_setup", "dtl_interleaved_setup", "wave_abi_setup")
                      for p in self.tile_tree.prologue_phases)
         if is_dtl and tile.lds_pad > 0:
             # DTL uses per-load-line padding (not per-row)
@@ -412,3 +414,39 @@ def export_custom_kernel(kernel: "GemmKernel", output_path: str,
         f.write(".end_amdgpu_metadata\n")
 
     return kernel_name
+
+
+def export_wave_kernel(kernel: "GemmKernel", output_path: str,
+                       kernel_name: str = None,
+                       gpu_arch: str = "gfx950") -> str:
+    """Export kernel as a .co file for the rocRoller WaveGemmKernelArgs path.
+
+    Generates a code object (.co) suitable for hipBLASLt's custom kernel
+    registry via hipModuleLoad. Uses the WaveGemmKernelArgs ABI (104 bytes,
+    all u64 fields, 2D grid).
+
+    Args:
+        kernel: Built GemmKernel (should be built with wave_abi=True).
+        output_path: Path for the .co file.
+        kernel_name: Override kernel symbol name. Must start with "wave_"
+                     for hipBLASLt's ABI dispatch.
+        gpu_arch: Target GPU architecture.
+
+    Returns:
+        The kernel name used.
+    """
+    tile = kernel.tile
+    mfma = tile.mfma
+
+    if kernel_name is None:
+        if mfma.is_mx:
+            kernel_name = f"wave_mxfp4_{tile.wg_m}x{tile.wg_n}x{tile.unroll_k}_kgen"
+        else:
+            kernel_name = f"wave_fp16_{tile.wg_m}x{tile.wg_n}x{tile.unroll_k}_kgen"
+
+    kernel.kernel_name = kernel_name
+    result = kernel.emit()
+
+    # Assemble .s -> .o -> .co
+    co_path = result.assemble(gpu_arch=gpu_arch, output_path=output_path)
+    return kernel_name, co_path
