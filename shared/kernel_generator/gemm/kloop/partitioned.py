@@ -20,13 +20,18 @@ from ..tile.tree import TilePhase
 from ..schedule.partition import PartitionPlan, Partition
 from ..schedule.mainloop import MainloopScheduler, ScheduleModule, ModuleKind
 from ..schedule.slot_placer import SlotPlacer, PlacedOp, Path, SchedulingRules
+from ..emit.phases import (
+    phase_load_kernargs, phase_store_d,
+    phase_thread_indexing, phase_load_cluster_setup, phase_lds_addrs,
+    phase_init_acc, phase_global_addrs,
+)
 from .setup import (
     phase_dtl_interleaved_setup,
     _emit_dtl_loads_a, _emit_dtl_loads_b,
     _a_off, _b_off,
 )
 
-__all__ = ["phase_dtl_partitioned_k_loop", "DTL_PARTITIONED_PROLOGUE_PHASES"]
+__all__ = ["phase_dtl_partitioned_k_loop", "DTL_PARTITIONED_PROLOGUE_PHASES", "GLOBAL_LOAD_PARTITIONED_PROLOGUE_PHASES"]
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +72,7 @@ def phase_mx_scale_setup(level, ctx):
     """
     tile = ctx._metadata["tile"]
     mfma = tile.mfma
+    use_dtl = ctx._metadata.get("use_dtl", True)
     use_real_scales = ctx._metadata.get("use_real_scales", False)
     use_swizzled_scales = (ctx._metadata.get("use_1d_grid", False) or ctx._metadata.get("use_wave_abi", False)) and use_real_scales
     if not mfma.is_mx or not use_real_scales:
@@ -255,6 +261,37 @@ def _recompute_ki_bases(ctx, tile, mfma, elem, ki_count):
                      comment=f"rd_{matrix}_k{ki} = rd_{matrix} ^ {xor_bytes}")
 
 
+
+
+def _emit_global_loads(ctx, tile, problem):
+    """Issue global_load for A and B (non-DTL path)."""
+    from ..emit.phases import _emit_global_load_no_wait
+    _emit_global_load_no_wait(ctx, problem, tile)
+
+
+def _emit_ds_writes(ctx, tile):
+    """Write loaded data from VGPRs to LDS (non-DTL path)."""
+    for name in ["a", "b"]:
+        load = ctx.get(f"v_gload_{name}")
+        addr_reg = ctx.vreg(f"v_lds_wr_{name}")
+        for i in range(0, load.count, 4):
+            cnt = min(4, load.count - i)
+            src = ctx.vreg(f"v_gload_{name}", i, cnt)
+            ctx.ds_write(addr_reg, src, offset=i * 4, width=cnt,
+                         comment=f"LDS write {name.upper()}[{i}:{i+cnt}]")
+
+
+def _advance_global_addrs(ctx, problem, tile):
+    """Advance A/B global pointers by unroll_k (non-DTL path)."""
+    k_stride = int(tile.unroll_k * problem.element_bytes)
+    for addr in ["v_addr_a", "v_addr_b"]:
+        ctx.inst("v_add_co_u32", ctx.vreg(addr, 0, 1), "vcc",
+                 str(k_stride), ctx.vreg(addr, 0, 1),
+                 comment=f"{addr} += {k_stride}")
+        ctx.inst("v_addc_co_u32", ctx.vreg(addr, 1, 1), "vcc",
+                 ctx.vreg(addr, 1, 1), "0", "vcc", comment="carry")
+
+
 def _toggle_rd_with_ki(ctx, tile, mfma, elem, ki_count, base_name, matrix):
     """Toggle read base + recompute per-ki bases after DB swap."""
     ctx.v_add(ctx.vreg(base_name),
@@ -277,6 +314,7 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     """DTL K-loop with partition-based scheduling."""
     tile = ctx._metadata["tile"]
     problem = ctx._metadata["problem"]
+    use_dtl = ctx._metadata.get("use_dtl", True)
     elem = problem.element_bytes
     mfma = tile.mfma
 
@@ -402,24 +440,27 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                       comment=f"soff_b[{ni_}] = stride * {ni_ * mfma.n}")
         ctx.raw("")
 
-    # Prologue: DTL load first tile
-    # Precompute DTL soffsets: soff[i] = i * soffset_stride
-    ctx.comment("Precompute DTL soffsets")
-    for i in range(1, num_loads_a):
-        name = f"s_dtl_soff_a{i}"
-        ctx.alloc_sgpr_permanent(1, name)
-        ctx.s_mul(ctx.sreg(name), ctx.sreg("s_soffset_a"), str(i),
-                  comment=f"dtl_soff_a[{i}] = {i} * soffset_a")
-    for i in range(1, num_loads_b):
-        name = f"s_dtl_soff_b{i}"
-        ctx.alloc_sgpr_permanent(1, name)
-        ctx.s_mul(ctx.sreg(name), ctx.sreg("s_soffset_b"), str(i),
-                  comment=f"dtl_soff_b[{i}] = {i} * soffset_b")
-    ctx.raw("")
+    # Precompute DTL soffsets (only for DTL path)
+    if use_dtl:
+        ctx.comment("Precompute DTL soffsets")
+        for i in range(1, num_loads_a):
+            name = f"s_dtl_soff_a{i}"
+            ctx.alloc_sgpr_permanent(1, name)
+            ctx.s_mul(ctx.sreg(name), ctx.sreg("s_soffset_a"), str(i),
+                      comment=f"dtl_soff_a[{i}] = {i} * soffset_a")
+        for i in range(1, num_loads_b):
+            name = f"s_dtl_soff_b{i}"
+            ctx.alloc_sgpr_permanent(1, name)
+            ctx.s_mul(ctx.sreg(name), ctx.sreg("s_soffset_b"), str(i),
+                      comment=f"dtl_soff_b[{i}] = {i} * soffset_b")
+        ctx.raw("")
 
-    ctx.comment("Prologue: DTL tile 0")
-    _emit_dtl_loads_a(ctx, tile, problem, num_loads_a)
-    _emit_dtl_loads_b(ctx, tile, problem, num_loads_b)
+    ctx.comment("Prologue: load tile 0")
+    if use_dtl:
+        _emit_dtl_loads_a(ctx, tile, problem, num_loads_a)
+        _emit_dtl_loads_b(ctx, tile, problem, num_loads_b)
+    else:
+        _emit_global_loads(ctx, tile, problem)
     if use_real_scales:
         if use_swizzled_scales:
             # Swizzled scale loads: 2 groups for A, 2 for B
@@ -469,15 +510,19 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                          ctx.vreg("v_dtl_off_scale_b"),
                          ctx.sreg("s_srd_scale_b", 0, 4),
                          soff, "offen", comment=f"scale B ni={ni_}")
-    if use_real_scales and not use_swizzled_scales:
-        # Scale loads (newest vmem ops) can stay in-flight past barrier;
-        # only DTL loads (oldest) must complete for LDS coherency.
-        num_scale_loads = partition_m + nr  # scale_a subtile0 + all scale_b
-        ctx.s_waitcnt(f"vmcnt({num_scale_loads})",
-                      comment=f"wait DTL (leave {num_scale_loads} scale loads in-flight)")
+    if use_dtl:
+        if use_real_scales and not use_swizzled_scales:
+            num_scale_loads = partition_m + nr
+            ctx.s_waitcnt(f"vmcnt({num_scale_loads})",
+                          comment=f"wait DTL (leave {num_scale_loads} scale loads in-flight)")
+        else:
+            ctx.s_waitcnt("vmcnt(0)", comment="wait DTL loads")
+        ctx.s_barrier(comment="sync")
     else:
-        ctx.s_waitcnt("vmcnt(0)", comment="wait DTL loads")
-    ctx.s_barrier(comment="sync")
+        ctx.s_waitcnt("vmcnt(0)", comment="wait global loads")
+        _emit_ds_writes(ctx, tile)
+        ctx.s_waitcnt("lgkmcnt(0)", comment="wait LDS writes")
+        ctx.s_barrier(comment="sync")
     ctx.raw("")
 
     # ================================================================
@@ -617,7 +662,10 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     # Suffix ops for the last mi group (placed backward)
     # When cross-iteration prefetch is active, the suffix vmcnt must
     # leave the prefetch loads in-flight (they complete by next iter).
-    _pf_inflight = (partition_m + nr) if (use_real_scales and not use_swizzled_scales) else 0
+    if use_dtl:
+        _pf_inflight = (partition_m + nr) if (use_real_scales and not use_swizzled_scales) else 0
+    else:
+        _pf_inflight = 0  # no DTL in-flight for non-DTL path
     suffix_ops = [
         PlacedOp(emit_fn=lambda n=_pf_inflight: ctx.s_waitcnt(
                  f"vmcnt({n})", comment=f"wait DTL (leave {n} prefetch in-flight)"),
@@ -783,20 +831,23 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                     offset=_b_off(ni, 0, tile, mfma, elem),
                     width=bv, comment=f"LR B n{ni}k0")
 
-    # DTL prefix
+    # Data load prefix
     ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
               comment="k_tiles--")
     ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
              comment="more tiles?")
-    ctx.inst("s_cbranch_scc0", "dtl_skip_all",
-             comment="skip DTL on last iter")
+    ctx.inst("s_cbranch_scc0", "load_skip_all",
+             comment="skip loads on last iter")
 
-    for srd in ["s_srd_a", "s_srd_b"]:
-        ctx.inst("s_add_u32", ctx.sreg(srd, 0, 1),
-                 ctx.sreg(srd, 0, 1), str(k_stride),
-                 comment=f"{srd} += {k_stride}")
-        ctx.inst("s_addc_u32", ctx.sreg(srd, 1, 1),
-                 ctx.sreg(srd, 1, 1), "0", comment="carry")
+    if use_dtl:
+        for srd in ["s_srd_a", "s_srd_b"]:
+            ctx.inst("s_add_u32", ctx.sreg(srd, 0, 1),
+                     ctx.sreg(srd, 0, 1), str(k_stride),
+                     comment=f"{srd} += {k_stride}")
+            ctx.inst("s_addc_u32", ctx.sreg(srd, 1, 1),
+                     ctx.sreg(srd, 1, 1), "0", comment="carry")
+    else:
+        _advance_global_addrs(ctx, problem, tile)
 
     # Advance scale SRDs
     if use_real_scales and scale_k_stride > 0 and use_swizzled_scales:
@@ -807,18 +858,30 @@ def phase_dtl_partitioned_k_loop(level, ctx):
             ctx.inst("s_addc_u32", ctx.sreg(srd, 1, 1),
                      ctx.sreg(srd, 1, 1), "0", comment="carry")
 
-    ctx.inst("s_add_u32", ctx.sreg("s_lds_wr_a_sg"),
-             ctx.sreg("s_lds_wr_a_sg"), ctx.sreg("s_lds_db_step"),
-             comment="wr_a += db")
-    ctx.inst("s_add_u32", ctx.sreg("s_lds_wr_b_sg"),
-             ctx.sreg("s_lds_wr_b_sg"), ctx.sreg("s_lds_db_step"),
-             comment="wr_b += db")
+    if use_dtl:
+        ctx.inst("s_add_u32", ctx.sreg("s_lds_wr_a_sg"),
+                 ctx.sreg("s_lds_wr_a_sg"), ctx.sreg("s_lds_db_step"),
+                 comment="wr_a += db")
+        ctx.inst("s_add_u32", ctx.sreg("s_lds_wr_b_sg"),
+                 ctx.sreg("s_lds_wr_b_sg"), ctx.sreg("s_lds_db_step"),
+                 comment="wr_b += db")
+    else:
+        # Non-DTL: toggle LDS write VGPRs
+        ctx.v_add(ctx.vreg("v_lds_wr_a"),
+                  ctx.sreg("s_lds_db_step"), ctx.vreg("v_lds_wr_a"),
+                  comment="wr_a += db")
+        ctx.v_add(ctx.vreg("v_lds_wr_b"),
+                  ctx.sreg("s_lds_db_step"), ctx.vreg("v_lds_wr_b"),
+                  comment="wr_b += db")
 
     # Toggle scale LDS write bases
 
 
-    _emit_dtl_loads_a(ctx, tile, problem, num_loads_a)
-    _emit_dtl_loads_b(ctx, tile, problem, num_loads_b)
+    if use_dtl:
+        _emit_dtl_loads_a(ctx, tile, problem, num_loads_a)
+        _emit_dtl_loads_b(ctx, tile, problem, num_loads_b)
+    else:
+        _emit_global_loads(ctx, tile, problem)
     if use_real_scales:
         if use_swizzled_scales:
             # Swizzled scale loads: 2 groups for A, 2 for B
@@ -851,11 +914,17 @@ def phase_dtl_partitioned_k_loop(level, ctx):
         # No waitcnt here: scale loads overlap with barrier + LDS reads
     ctx.raw("")
 
-    ctx.label("dtl_skip_all")
-    # No barrier needed here: DTL writes go to the OTHER buffer,
-    # preamble reads come from the CURRENT buffer. The suffix barrier
-    # from the previous iteration already synced all waves.
-    # On first iteration, the prologue barrier handles the sync.
+    ctx.label("load_skip_all")
+    if use_dtl:
+        # No barrier needed: DTL writes to OTHER buffer,
+        # preamble reads from CURRENT buffer.
+        pass
+    else:
+        # Non-DTL: need to write loaded data to LDS and sync
+        ctx.s_waitcnt("vmcnt(0)", comment="wait global loads")
+        _emit_ds_writes(ctx, tile)
+        ctx.s_waitcnt("lgkmcnt(0)", comment="wait LDS writes")
+        ctx.s_barrier(comment="sync")
     ctx.raw("")
 
     # Preamble: A reads + B ki=1 (B ki=0 already issued at loop top)
@@ -888,11 +957,12 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     wait_cnt = min(remaining, 15)  # lgkmcnt max is 15 on gfx9
     ctx.s_waitcnt(f"lgkmcnt({wait_cnt})", comment="wait B[ki=0] + A[m0,k0]")
     if use_real_scales and not use_swizzled_scales:
-        # DTL loads for next iter (newest) can stay in-flight;
-        # only scale loads (oldest) must complete for MFMA operands.
-        num_dtl = num_loads_a + num_loads_b
-        ctx.s_waitcnt(f"vmcnt({num_dtl})",
-                      comment=f"wait scales (leave {num_dtl} DTL in-flight)")
+        if use_dtl:
+            num_dtl = num_loads_a + num_loads_b
+            ctx.s_waitcnt(f"vmcnt({num_dtl})",
+                          comment=f"wait scales (leave {num_dtl} DTL in-flight)")
+        else:
+            ctx.s_waitcnt("vmcnt(0)", comment="wait scale loads")
     elif use_real_scales:
         ctx.s_waitcnt("vmcnt(0)", comment="wait scale VGPR loads")
     ctx.raw("")
@@ -923,11 +993,13 @@ def phase_dtl_partitioned_k_loop(level, ctx):
             if mfma_count > 0 and mfma_count % mfmas_per_subtile == 0:
                 st_idx = mfma_count // mfmas_per_subtile
                 if st_idx < num_subtiles:
-                    # DTL loads (newest) can stay in-flight;
-                    # only scale prefetch loads (oldest) need to complete.
-                    num_dtl_ = num_loads_a + num_loads_b
-                    ctx.s_waitcnt(f"vmcnt({num_dtl_})",
-                                  comment=f"wait scale_a subtile {st_idx} (leave DTL)")
+                    if use_dtl:
+                        num_dtl_ = num_loads_a + num_loads_b
+                        ctx.s_waitcnt(f"vmcnt({num_dtl_})",
+                                      comment=f"wait scale_a subtile {st_idx} (leave DTL)")
+                    else:
+                        ctx.s_waitcnt("vmcnt(0)",
+                                      comment=f"wait scale_a subtile {st_idx}")
 
         # Partition boundary comments
         if mfma_count % (partition_m * mfmas_per_mi) == 0:
@@ -960,6 +1032,17 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     else:
         ctx.inst("s_cbranch_scc1", "k_loop", comment="loop")
     ctx.raw("")
+
+
+GLOBAL_LOAD_PARTITIONED_PROLOGUE_PHASES = [
+    TilePhase("load_kernargs", phase_load_kernargs),
+    TilePhase("thread_indexing", phase_thread_indexing),
+    TilePhase("load_cluster_setup", phase_load_cluster_setup),
+    TilePhase("lds_addrs", phase_lds_addrs),
+    TilePhase("init_acc", phase_init_acc),
+    TilePhase("global_addrs", phase_global_addrs),
+    TilePhase("dtl_partitioned_k_loop", phase_dtl_partitioned_k_loop),
+]
 
 
 DTL_PARTITIONED_PROLOGUE_PHASES = [

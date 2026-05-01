@@ -135,7 +135,8 @@ class GemmKernel:
               dtl_interleaved: bool = False,
               dtl_partitioned: bool = False,
               wave_abi: bool = False,
-              use_real_scales: bool = False) -> GemmKernel:
+              use_real_scales: bool = False,
+              use_dtl: bool = True) -> GemmKernel:
         """Build a GemmKernel.  GemmTiling is the source of truth.
 
         Args:
@@ -156,8 +157,11 @@ class GemmKernel:
             if tile is not None:
                 tiling = GemmTiling.from_tile_config(tile)
             else:
-                if dtl_interleaved or dtl_partitioned or wave_abi:
+                if (dtl_interleaved or dtl_partitioned or wave_abi) and use_dtl:
                     # DTL variants need 256x256x64 for 128 MFMAs
+                    tiling = GemmTiling.high_perf(
+                        wg_m=256, wg_n=256, unroll_k=64)
+                elif dtl_partitioned and not use_dtl:
                     tiling = GemmTiling.high_perf(
                         wg_m=256, wg_n=256, unroll_k=64)
                 elif optimized or interleaved or pgr2 or dtl or interleaved_large or pgr2_interleaved or wave_abi:
@@ -181,7 +185,8 @@ class GemmKernel:
                 interleaved_large=interleaved_large,
                 pgr2_interleaved=pgr2_interleaved,
                 dtl_interleaved=dtl_interleaved,
-                dtl_partitioned=dtl_partitioned,
+                dtl_partitioned=dtl_partitioned and use_dtl,
+                non_dtl_partitioned=dtl_partitioned and not use_dtl,
                 wave_abi=wave_abi)
 
         tile_tree.validate()
@@ -193,6 +198,7 @@ class GemmKernel:
             mfma_visitor=default_mfma_visitor,
         )
         k.use_real_scales = use_real_scales
+        k.use_dtl = use_dtl
         return k
 
     def emit(self) -> AsmKernel:
@@ -229,6 +235,7 @@ class GemmKernel:
             "problem": self.problem,
             "layouts": self.layouts,
             "kernel": self,
+            "use_dtl": getattr(self, 'use_dtl', True),
             "use_real_scales": getattr(self, 'use_real_scales', False),
             "lds_scale_half": lds_scale_half,
             "lds_data_half": lds_half - lds_scale_half,
