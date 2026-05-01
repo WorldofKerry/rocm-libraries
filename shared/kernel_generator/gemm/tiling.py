@@ -207,6 +207,7 @@ class GemmTiling:
     wave_size: int = 64
     lds_pad: int = 0  # LDS padding bytes per row for bank conflict avoidance
     lds_swizzle: bool = False  # XOR-based LDS bank conflict avoidance
+    swizzle: object = None     # Swizzle instance (overrides lds_swizzle)
 
     @staticmethod
     def standard(
@@ -241,6 +242,7 @@ class GemmTiling:
         wave_size: int = 64,
         lds_pad: int = 0,  # TODO: fix non-pow2 padding slowdown, then re-enable
         lds_swizzle: bool = False,
+        swizzle: object = None,
     ) -> GemmTiling:
         """High-performance tiling for gfx950.
 
@@ -261,6 +263,7 @@ class GemmTiling:
         )
         t.lds_pad = lds_pad
         t.lds_swizzle = lds_swizzle
+        t.swizzle = swizzle
         return t
 
     @staticmethod
@@ -336,7 +339,7 @@ class GemmTiling:
             wg_m=self.wg_m, wg_n=self.wg_n, unroll_k=self.unroll_k,
             waves_m=self.waves_m, waves_n=self.waves_n,
             mfma=self.mfma, wave_size=self.wave_size,
-            lds_pad=self.lds_pad, lds_swizzle=self.lds_swizzle,
+            lds_pad=self.lds_pad, lds_swizzle=self.lds_swizzle, swizzle=self.swizzle,
         )
 
     def build_tile_tree(self, pipelined: bool = False,
@@ -463,6 +466,7 @@ class GemmTiling:
             mfma=tile.mfma, wave_size=tile.wave_size)
         t.lds_pad = tile.lds_pad
         t.lds_swizzle = getattr(tile, "lds_swizzle", False)
+        t.swizzle = getattr(tile, "swizzle", None)
         return t
 
     def build_m_descriptor(self) -> TileDescriptor:

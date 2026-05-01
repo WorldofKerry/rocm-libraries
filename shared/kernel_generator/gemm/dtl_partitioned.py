@@ -23,7 +23,7 @@ from .slot_placer import SlotPlacer, PlacedOp, Path, SchedulingRules
 from .dtl_interleaved import (
     phase_dtl_interleaved_setup,
     _emit_dtl_loads_a, _emit_dtl_loads_b,
-    _a_off, _b_off, _swizzle_xor_bytes,
+    _a_off, _b_off,
 )
 
 __all__ = ["phase_dtl_partitioned_k_loop", "DTL_PARTITIONED_PROLOGUE_PHASES"]
@@ -211,30 +211,67 @@ def phase_mx_scale_setup(level, ctx):
 
 def _emit_swizzled_ds_read(ctx, dst, base_reg, offset, ki, tile, mfma, elem,
                            width=4, comment=""):
-    """Emit ds_read with LDS swizzle support.
+    """Emit ds_read using per-ki base VGPR.
     
-    For ki=0, reads directly from base_reg.
-    For ki>0 with lds_swizzle, uses precomputed v_lds_rd_a_k1 / v_lds_rd_b_k1
-    (set up once per iteration) instead of recomputing XOR each time.
+    ki=0 uses base_reg directly.
+    ki>0 uses the precomputed v_lds_rd_{a,b}_k{ki} VGPR.
     """
-    if getattr(tile, 'lds_swizzle', False) and ki > 0:
-        # Use precomputed swizzled base register
+    swz = tile.resolved_swizzle(elem) if hasattr(tile, 'resolved_swizzle') else None
+    if swz is not None and ki > 0:
         if base_reg == ctx.vreg("v_lds_rd_a"):
-            swz_reg = ctx.vreg("v_lds_rd_a_k1")
+            swz_reg = ctx.vreg(f"v_lds_rd_a_k{ki}")
         elif base_reg == ctx.vreg("v_lds_rd_b"):
-            swz_reg = ctx.vreg("v_lds_rd_b_k1")
+            swz_reg = ctx.vreg(f"v_lds_rd_b_k{ki}")
         else:
-            # Fallback: compute inline
-            xor_bytes = _swizzle_xor_bytes(tile, mfma, elem)
-            ctx.inst("v_xor_b32", ctx.vreg("v_tmp4"),
-                     base_reg, str(xor_bytes),
-                     comment=f"swizzle ki={ki}: XOR {xor_bytes}")
-            swz_reg = ctx.vreg("v_tmp4")
+            swz_reg = base_reg  # fallback
         ctx.ds_read(dst, swz_reg, offset=offset,
                     width=width, comment=comment)
     else:
         ctx.ds_read(dst, base_reg, offset=offset,
                     width=width, comment=comment)
+
+
+
+def _recompute_ki_bases(ctx, tile, mfma, elem, ki_count):
+    """Recompute per-ki LDS read base VGPRs from v_lds_rd_a/b."""
+    swz = tile.resolved_swizzle(elem) if hasattr(tile, 'resolved_swizzle') else None
+    if swz is None or ki_count <= 1:
+        return
+    from .swizzle import DataLayout as SwzLayout
+    swz_layout = SwzLayout(row_stride_bytes=int(tile.unroll_k * elem),
+                           mfma_k=mfma.k, mfma_m=mfma.m,
+                           elem_bytes=elem, wave_size=tile.wave_size)
+    nc = swz_layout.num_cols
+    for ki in range(1, ki_count):
+        step = ki * swz_layout.k_step
+        for matrix in ["a", "b"]:
+            base = ctx.vreg(f"v_lds_rd_{matrix}")
+            out = ctx.vreg(f"v_lds_rd_{matrix}_k{ki}")
+            # ki_base = base XOR (step * 16) for XOR swizzle,
+            # or (col + step) % nc * 16 + row for rotation swizzle.
+            # Generic approach: XOR the ki offset bytes
+            xor_bytes = step * 16  # k_step columns * 16 bytes/col
+            ctx.inst("v_xor_b32", out, base, str(xor_bytes),
+                     comment=f"rd_{matrix}_k{ki} = rd_{matrix} ^ {xor_bytes}")
+
+
+def _toggle_rd_with_ki(ctx, tile, mfma, elem, ki_count, base_name, matrix):
+    """Toggle read base + recompute per-ki bases after DB swap."""
+    ctx.v_add(ctx.vreg(base_name),
+              ctx.sreg("s_lds_db_step"), ctx.vreg(base_name),
+              comment=f"rd_{matrix} += db")
+    swz = tile.resolved_swizzle(elem) if hasattr(tile, 'resolved_swizzle') else None
+    if swz is not None and ki_count > 1:
+        from .swizzle import DataLayout as SwzLayout
+        swz_layout = SwzLayout(row_stride_bytes=int(tile.unroll_k * elem),
+                               mfma_k=mfma.k, mfma_m=mfma.m,
+                               elem_bytes=elem, wave_size=tile.wave_size)
+        for ki in range(1, ki_count):
+            step = ki * swz_layout.k_step
+            xor_bytes = step * 16
+            ctx.inst("v_xor_b32", ctx.vreg(f"v_lds_rd_{matrix}_k{ki}"),
+                     ctx.vreg(base_name), str(xor_bytes),
+                     comment=f"rd_{matrix}_k{ki} = rd_{matrix} ^ {xor_bytes}")
 
 def phase_dtl_partitioned_k_loop(level, ctx):
     """DTL K-loop with partition-based scheduling."""
@@ -585,24 +622,14 @@ def phase_dtl_partitioned_k_loop(level, ctx):
         PlacedOp(emit_fn=lambda n=_pf_inflight: ctx.s_waitcnt(
                  f"vmcnt({n})", comment=f"wait DTL (leave {n} prefetch in-flight)"),
                  op_type="wait", comment="vmcnt"),
-        PlacedOp(emit_fn=lambda: (
-                 ctx.v_add(ctx.vreg("v_lds_rd_a"),
-                 ctx.sreg("s_lds_db_step"), ctx.vreg("v_lds_rd_a"),
-                 comment="rd_a += db"),
-                 ctx.inst("v_xor_b32", ctx.vreg("v_lds_rd_a_k1"),
-                 ctx.vreg("v_lds_rd_a"),
-                 str(_swizzle_xor_bytes(tile, mfma, elem)),
-                 comment="rd_a_k1 = rd_a ^ swz") if getattr(tile, 'lds_swizzle', False) and ki_count > 1 else None
-                 ), op_type="salu", comment="toggle_a"),
-        PlacedOp(emit_fn=lambda: (
-                 ctx.v_add(ctx.vreg("v_lds_rd_b"),
-                 ctx.sreg("s_lds_db_step"), ctx.vreg("v_lds_rd_b"),
-                 comment="rd_b += db"),
-                 ctx.inst("v_xor_b32", ctx.vreg("v_lds_rd_b_k1"),
-                 ctx.vreg("v_lds_rd_b"),
-                 str(_swizzle_xor_bytes(tile, mfma, elem)),
-                 comment="rd_b_k1 = rd_b ^ swz") if getattr(tile, 'lds_swizzle', False) and ki_count > 1 else None
-                 ), op_type="salu", comment="toggle_b"),
+        PlacedOp(emit_fn=lambda: _toggle_rd_with_ki(
+                 ctx, tile, mfma, elem, ki_count,
+                 "v_lds_rd_a", "a"),
+                 op_type="salu", comment="toggle_a"),
+        PlacedOp(emit_fn=lambda: _toggle_rd_with_ki(
+                 ctx, tile, mfma, elem, ki_count,
+                 "v_lds_rd_b", "b"),
+                 op_type="salu", comment="toggle_b"),
     ]
     # Toggle scale LDS read addresses if MX
     if use_real_scales:
@@ -870,15 +897,8 @@ def phase_dtl_partitioned_k_loop(level, ctx):
         ctx.s_waitcnt("vmcnt(0)", comment="wait scale VGPR loads")
     ctx.raw("")
 
-    # Precompute swizzled LDS read bases for ki=1
-    if getattr(tile, 'lds_swizzle', False) and ki_count > 1:
-        xor_val = _swizzle_xor_bytes(tile, mfma, elem)
-        ctx.inst("v_xor_b32", ctx.vreg("v_lds_rd_a_k1"),
-                 ctx.vreg("v_lds_rd_a"), str(xor_val),
-                 comment=f"precompute rd_a_k1 = rd_a ^ {xor_val}")
-        ctx.inst("v_xor_b32", ctx.vreg("v_lds_rd_b_k1"),
-                 ctx.vreg("v_lds_rd_b"), str(xor_val),
-                 comment=f"precompute rd_b_k1 = rd_b ^ {xor_val}")
+    # Precompute per-ki LDS read bases
+    _recompute_ki_bases(ctx, tile, mfma, elem, ki_count)
     ctx.raw("")
 
     # ---- Emit scheduled body ----

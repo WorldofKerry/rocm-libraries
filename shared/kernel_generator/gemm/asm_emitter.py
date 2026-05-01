@@ -93,8 +93,11 @@ def alloc_registers(ctx: AsmContext, problem: GemmProblem,
     ctx.alloc_vgpr_permanent(1, "v_lds_wr_b")
     ctx.alloc_vgpr_permanent(1, "v_lds_rd_a")
     ctx.alloc_vgpr_permanent(1, "v_lds_rd_b")
-    ctx.alloc_vgpr_permanent(1, "v_lds_rd_a_k1")
-    ctx.alloc_vgpr_permanent(1, "v_lds_rd_b_k1")
+    # Per-ki LDS read base VGPRs (ki=0 uses v_lds_rd_a/b directly)
+    ki_count = tile.unroll_k // tile.mfma.k if tile.mfma.k > 0 else 1
+    for ki in range(1, ki_count):
+        ctx.alloc_vgpr_permanent(1, f"v_lds_rd_a_k{ki}")
+        ctx.alloc_vgpr_permanent(1, f"v_lds_rd_b_k{ki}")
 
     ctx.alloc_vgpr_permanent(tile.mfma.a_vgprs, "v_a")
     ctx.alloc_vgpr_permanent(tile.mfma.b_vgprs, "v_b")
@@ -330,8 +333,11 @@ def alloc_registers_dtl(ctx: AsmContext, problem: GemmProblem,
     # LDS read addresses (same as non-DTL)
     ctx.alloc_vgpr_permanent(1, "v_lds_rd_a")
     ctx.alloc_vgpr_permanent(1, "v_lds_rd_b")
-    ctx.alloc_vgpr_permanent(1, "v_lds_rd_a_k1")
-    ctx.alloc_vgpr_permanent(1, "v_lds_rd_b_k1")
+    # Per-ki LDS read base VGPRs (ki=0 uses v_lds_rd_a/b directly)
+    ki_count = tile.unroll_k // tile.mfma.k if tile.mfma.k > 0 else 1
+    for ki in range(1, ki_count):
+        ctx.alloc_vgpr_permanent(1, f"v_lds_rd_a_k{ki}")
+        ctx.alloc_vgpr_permanent(1, f"v_lds_rd_b_k{ki}")
 
     # MFMA operands (same as non-DTL)
     ctx.alloc_vgpr_permanent(tile.mfma.a_vgprs, "v_a")

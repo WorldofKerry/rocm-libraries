@@ -230,11 +230,27 @@ class TileConfig:
     wave_size: int = 64      # threads per wave
     mfma: MfmaConfig = field(default_factory=MfmaConfig.f16_16x16x16)
     lds_pad: int = 0         # LDS padding per row (bytes)
-    lds_swizzle: bool = False # XOR-based LDS bank conflict avoidance
+    lds_swizzle: bool = False # XOR-based LDS bank conflict avoidance (convenience)
+    swizzle: object = None   # Swizzle instance (overrides lds_swizzle if set)
     prefetch_stages: int = 1 # number of software-pipeline stages
     vector_width: int = 8    # elements per global load (fp16: 8 = 16 B)
     subtile: Optional[SubTileConfig] = None     # None = subtiling disabled
     partition: Optional[PartitionConfig] = None  # None = no partitioning
+
+    # -- swizzle resolution ------------------------------------------------
+
+    def resolved_swizzle(self, elem_bytes: float = None):
+        """Return the active Swizzle instance, or None.
+        
+        If self.swizzle is set, use it directly.
+        If self.lds_swizzle is True, auto-create an XorSwizzle.
+        """
+        if self.swizzle is not None:
+            return self.swizzle
+        if self.lds_swizzle:
+            from .swizzle import XorSwizzle
+            return XorSwizzle()
+        return None
 
     # -- subtile-derived quantities -----------------------------------------
 
