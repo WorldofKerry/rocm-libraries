@@ -400,7 +400,7 @@ class TestMXFP4RealScales:
         problem = GemmProblem(m, n, k, dtype=DataType.MXFP4)
         kernel = GemmKernel.build(problem, tiling=tiling,
                                   dtl_partitioned=True,
-                                  use_real_scales=True)
+                                  )
         result = kernel.emit()
         co_path = result.assemble(output_path=output_path)
         return kernel, co_path

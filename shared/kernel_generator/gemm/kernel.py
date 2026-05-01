@@ -135,7 +135,6 @@ class GemmKernel:
               dtl_interleaved: bool = False,
               dtl_partitioned: bool = False,
               wave_abi: bool = False,
-              use_real_scales: bool = None,
               use_dtl: bool = True) -> GemmKernel:
         """Build a GemmKernel.  GemmTiling is the source of truth.
 
@@ -197,10 +196,8 @@ class GemmKernel:
             kernel_name=kernel_name,
             mfma_visitor=default_mfma_visitor,
         )
-        # Auto-enable real scales for MX data types
-        if use_real_scales is None:
-            use_real_scales = problem.dtype.value == 'mxfp4'
-        k.use_real_scales = use_real_scales
+        # Derive real scales from data type (MX types always need scales)
+        k.use_real_scales = problem.dtype.value == 'mxfp4'
         k.use_dtl = use_dtl
         return k
 

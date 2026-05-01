@@ -243,13 +243,13 @@ class TileConfig:
         """Return the active Swizzle instance, or None.
         
         If self.swizzle is set, use it directly.
-        If self.lds_swizzle is True, auto-create an XorSwizzle.
+        If self.lds_swizzle is True, auto-create a RotationSwizzle (2-way optimal).
         """
         if self.swizzle is not None:
             return self.swizzle
         if self.lds_swizzle:
-            from .memory.swizzle import XorSwizzle
-            return XorSwizzle()
+            from .memory.swizzle import RotationSwizzle
+            return RotationSwizzle(use_cross_lane=True)
         return None
 
     # -- subtile-derived quantities -----------------------------------------
