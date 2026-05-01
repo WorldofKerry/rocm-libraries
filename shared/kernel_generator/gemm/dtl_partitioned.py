@@ -748,6 +748,14 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     ctx.label("k_loop")
     ctx.raw("")
 
+    # Early preamble B ki=0 reads (from current buffer, overlap with DTL)
+    ctx.comment("Early B reads (overlap with DTL)")
+    for ni in range(nr):
+        ctx.ds_read(ctx.vreg(b_names[(ni, 0)], 0, bv),
+                    ctx.vreg("v_lds_rd_b"),
+                    offset=_b_off(ni, 0, tile, mfma, elem),
+                    width=bv, comment=f"LR B n{ni}k0")
+
     # DTL prefix
     ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
               comment="k_tiles--")
@@ -823,20 +831,14 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     # On first iteration, the prologue barrier handles the sync.
     ctx.raw("")
 
-    # Preamble: scale reads + B + A[m0]
-    ctx.comment("Preamble: scales + B + A[m0]")
+    # Preamble: A reads + B ki=1 (B ki=0 already issued at loop top)
+    ctx.comment("Preamble: A[m0] + B ki=1")
 
-
-    for ni in range(nr):
-        ctx.ds_read(ctx.vreg(b_names[(ni, 0)], 0, bv),
-                    ctx.vreg("v_lds_rd_b"),
-                    offset=_b_off(ni, 0, tile, mfma, elem),
-                    width=bv, comment=f"LR B n{ni}k0")
     ctx.ds_read(ctx.vreg(a_names[(0, 0)], 0, av),
                 ctx.vreg("v_lds_rd_a"),
                 offset=_a_off(0, 0, tile, mfma, elem),
                 width=av, comment="LR A m0k0 b0")
-    preamble_inflight = nr + 1  # B[ki=0] reads + A[m0,k0]
+    preamble_inflight = nr + 1  # B[ki=0] reads (early) + A[m0,k0]
     if ki_count > 1:
         for ni in range(nr):
             _emit_swizzled_ds_read(
