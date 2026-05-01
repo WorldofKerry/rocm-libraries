@@ -139,8 +139,14 @@ def emit_descriptor(ctx: AsmContext, kernel_name: str,
     sgpr_count = ctx._next["s"]
     acc_count = ctx._next["acc"]
     vgpr_count = accum_offset + acc_count
-    # TensileLite-compatible kernarg sizes
-    kernarg_size = 136 if tile.mfma.is_mx else 104
+    # Kernarg size depends on ABI mode
+    use_wave_abi = ctx._metadata.get('use_wave_abi', False)
+    if use_wave_abi:
+        kernarg_size = 104  # WaveGemmKernelArgs: 13 u64 fields = 104 bytes
+    elif tile.mfma.is_mx:
+        kernarg_size = 136  # TensileLite MXFP4 batched layout
+    else:
+        kernarg_size = 104  # TensileLite non-MX layout
 
     ctx.raw("")
     ctx.raw(".rodata")
@@ -176,8 +182,25 @@ def emit_descriptor(ctx: AsmContext, kernel_name: str,
     ctx.raw(f"    .wavefront_size:  {tile.wave_size}")
     ctx.raw(f"    .max_flat_workgroup_size: {tile.block_size}")
     ctx.raw(f"    .args:")
+    # Wave ABI kernarg layout (WaveGemmKernelArgs)
+    if use_wave_abi:
+        args = [
+            (0, 8, "global_buffer", "ptr_a"),
+            (8, 8, "global_buffer", "ptr_a_scale"),
+            (16, 8, "global_buffer", "ptr_b"),
+            (24, 8, "global_buffer", "ptr_b_scale"),
+            (32, 8, "global_buffer", "ptr_c"),
+            (40, 8, "by_value", "dim_m"),
+            (48, 8, "by_value", "dim_n"),
+            (56, 8, "by_value", "dim_k"),
+            (64, 8, "by_value", "stride_a_dim0"),
+            (72, 8, "by_value", "stride_a_scale_dim0"),
+            (80, 8, "by_value", "stride_b_dim0"),
+            (88, 8, "by_value", "stride_b_scale_dim0"),
+            (96, 8, "by_value", "stride_c_dim0"),
+        ]
     # TensileLite batched MXFP4 kernarg layout
-    if tile.mfma.is_mx:
+    elif tile.mfma.is_mx:
         args = [
             (0, 4, "by_value", "Gemm info"),
             (4, 4, "by_value", "kernel info0"),
