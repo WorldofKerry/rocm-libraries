@@ -472,7 +472,7 @@ class TestWaveABIKernel:
         mx = MfmaConfig.mxfp4_16x16x128()
         t = GemmTiling.high_perf(wg_m=128, wg_n=128, unroll_k=256, mfma=mx)
         p = GemmProblem(4096, 4096, 4096, dtype=DataType.MXFP4)
-        k = GemmKernel.build(p, tiling=t, wave_abi=True, use_real_scales=True)
+        k = GemmKernel.build(p, tiling=t, wave_abi=True)
 
         result = k.emit()
         assert len(result.asm_text) > 0
@@ -490,7 +490,7 @@ class TestWaveABIKernel:
         mx = MfmaConfig.mxfp4_16x16x128()
         t = GemmTiling.high_perf(wg_m=128, wg_n=128, unroll_k=256, mfma=mx)
         p = GemmProblem(4096, 4096, 4096, dtype=DataType.MXFP4)
-        k = GemmKernel.build(p, tiling=t, wave_abi=True, use_real_scales=True)
+        k = GemmKernel.build(p, tiling=t, wave_abi=True)
 
         name, co = export_wave_kernel(k, "/tmp/test_wave_abi.co")
         assert name == "wave_mxfp4_128x128x256_kgen"
@@ -505,7 +505,7 @@ class TestWaveABIKernel:
         mx = MfmaConfig.mxfp4_16x16x128()
         t = GemmTiling.high_perf(wg_m=128, wg_n=128, unroll_k=256, mfma=mx)
         p = GemmProblem(4096, 4096, 4096, dtype=DataType.MXFP4)
-        k = GemmKernel.build(p, tiling=t, wave_abi=True, use_real_scales=True)
+        k = GemmKernel.build(p, tiling=t, wave_abi=True)
 
         result = k.emit()
         asm = result.asm_text
@@ -525,7 +525,7 @@ class TestWaveABIKernel:
         mx = MfmaConfig.mxfp4_16x16x128()
         t = GemmTiling.high_perf(wg_m=128, wg_n=128, unroll_k=256, mfma=mx)
         p = GemmProblem(4096, 4096, 4096, dtype=DataType.MXFP4)
-        k = GemmKernel.build(p, tiling=t, wave_abi=True, use_real_scales=True)
+        k = GemmKernel.build(p, tiling=t, wave_abi=True)
 
         name, _ = export_wave_kernel(k, "/tmp/test_wave_name.co")
         assert name.startswith("wave_"), \
