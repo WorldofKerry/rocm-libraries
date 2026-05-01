@@ -679,18 +679,6 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                  "v_lds_rd_b", "b"),
                  op_type="salu", comment="toggle_b"),
     ]
-    # Toggle scale LDS read addresses if MX
-    if use_real_scales:
-        suffix_ops.append(PlacedOp(
-            emit_fn=lambda: ctx.v_add(ctx.vreg("v_lds_rd_scale_a"),
-                ctx.sreg("s_lds_db_step"), ctx.vreg("v_lds_rd_scale_a"),
-                comment="rd_scale_a += db"),
-            op_type="salu", comment="toggle_scale_a"))
-        suffix_ops.append(PlacedOp(
-            emit_fn=lambda: ctx.v_add(ctx.vreg("v_lds_rd_scale_b"),
-                ctx.sreg("s_lds_db_step"), ctx.vreg("v_lds_rd_scale_b"),
-                comment="rd_scale_b += db"),
-            op_type="salu", comment="toggle_scale_b"))
     suffix_ops.append(PlacedOp(
         emit_fn=lambda: ctx.inst("s_sub_u32", ctx.sreg("s_lds_db_step"),
             "0", ctx.sreg("s_lds_db_step"), comment="negate db"),
