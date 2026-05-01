@@ -405,7 +405,14 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                              ctx.vreg("v_dtl_off_scale_b"),
                              ctx.sreg("s_srd_scale_b", 0, 4),
                              ctx.sreg("s_tmp0"), "offen", comment=f"scale B ni={ni_}")
-    ctx.s_waitcnt("vmcnt(0)", comment="wait DTL + scale loads")
+    if use_real_scales and not use_swizzled_scales:
+        # Scale loads (newest vmem ops) can stay in-flight past barrier;
+        # only DTL loads (oldest) must complete for LDS coherency.
+        num_scale_loads = partition_m + nr  # scale_a subtile0 + all scale_b
+        ctx.s_waitcnt(f"vmcnt({num_scale_loads})",
+                      comment=f"wait DTL (leave {num_scale_loads} scale loads in-flight)")
+    else:
+        ctx.s_waitcnt("vmcnt(0)", comment="wait DTL loads")
     ctx.s_barrier(comment="sync")
     ctx.raw("")
 
@@ -825,7 +832,13 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     remaining = preamble_inflight - first_batch
     wait_cnt = min(remaining, 15)  # lgkmcnt max is 15 on gfx9
     ctx.s_waitcnt(f"lgkmcnt({wait_cnt})", comment="wait B[ki=0] + A[m0,k0]")
-    if use_real_scales:
+    if use_real_scales and not use_swizzled_scales:
+        # DTL loads for next iter (newest) can stay in-flight;
+        # only scale loads (oldest) must complete for MFMA operands.
+        num_dtl = num_loads_a + num_loads_b
+        ctx.s_waitcnt(f"vmcnt({num_dtl})",
+                      comment=f"wait scales (leave {num_dtl} DTL in-flight)")
+    elif use_real_scales:
         ctx.s_waitcnt("vmcnt(0)", comment="wait scale VGPR loads")
     ctx.raw("")
 
