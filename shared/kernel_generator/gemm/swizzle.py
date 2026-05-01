@@ -268,13 +268,14 @@ class XorSwizzle(Swizzle):
     def emit_write_swizzle(self, ctx, layout, mem,
                            v_thread_row, v_thread_col, v_out):
         nc = layout.num_cols
-        ctx.v_lshr(v_out, v_thread_row, self.shift_r,
+        tmp = ctx.vreg("v_tmp3")  # must differ from v_out and v_thread_col
+        ctx.v_lshr(tmp, v_thread_row, self.shift_r,
                    comment=f"row >> {self.shift_r}")
-        ctx.v_lshl(v_out, v_out, self.shift_l,
+        ctx.v_lshl(tmp, tmp, self.shift_l,
                    comment=f"<< {self.shift_l}")
-        ctx.v_and(v_out, v_out, nc - 1,
+        ctx.v_and(tmp, tmp, nc - 1,
                   comment=f"& {nc - 1}")
-        ctx.inst("v_xor_b32", v_out, v_thread_col, v_out,
+        ctx.inst("v_xor_b32", v_out, v_thread_col, tmp,
                  comment="col ^ f(row)")
 
     def emit_read_setup(self, ctx, layout, mem,
