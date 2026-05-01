@@ -611,11 +611,11 @@ class GemmLauncher:
         for i, v in enumerate(_all_args):
             args[i] = ctypes.cast(ctypes.pointer(v), ctypes.c_void_p)
 
-        # Warmup (1D flattened grid)
+        # Dispatch grid: 2D (grid_m x grid_n) for standalone kernels
         for _ in range(num_warmup):
             _check(hip.hipModuleLaunchKernel(
                 func,
-                total_wgs, 1, 1,
+                grid_m, grid_n, 1,
                 block_size, 1, 1,
                 lds_size, None,
                 args, None,
@@ -632,7 +632,7 @@ class GemmLauncher:
         for _ in range(num_iters):
             _check(hip.hipModuleLaunchKernel(
                 func,
-                total_wgs, 1, 1,
+                grid_m, grid_n, 1,
                 block_size, 1, 1,
                 lds_size, None,
                 args, None,
