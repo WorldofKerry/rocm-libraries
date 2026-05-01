@@ -352,7 +352,8 @@ class GemmTiling:
                        dtl_interleaved: bool = False,
                        dtl_partitioned: bool = False,
                        non_dtl_partitioned: bool = False,
-                       wave_abi: bool = False) -> TileLevel:
+                       wave_abi: bool = False,
+                       composable: bool = False) -> TileLevel:
         """Build the full tile tree with phases from TileDim chains.
 
         The chain structure determines the tree levels:
@@ -386,7 +387,7 @@ class GemmTiling:
 
         # Wave: per-wave compute tile
         # K-loop data movement phases go here (non-pipelined)
-        if pipelined or optimized or non_dtl_partitioned or interleaved or pgr2 or dtl or interleaved_large or pgr2_interleaved or dtl_interleaved or dtl_partitioned or wave_abi:
+        if pipelined or optimized or non_dtl_partitioned or interleaved or pgr2 or dtl or interleaved_large or pgr2_interleaved or dtl_interleaved or dtl_partitioned or wave_abi or composable:
             # Pipelined/optimized: K-loop phase handles compute internally.
             # Wave gets a no-op emit so the tree walker skips it.
             wave_level = TileLevel(
@@ -403,7 +404,17 @@ class GemmTiling:
                 epilogue_phases=list(WAVE_EPILOGUE_PHASES))
 
         # Workgroup: setup + K-loop structure + store
-        if wave_abi:
+        if composable:
+            from .kloop.setup import phase_dtl_interleaved_setup
+            from .kloop.partitioned import phase_mx_scale_setup
+            from .kloop.composable import composable_kloop_phase
+            from .tile.tree import TilePhase
+            wg_pro = [
+                TilePhase("dtl_setup", phase_dtl_interleaved_setup),
+                TilePhase("mx_scale_setup", phase_mx_scale_setup),
+                TilePhase("composable_k_loop", composable_kloop_phase),
+            ]
+        elif wave_abi:
             from .kloop.setup import WAVE_ABI_PROLOGUE_PHASES
             from .kloop.partitioned import phase_mx_scale_setup
             from .tile.tree import TilePhase

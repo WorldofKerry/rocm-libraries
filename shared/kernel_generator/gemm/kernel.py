@@ -135,6 +135,7 @@ class GemmKernel:
               dtl_interleaved: bool = False,
               dtl_partitioned: bool = False,
               wave_abi: bool = False,
+              composable: bool = False,
               use_dtl: bool = True) -> GemmKernel:
         """Build a GemmKernel.  GemmTiling is the source of truth.
 
@@ -156,7 +157,7 @@ class GemmKernel:
             if tile is not None:
                 tiling = GemmTiling.from_tile_config(tile)
             else:
-                if (dtl_interleaved or dtl_partitioned or wave_abi) and use_dtl:
+                if (dtl_interleaved or dtl_partitioned or wave_abi or composable) and use_dtl:
                     # DTL variants need 256x256x64 for 128 MFMAs
                     tiling = GemmTiling.high_perf(
                         wg_m=256, wg_n=256, unroll_k=64)
@@ -186,7 +187,8 @@ class GemmKernel:
                 dtl_interleaved=dtl_interleaved,
                 dtl_partitioned=dtl_partitioned and use_dtl,
                 non_dtl_partitioned=dtl_partitioned and not use_dtl,
-                wave_abi=wave_abi)
+                wave_abi=wave_abi,
+                composable=composable)
 
         tile_tree.validate()
 
