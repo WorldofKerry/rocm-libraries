@@ -190,18 +190,18 @@ def phase_mx_scale_setup(level, ctx):
     else:
         # Linear scale addressing (standalone path)
         ctx.comment("Scale A wave-level voffset")
-        ctx.inst("v_mul_lo_u32", ctx.vreg("v_tmp0"),
-                 str(tile.m_per_wave), ctx.vreg("v_wave_m"),
-                 comment=f"wave_m * {tile.m_per_wave}")
+        ctx.v_mul(ctx.vreg("v_tmp0"),
+                  str(tile.m_per_wave), ctx.vreg("v_wave_m"),
+                  comment=f"wave_m * {tile.m_per_wave}")
         ctx.inst("v_mul_lo_u32", ctx.vreg("v_dtl_off_scale_a"),
                  ctx.sreg("s_stride_scale_a"), ctx.vreg("v_tmp0"),
                  comment="wave_m_base * stride_scale_a -> voffset_scale_a")
         ctx.raw("")
 
         ctx.comment("Scale B wave-level voffset")
-        ctx.inst("v_mul_lo_u32", ctx.vreg("v_tmp0"),
-                 str(tile.n_per_wave), ctx.vreg("v_wave_n"),
-                 comment=f"wave_n * {tile.n_per_wave}")
+        ctx.v_mul(ctx.vreg("v_tmp0"),
+                  str(tile.n_per_wave), ctx.vreg("v_wave_n"),
+                  comment=f"wave_n * {tile.n_per_wave}")
         ctx.inst("v_mul_lo_u32", ctx.vreg("v_dtl_off_scale_b"),
                  ctx.sreg("s_stride_scale_b"), ctx.vreg("v_tmp0"),
                  comment="wave_n_base * stride_scale_b -> voffset_scale_b")
@@ -384,8 +384,7 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                              ctx.vreg("v_dtl_off_scale_b"),
                              ctx.sreg("s_srd_scale_b", 0, 4),
                              ctx.sreg("s_tmp0"), "offen", comment=f"scale B ni={ni_}")
-        ctx.s_waitcnt("vmcnt(0)", comment="wait scale VGPR loads")
-    ctx.s_waitcnt("vmcnt(0)", comment="wait DTL")
+    ctx.s_waitcnt("vmcnt(0)", comment="wait DTL + scale loads")
     ctx.s_barrier(comment="sync")
     ctx.raw("")
 
@@ -664,7 +663,7 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                              ctx.vreg("v_dtl_off_scale_b"),
                              ctx.sreg("s_srd_scale_b", 0, 4),
                              ctx.sreg("s_tmp0"), "offen", comment=f"scale B ni={ni_}")
-        ctx.s_waitcnt("vmcnt(0)", comment="wait scale VGPR loads")
+        # No waitcnt here: scale loads overlap with barrier + LDS reads
     ctx.raw("")
 
     ctx.label("dtl_skip_all")
@@ -699,6 +698,8 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     # lgkmcnt max is 15 on gfx9; cap to avoid assembler error
     wait_cnt = min(preamble_inflight, 15)
     ctx.s_waitcnt(f"lgkmcnt({wait_cnt})", comment="wait B[ki=0] + A[m0,k0]")
+    if use_real_scales:
+        ctx.s_waitcnt("vmcnt(0)", comment="wait scale VGPR loads")
     ctx.raw("")
 
     # ---- Emit scheduled body ----
