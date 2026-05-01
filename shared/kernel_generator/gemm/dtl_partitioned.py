@@ -311,6 +311,15 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                     ctx.alloc_vgpr_permanent(1, name)
                 for ki in range(ki_count):
                     scale_b_names[(ni, ki)] = name
+            # Double-buffer: allocate "next" set for cross-iteration prefetch
+            for mi in range(partition_m):
+                nxt = f"v_scale_a_m{mi}_nxt"
+                if not ctx.has(nxt):
+                    ctx.alloc_vgpr_permanent(1, nxt)
+            for ni in range(nr):
+                nxt = f"v_scale_b_n{ni}_nxt"
+                if not ctx.has(nxt):
+                    ctx.alloc_vgpr_permanent(1, nxt)
 
     # ---- K-loop setup ----
     ctx.comment("=== DTL Partitioned K-loop ===")
@@ -386,6 +395,16 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                              ctx.sreg("s_srd_scale_b", 0, 4),
                              ctx.sreg("s_tmp0"), "offen", comment=f"scale B ni={ni_}")
     ctx.s_waitcnt("vmcnt(0)", comment="wait DTL + scale loads")
+    # Initialize _nxt registers so first iteration's v_mov is safe
+    if use_real_scales and not use_swizzled_scales:
+        for mi_ in range(partition_m):
+            ctx.v_mov(ctx.vreg(f"v_scale_a_m{mi_}_nxt"),
+                      ctx.vreg(f"v_scale_a_m{mi_}"),
+                      comment=f"init nxt scale A m{mi_}")
+        for ni_ in range(nr):
+            ctx.v_mov(ctx.vreg(f"v_scale_b_n{ni_}_nxt"),
+                      ctx.vreg(f"v_scale_b_n{ni_}"),
+                      comment=f"init nxt scale B n{ni_}")
     ctx.s_barrier(comment="sync")
     ctx.raw("")
 
@@ -645,14 +664,14 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                                   str(m * mfma.m), comment=f"soff mi={m}")
                         soff = ctx.sreg("s_tmp0")
                     ctx.inst("buffer_load_dword",
-                             ctx.vreg(f"v_scale_a_m{m}"),
+                             ctx.vreg(f"v_scale_a_m{m}_nxt"),
                              ctx.vreg("v_dtl_off_scale_a"),
                              ctx.sreg("s_srd_scale_a", 0, 4),
-                             soff, "offen", comment=f"scale A mi={m} (next K)")
+                             soff, "offen", comment=f"scale A mi={m} (next K -> nxt)")
                 return emit
             prefetch_loads.append(PrefetchOp(
                 reg_name=reg, emit_fn=_mk_pf_a(),
-                earliest_slot=last_use.get(reg, 0)))
+                earliest_slot=(num_subtiles - 1) * partition_m * mfmas_per_mi))
 
         for ni_ in range(nr):
             reg = f"v_scale_b_n{ni_}"
@@ -665,14 +684,14 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                                   str(n * mfma.n), comment=f"ni={n} * {mfma.n} * stride")
                         soff = ctx.sreg("s_tmp0")
                     ctx.inst("buffer_load_dword",
-                             ctx.vreg(f"v_scale_b_n{n}"),
+                             ctx.vreg(f"v_scale_b_n{n}_nxt"),
                              ctx.vreg("v_dtl_off_scale_b"),
                              ctx.sreg("s_srd_scale_b", 0, 4),
-                             soff, "offen", comment=f"scale B ni={n} (next K)")
+                             soff, "offen", comment=f"scale B ni={n} (next K -> nxt)")
                 return emit
             prefetch_loads.append(PrefetchOp(
                 reg_name=reg, emit_fn=_mk_pf_b(),
-                earliest_slot=last_use.get(reg, 0)))
+                earliest_slot=(num_subtiles - 1) * partition_m * mfmas_per_mi))
 
         # SRD advancement function
         def _srd_advance():
@@ -801,6 +820,17 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     ctx.s_waitcnt(f"lgkmcnt({wait_cnt})", comment="wait B[ki=0] + A[m0,k0]")
     if use_real_scales:
         ctx.s_waitcnt("vmcnt(0)", comment="wait scale VGPR loads")
+    # Double-buffer swap: copy prefetched _nxt -> current registers
+    if use_real_scales and not use_swizzled_scales:
+        ctx.comment("Swap scale double-buffer: nxt -> cur")
+        for mi_ in range(partition_m):
+            ctx.v_mov(ctx.vreg(f"v_scale_a_m{mi_}"),
+                      ctx.vreg(f"v_scale_a_m{mi_}_nxt"),
+                      comment=f"scale A m{mi_}: nxt->cur")
+        for ni_ in range(nr):
+            ctx.v_mov(ctx.vreg(f"v_scale_b_n{ni_}"),
+                      ctx.vreg(f"v_scale_b_n{ni_}_nxt"),
+                      comment=f"scale B n{ni_}: nxt->cur")
     ctx.raw("")
 
     # ---- Emit scheduled body ----
