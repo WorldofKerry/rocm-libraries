@@ -366,6 +366,20 @@ def phase_dtl_partitioned_k_loop(level, ctx):
         ctx.raw("")
 
     # Prologue: DTL load first tile
+    # Precompute DTL soffsets: soff[i] = i * soffset_stride
+    ctx.comment("Precompute DTL soffsets")
+    for i in range(1, num_loads_a):
+        name = f"s_dtl_soff_a{i}"
+        ctx.alloc_sgpr_permanent(1, name)
+        ctx.s_mul(ctx.sreg(name), ctx.sreg("s_soffset_a"), str(i),
+                  comment=f"dtl_soff_a[{i}] = {i} * soffset_a")
+    for i in range(1, num_loads_b):
+        name = f"s_dtl_soff_b{i}"
+        ctx.alloc_sgpr_permanent(1, name)
+        ctx.s_mul(ctx.sreg(name), ctx.sreg("s_soffset_b"), str(i),
+                  comment=f"dtl_soff_b[{i}] = {i} * soffset_b")
+    ctx.raw("")
+
     ctx.comment("Prologue: DTL tile 0")
     _emit_dtl_loads_a(ctx, tile, problem, num_loads_a)
     _emit_dtl_loads_b(ctx, tile, problem, num_loads_b)

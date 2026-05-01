@@ -698,17 +698,24 @@ def _emit_dtl_loads_a(ctx, tile, problem, num_loads):
     lds_stride = lds_data_per_load + tile.lds_pad  # add padding per load line
 
     ctx.inst("s_mov_b32", "m0", ctx.sreg("s_lds_wr_a_sg"), comment="m0 = LDS base A")
-    ctx.s_mov(ctx.sreg("s_tmp0"), "0", comment="cumulative soffset A")
+    has_precomputed_a = ctx.has(f"s_dtl_soff_a1") if num_loads > 1 else False
+    if not has_precomputed_a:
+        ctx.s_mov(ctx.sreg("s_tmp0"), "0", comment="cumulative soffset A")
     for i in range(num_loads):
+        if has_precomputed_a:
+            soff = "0" if i == 0 else ctx.sreg(f"s_dtl_soff_a{i}")
+        else:
+            soff = ctx.sreg("s_tmp0")
         ctx.inst("buffer_load_dwordx4",
                  ctx.vreg("v_dtl_off_a"), ctx.sreg("s_srd_a", 0, 4),
-                 ctx.sreg("s_tmp0"), "offen offset:0, lds",
+                 soff, "offen offset:0, lds",
                  comment=f"DTL A[{i}]")
         if i < num_loads - 1:
             ctx.inst("s_add_u32", "m0", "m0", str(lds_stride),
                      comment=f"m0 += {lds_stride}")
-            ctx.inst("s_add_u32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
-                     ctx.sreg("s_soffset_a"), comment="soffset += stride")
+            if not has_precomputed_a:
+                ctx.inst("s_add_u32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+                         ctx.sreg("s_soffset_a"), comment="soffset += stride")
 
 
 def _emit_dtl_loads_b(ctx, tile, problem, num_loads):
@@ -720,17 +727,24 @@ def _emit_dtl_loads_b(ctx, tile, problem, num_loads):
     lds_stride = lds_data_per_load + tile.lds_pad
 
     ctx.inst("s_mov_b32", "m0", ctx.sreg("s_lds_wr_b_sg"), comment="m0 = LDS base B")
-    ctx.s_mov(ctx.sreg("s_tmp0"), "0", comment="cumulative soffset B")
+    has_precomputed_b = ctx.has(f"s_dtl_soff_b1") if num_loads > 1 else False
+    if not has_precomputed_b:
+        ctx.s_mov(ctx.sreg("s_tmp0"), "0", comment="cumulative soffset B")
     for i in range(num_loads):
+        if has_precomputed_b:
+            soff = "0" if i == 0 else ctx.sreg(f"s_dtl_soff_b{i}")
+        else:
+            soff = ctx.sreg("s_tmp0")
         ctx.inst("buffer_load_dwordx4",
                  ctx.vreg("v_dtl_off_b"), ctx.sreg("s_srd_b", 0, 4),
-                 ctx.sreg("s_tmp0"), "offen offset:0, lds",
+                 soff, "offen offset:0, lds",
                  comment=f"DTL B[{i}]")
         if i < num_loads - 1:
             ctx.inst("s_add_u32", "m0", "m0", str(lds_stride),
                      comment=f"m0 += {lds_stride}")
-            ctx.inst("s_add_u32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
-                     ctx.sreg("s_soffset_b"), comment="soffset += stride")
+            if not has_precomputed_b:
+                ctx.inst("s_add_u32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+                         ctx.sreg("s_soffset_b"), comment="soffset += stride")
 
 
 def phase_dtl_interleaved_k_loop(level, ctx):
