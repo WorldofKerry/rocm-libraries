@@ -39,29 +39,43 @@ def _layouts(ctx): return ctx._metadata["layouts"]
 
 def _a_off(mi, ki, tile, mfma, elem):
     """LDS byte offset for A operand at (mi, ki).
-    
-    With per-load-line padding: offset includes extra pad bytes
-    for each load-line boundary crossed by the mi index.
-    Without padding (lds_pad=0): simple mi*m*uk*elem + ki*k*elem.
+
+    When lds_swizzle is enabled the ki contribution is handled by
+    base-register selection (v_lds_rd_a for ki=0, XOR toggle for ki>0),
+    so this returns only the mi row offset.
     """
-    pad_bytes = tile.lds_pad  # bytes of padding per load line
+    row_start = mi * mfma.m
+    row_stride = int(tile.unroll_k * elem)
+    if getattr(tile, 'lds_swizzle', False):
+        return int(row_start * row_stride)
+    pad_bytes = tile.lds_pad
     threads_per_row = int(tile.unroll_k * elem) // 16
     rows_per_load = (tile.waves_m * tile.waves_n * tile.wave_size) // threads_per_row
-    row_start = mi * mfma.m  # starting row within wave's M range
-    lines_crossed = row_start // rows_per_load  # load-line boundaries crossed
-    row_stride = int(tile.unroll_k * elem)  # bytes per row (no per-row padding)
+    lines_crossed = row_start // rows_per_load
     return int(row_start * row_stride + lines_crossed * pad_bytes + ki * mfma.k * elem)
 
 
 def _b_off(ni, ki, tile, mfma, elem):
     """LDS byte offset for B operand at (ni, ki)."""
+    row_start = ni * mfma.n
+    row_stride = int(tile.unroll_k * elem)
+    if getattr(tile, 'lds_swizzle', False):
+        return int(row_start * row_stride)
     pad_bytes = tile.lds_pad
     threads_per_row = int(tile.unroll_k * elem) // 16
     rows_per_load = (tile.waves_m * tile.waves_n * tile.wave_size) // threads_per_row
-    row_start = ni * mfma.n
     lines_crossed = row_start // rows_per_load
-    row_stride = int(tile.unroll_k * elem)
     return int(row_start * row_stride + lines_crossed * pad_bytes + ki * mfma.k * elem)
+
+
+def _swizzle_xor_bytes(tile, mfma, elem):
+    """XOR constant (bytes) to toggle between ki=0 and ki=1 LDS read bases.
+
+    For MXFP4 uk=256: k_chunks_per_ki=4, XOR 64 flips bit 6,
+    switching between the first and second K-halves within each row.
+    """
+    k_chunks_per_ki = int(mfma.k * elem) // 16
+    return k_chunks_per_ki << 4
 
 
 def phase_wave_abi_setup(level, ctx):
@@ -227,68 +241,113 @@ def phase_wave_abi_setup(level, ctx):
 
     # LDS read addresses
     k_per_group = mfma.k // (tile.wave_size // mfma.m)
+    threads_per_row_rd = int(tile.unroll_k * elem) // 16
+    row_stride_bytes = int(tile.unroll_k * elem)
     ctx.comment("LDS read addresses")
     ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.m - 1,
               comment=f"lane_row = lane_id % {mfma.m}")
-    ctx.v_lshr(ctx.vreg("v_tmp1"), ctx.vreg("v_lane_id"),
-               int(math.log2(mfma.m)), comment=f"lane_id / {mfma.m}")
-    ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_tmp1"),
-               int(math.log2(k_per_group)), comment=f"* {k_per_group}")
 
-    # LDS read A
-    ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(tile.m_per_wave),
-              ctx.vreg("v_wave_m"), comment=f"wave_m * {tile.m_per_wave}")
-    ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
-              ctx.vreg("v_tmp0"), comment="+ lane_row")
-    ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(tile.unroll_k),
-              ctx.vreg("v_lds_rd_a"), comment=f"* {tile.unroll_k}")
-    if tile.lds_pad > 0:
-        tpr = int(tile.unroll_k * elem) // 16
-        rpl = tile.block_size // tpr
-        wave_lines = tile.m_per_wave // rpl
-        if wave_lines > 0:
-            ctx.v_mul(ctx.vreg("v_tmp0"), str(wave_lines * tile.lds_pad),
-                      ctx.vreg("v_wave_m"),
-                      comment=f"wave pad = wave_m * {wave_lines * tile.lds_pad}")
-            ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
-                      ctx.vreg("v_tmp0"), comment="+ wave padding")
-    ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
-              ctx.vreg("v_tmp1"), comment="+ lane_k")
-    if elem >= 1:
-        ctx.v_lshl(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
-                   int(math.log2(elem)), comment=f"* {elem}")
-    else:
-        ctx.v_lshr(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
-                   int(math.log2(1.0 / elem)), comment=f"* {elem} (sub-byte)")
-    ctx.raw("")
+    if tile.lds_swizzle:
+        # Swizzled LDS read: row_base + ((k_group ^ swz) << 4)
+        # swz(lane_row) = ((lane_row >> 2) << 1) & (threads_per_row - 1)
+        ctx.v_lshr(ctx.vreg("v_tmp1"), ctx.vreg("v_lane_id"),
+                   int(math.log2(mfma.m)), comment=f"k_group = lane_id / {mfma.m}")
+        # Compute swizzle value
+        ctx.v_lshr(ctx.vreg("v_tmp2"), ctx.vreg("v_tmp0"), 2,
+                   comment="lane_row >> 2")
+        ctx.v_lshl(ctx.vreg("v_tmp2"), ctx.vreg("v_tmp2"), 1,
+                   comment="<< 1")
+        ctx.v_and(ctx.vreg("v_tmp2"), ctx.vreg("v_tmp2"), threads_per_row_rd - 1,
+                  comment=f"& {threads_per_row_rd-1} -> swz")
+        # swizzled_col = (k_group ^ swz) << 4
+        ctx.inst("v_xor_b32", ctx.vreg("v_tmp3"),
+                 ctx.vreg("v_tmp1"), ctx.vreg("v_tmp2"),
+                 comment="k_group ^ swz")
+        ctx.v_lshl(ctx.vreg("v_tmp3"), ctx.vreg("v_tmp3"), 4,
+                   comment="* 16 -> swizzled col bytes")
 
-    # LDS read B
-    ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.m - 1,
-              comment=f"lane_row = lane_id % {mfma.m} (re-derive)")
-    ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(tile.n_per_wave),
-              ctx.vreg("v_wave_n"), comment=f"wave_n * {tile.n_per_wave}")
-    ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
-              ctx.vreg("v_tmp0"), comment="+ lane_row")
-    ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(tile.unroll_k),
-              ctx.vreg("v_lds_rd_b"), comment=f"* {tile.unroll_k}")
-    ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
-              ctx.vreg("v_tmp1"), comment="+ lane_k")
-    if elem >= 1:
-        ctx.v_lshl(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
-                   int(math.log2(elem)), comment=f"* {elem}")
+        # LDS read A: row_base + swizzled_col
+        ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(tile.m_per_wave),
+                  ctx.vreg("v_wave_m"), comment=f"wave_m * {tile.m_per_wave}")
+        ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
+                  ctx.vreg("v_tmp0"), comment="+ lane_row")
+        ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(row_stride_bytes),
+                  ctx.vreg("v_lds_rd_a"), comment=f"* {row_stride_bytes} -> row_base")
+        ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
+                  ctx.vreg("v_tmp3"), comment="+ swizzled col bytes")
+        ctx.raw("")
+
+        # LDS read B: same swizzle, different wave base
+        ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.m - 1,
+                  comment=f"lane_row = lane_id % {mfma.m} (re-derive)")
+        ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(tile.n_per_wave),
+                  ctx.vreg("v_wave_n"), comment=f"wave_n * {tile.n_per_wave}")
+        ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
+                  ctx.vreg("v_tmp0"), comment="+ lane_row")
+        ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(row_stride_bytes),
+                  ctx.vreg("v_lds_rd_b"), comment=f"* {row_stride_bytes} -> row_base")
+        ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
+                  ctx.vreg("v_tmp3"), comment="+ swizzled col bytes")
     else:
-        ctx.v_lshr(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
-                   int(math.log2(1.0 / elem)), comment=f"* {elem} (sub-byte)")
-    if tile.lds_pad > 0:
-        tpr_b = int(tile.unroll_k * elem) // 16
-        rpl_b = tile.block_size // tpr_b
-        wave_lines_b = tile.n_per_wave // rpl_b
-        if wave_lines_b > 0:
-            ctx.v_mul(ctx.vreg("v_tmp0"), str(wave_lines_b * tile.lds_pad),
-                      ctx.vreg("v_wave_n"),
-                      comment=f"wave pad = wave_n * {wave_lines_b * tile.lds_pad}")
-            ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
-                      ctx.vreg("v_tmp0"), comment="+ wave padding (bytes)")
+        ctx.v_lshr(ctx.vreg("v_tmp1"), ctx.vreg("v_lane_id"),
+                   int(math.log2(mfma.m)), comment=f"lane_id / {mfma.m}")
+        ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_tmp1"),
+                   int(math.log2(k_per_group)), comment=f"* {k_per_group}")
+
+        # LDS read A
+        ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(tile.m_per_wave),
+                  ctx.vreg("v_wave_m"), comment=f"wave_m * {tile.m_per_wave}")
+        ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
+                  ctx.vreg("v_tmp0"), comment="+ lane_row")
+        ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(tile.unroll_k),
+                  ctx.vreg("v_lds_rd_a"), comment=f"* {tile.unroll_k}")
+        if tile.lds_pad > 0:
+            tpr = int(tile.unroll_k * elem) // 16
+            rpl = tile.block_size // tpr
+            wave_lines = tile.m_per_wave // rpl
+            if wave_lines > 0:
+                ctx.v_mul(ctx.vreg("v_tmp0"), str(wave_lines * tile.lds_pad),
+                          ctx.vreg("v_wave_m"),
+                          comment=f"wave pad = wave_m * {wave_lines * tile.lds_pad}")
+                ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
+                          ctx.vreg("v_tmp0"), comment="+ wave padding")
+        ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
+                  ctx.vreg("v_tmp1"), comment="+ lane_k")
+        if elem >= 1:
+            ctx.v_lshl(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
+                       int(math.log2(elem)), comment=f"* {elem}")
+        else:
+            ctx.v_lshr(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
+                       int(math.log2(1.0 / elem)), comment=f"* {elem} (sub-byte)")
+        ctx.raw("")
+
+        # LDS read B
+        ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.m - 1,
+                  comment=f"lane_row = lane_id % {mfma.m} (re-derive)")
+        ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(tile.n_per_wave),
+                  ctx.vreg("v_wave_n"), comment=f"wave_n * {tile.n_per_wave}")
+        ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
+                  ctx.vreg("v_tmp0"), comment="+ lane_row")
+        ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(tile.unroll_k),
+                  ctx.vreg("v_lds_rd_b"), comment=f"* {tile.unroll_k}")
+        ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
+                  ctx.vreg("v_tmp1"), comment="+ lane_k")
+        if elem >= 1:
+            ctx.v_lshl(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
+                       int(math.log2(elem)), comment=f"* {elem}")
+        else:
+            ctx.v_lshr(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
+                       int(math.log2(1.0 / elem)), comment=f"* {elem} (sub-byte)")
+        if tile.lds_pad > 0:
+            tpr_b = int(tile.unroll_k * elem) // 16
+            rpl_b = tile.block_size // tpr_b
+            wave_lines_b = tile.n_per_wave // rpl_b
+            if wave_lines_b > 0:
+                ctx.v_mul(ctx.vreg("v_tmp0"), str(wave_lines_b * tile.lds_pad),
+                          ctx.vreg("v_wave_n"),
+                          comment=f"wave pad = wave_n * {wave_lines_b * tile.lds_pad}")
+                ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
+                          ctx.vreg("v_tmp0"), comment="+ wave padding (bytes)")
     if tile.lds_pad > 0:
         threads_per_row__ = int(tile.unroll_k * elem) // 16
         rows_per_load__ = tile.block_size // threads_per_row__
@@ -403,6 +462,18 @@ def phase_dtl_interleaved_setup(level, ctx):
                comment="thread_row")
     ctx.v_and(ctx.vreg("v_tmp1"), ctx.vreg("v_tid"), threads_per_row - 1,
               comment="thread_col_group")
+    if tile.lds_swizzle:
+        # Bank-conflict swizzle: XOR col with f(thread_row)
+        # f(row) = ((row >> 2) << 1) & (threads_per_row - 1)
+        ctx.v_lshr(ctx.vreg("v_tmp2"), ctx.vreg("v_tmp0"), 2,
+                   comment="thread_row >> 2")
+        ctx.v_lshl(ctx.vreg("v_tmp2"), ctx.vreg("v_tmp2"), 1,
+                   comment="<< 1")
+        ctx.v_and(ctx.vreg("v_tmp2"), ctx.vreg("v_tmp2"), threads_per_row - 1,
+                  comment=f"& {threads_per_row-1} -> swz(thread_row)")
+        ctx.inst("v_xor_b32", ctx.vreg("v_tmp1"),
+                 ctx.vreg("v_tmp1"), ctx.vreg("v_tmp2"),
+                 comment="thread_col ^ swz(thread_row)")
     ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_tmp1"), 4,
                comment="* 16 -> col_bytes")
 
@@ -489,70 +560,109 @@ def phase_dtl_interleaved_setup(level, ctx):
 
     # LDS read addresses
     k_per_group = mfma.k // (tile.wave_size // mfma.m)
+    threads_per_row_rd = int(tile.unroll_k * elem) // 16
+    row_stride_bytes = int(tile.unroll_k * elem)
     ctx.comment("LDS read addresses")
     ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.m - 1,
               comment=f"lane_row = lane_id % {mfma.m}")
-    ctx.v_lshr(ctx.vreg("v_tmp1"), ctx.vreg("v_lane_id"),
-               int(math.log2(mfma.m)), comment=f"lane_id / {mfma.m}")
-    ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_tmp1"),
-               int(math.log2(k_per_group)), comment=f"* {k_per_group}")
 
-    # LDS read A
-    ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(tile.m_per_wave),
-              ctx.vreg("v_wave_m"), comment=f"wave_m * {tile.m_per_wave}")
-    ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
-              ctx.vreg("v_tmp0"), comment="+ lane_row")
-    # DTL LDS row stride = unroll_k (no per-row padding in DTL write)
-    ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(tile.unroll_k),
-              ctx.vreg("v_lds_rd_a"), comment=f"* {tile.unroll_k}")
-    # Add per-load-line padding offset for the wave's starting row
-    if tile.lds_pad > 0:
-        tpr = int(tile.unroll_k * elem) // 16
-        rpl = tile.block_size // tpr
-        wave_lines = tile.m_per_wave // rpl
-        if wave_lines > 0:
-            # Use v_tmp0 for wave_pad (v_tmp1 holds lane_k, must not clobber)
-            ctx.v_mul(ctx.vreg("v_tmp0"), str(wave_lines * tile.lds_pad),
-                      ctx.vreg("v_wave_m"), comment=f"wave pad = wave_m * {wave_lines * tile.lds_pad}")
-            ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
-                      ctx.vreg("v_tmp0"), comment="+ wave padding")
-    ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
-              ctx.vreg("v_tmp1"), comment="+ lane_k")
-    if elem >= 1:
-        ctx.v_lshl(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
-                   int(math.log2(elem)), comment=f"* {elem}")
-    else:
-        ctx.v_lshr(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
-                   int(math.log2(1.0 / elem)), comment=f"* {elem} (sub-byte)")
-    ctx.raw("")
+    if tile.lds_swizzle:
+        ctx.v_lshr(ctx.vreg("v_tmp1"), ctx.vreg("v_lane_id"),
+                   int(math.log2(mfma.m)), comment=f"k_group = lane_id / {mfma.m}")
+        ctx.v_lshr(ctx.vreg("v_tmp2"), ctx.vreg("v_tmp0"), 2,
+                   comment="lane_row >> 2")
+        ctx.v_lshl(ctx.vreg("v_tmp2"), ctx.vreg("v_tmp2"), 1,
+                   comment="<< 1")
+        ctx.v_and(ctx.vreg("v_tmp2"), ctx.vreg("v_tmp2"), threads_per_row_rd - 1,
+                  comment=f"& {threads_per_row_rd-1} -> swz")
+        ctx.inst("v_xor_b32", ctx.vreg("v_tmp3"),
+                 ctx.vreg("v_tmp1"), ctx.vreg("v_tmp2"),
+                 comment="k_group ^ swz")
+        ctx.v_lshl(ctx.vreg("v_tmp3"), ctx.vreg("v_tmp3"), 4,
+                   comment="* 16 -> swizzled col bytes")
 
-    # LDS read B
-    # Re-derive lane_row since v_tmp0 may have been clobbered by A wave_pad
-    ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.m - 1,
-              comment=f"lane_row = lane_id % {mfma.m} (re-derive)")
-    ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(tile.n_per_wave),
-              ctx.vreg("v_wave_n"), comment=f"wave_n * {tile.n_per_wave}")
-    ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
-              ctx.vreg("v_tmp0"), comment="+ lane_row")
-    ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(tile.unroll_k),
-              ctx.vreg("v_lds_rd_b"), comment=f"* {tile.unroll_k}")
-    ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
-              ctx.vreg("v_tmp1"), comment="+ lane_k")
-    if elem >= 1:
-        ctx.v_lshl(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
-                   int(math.log2(elem)), comment=f"* {elem}")
+        # LDS read A
+        ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(tile.m_per_wave),
+                  ctx.vreg("v_wave_m"), comment=f"wave_m * {tile.m_per_wave}")
+        ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
+                  ctx.vreg("v_tmp0"), comment="+ lane_row")
+        ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(row_stride_bytes),
+                  ctx.vreg("v_lds_rd_a"), comment=f"* {row_stride_bytes} -> row_base")
+        ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
+                  ctx.vreg("v_tmp3"), comment="+ swizzled col bytes")
+        ctx.raw("")
+
+        # LDS read B
+        ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.m - 1,
+                  comment=f"lane_row = lane_id % {mfma.m} (re-derive)")
+        ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(tile.n_per_wave),
+                  ctx.vreg("v_wave_n"), comment=f"wave_n * {tile.n_per_wave}")
+        ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
+                  ctx.vreg("v_tmp0"), comment="+ lane_row")
+        ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(row_stride_bytes),
+                  ctx.vreg("v_lds_rd_b"), comment=f"* {row_stride_bytes} -> row_base")
+        ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
+                  ctx.vreg("v_tmp3"), comment="+ swizzled col bytes")
     else:
-        ctx.v_lshr(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
-                   int(math.log2(1.0 / elem)), comment=f"* {elem} (sub-byte)")
-    if tile.lds_pad > 0:
-        tpr_b = int(tile.unroll_k * elem) // 16
-        rpl_b = tile.block_size // tpr_b
-        wave_lines_b = tile.n_per_wave // rpl_b
-        if wave_lines_b > 0:
-            ctx.v_mul(ctx.vreg("v_tmp0"), str(wave_lines_b * tile.lds_pad),
-                      ctx.vreg("v_wave_n"), comment=f"wave pad = wave_n * {wave_lines_b * tile.lds_pad}")
-            ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
-                      ctx.vreg("v_tmp0"), comment="+ wave padding (bytes)")
+        ctx.v_lshr(ctx.vreg("v_tmp1"), ctx.vreg("v_lane_id"),
+                   int(math.log2(mfma.m)), comment=f"lane_id / {mfma.m}")
+        ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_tmp1"),
+                   int(math.log2(k_per_group)), comment=f"* {k_per_group}")
+
+        # LDS read A
+        ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(tile.m_per_wave),
+                  ctx.vreg("v_wave_m"), comment=f"wave_m * {tile.m_per_wave}")
+        ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
+                  ctx.vreg("v_tmp0"), comment="+ lane_row")
+        ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(tile.unroll_k),
+                  ctx.vreg("v_lds_rd_a"), comment=f"* {tile.unroll_k}")
+        if tile.lds_pad > 0:
+            tpr = int(tile.unroll_k * elem) // 16
+            rpl = tile.block_size // tpr
+            wave_lines = tile.m_per_wave // rpl
+            if wave_lines > 0:
+                ctx.v_mul(ctx.vreg("v_tmp0"), str(wave_lines * tile.lds_pad),
+                          ctx.vreg("v_wave_m"),
+                          comment=f"wave pad = wave_m * {wave_lines * tile.lds_pad}")
+                ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
+                          ctx.vreg("v_tmp0"), comment="+ wave padding")
+        ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
+                  ctx.vreg("v_tmp1"), comment="+ lane_k")
+        if elem >= 1:
+            ctx.v_lshl(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
+                       int(math.log2(elem)), comment=f"* {elem}")
+        else:
+            ctx.v_lshr(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
+                       int(math.log2(1.0 / elem)), comment=f"* {elem} (sub-byte)")
+        ctx.raw("")
+
+        # LDS read B
+        ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.m - 1,
+                  comment=f"lane_row = lane_id % {mfma.m} (re-derive)")
+        ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(tile.n_per_wave),
+                  ctx.vreg("v_wave_n"), comment=f"wave_n * {tile.n_per_wave}")
+        ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
+                  ctx.vreg("v_tmp0"), comment="+ lane_row")
+        ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(tile.unroll_k),
+                  ctx.vreg("v_lds_rd_b"), comment=f"* {tile.unroll_k}")
+        ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
+                  ctx.vreg("v_tmp1"), comment="+ lane_k")
+        if elem >= 1:
+            ctx.v_lshl(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
+                       int(math.log2(elem)), comment=f"* {elem}")
+        else:
+            ctx.v_lshr(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
+                       int(math.log2(1.0 / elem)), comment=f"* {elem} (sub-byte)")
+        if tile.lds_pad > 0:
+            tpr_b = int(tile.unroll_k * elem) // 16
+            rpl_b = tile.block_size // tpr_b
+            wave_lines_b = tile.n_per_wave // rpl_b
+            if wave_lines_b > 0:
+                ctx.v_mul(ctx.vreg("v_tmp0"), str(wave_lines_b * tile.lds_pad),
+                          ctx.vreg("v_wave_n"),
+                          comment=f"wave pad = wave_n * {wave_lines_b * tile.lds_pad}")
+                ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
+                          ctx.vreg("v_tmp0"), comment="+ wave padding (bytes)")
     if tile.lds_pad > 0:
         threads_per_row__ = int(tile.unroll_k * elem) // 16
         rows_per_load__ = tile.block_size // threads_per_row__

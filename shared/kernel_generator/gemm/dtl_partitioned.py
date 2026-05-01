@@ -23,7 +23,7 @@ from .slot_placer import SlotPlacer, PlacedOp, Path, SchedulingRules
 from .dtl_interleaved import (
     phase_dtl_interleaved_setup,
     _emit_dtl_loads_a, _emit_dtl_loads_b,
-    _a_off, _b_off,
+    _a_off, _b_off, _swizzle_xor_bytes,
 )
 
 __all__ = ["phase_dtl_partitioned_k_loop", "DTL_PARTITIONED_PROLOGUE_PHASES"]
@@ -208,6 +208,26 @@ def phase_mx_scale_setup(level, ctx):
         ctx.raw("")
 
 
+
+def _emit_swizzled_ds_read(ctx, dst, base_reg, offset, ki, tile, mfma, elem,
+                           width=4, comment=""):
+    """Emit ds_read with LDS swizzle support.
+    
+    For ki=0, reads directly from base_reg.
+    For ki>0 with lds_swizzle, XORs base_reg with the swizzle constant
+    into a temp VGPR before reading.
+    """
+    if getattr(tile, 'lds_swizzle', False) and ki > 0:
+        xor_bytes = _swizzle_xor_bytes(tile, mfma, elem)
+        ctx.inst("v_xor_b32", ctx.vreg("v_tmp4"),
+                 base_reg, str(xor_bytes),
+                 comment=f"swizzle ki={ki}: XOR {xor_bytes}")
+        ctx.ds_read(dst, ctx.vreg("v_tmp4"), offset=offset,
+                    width=width, comment=comment)
+    else:
+        ctx.ds_read(dst, base_reg, offset=offset,
+                    width=width, comment=comment)
+
 def phase_dtl_partitioned_k_loop(level, ctx):
     """DTL K-loop with partition-based scheduling."""
     tile = ctx._metadata["tile"]
@@ -247,7 +267,7 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     else:
         scale_k_stride = 0
 
-    partition_m = 2
+    partition_m = 4
     mfmas_per_mi = nr * ki_count  # 16
     num_subtiles = mr // partition_m
 
@@ -489,11 +509,13 @@ def phase_dtl_partitioned_k_loop(level, ctx):
         for ki in range(ki_count):
             def _mk_lr(mi_=mi + 1, ki_=ki, buf_=next_buf):
                 def emit():
-                    ctx.ds_read(ctx.vreg(a_names[(buf_, ki_)], 0, av),
-                                ctx.vreg("v_lds_rd_a"),
-                                offset=_a_off(mi_, ki_, tile, mfma, elem),
-                                width=av,
-                                comment=f"LR A m{mi_}k{ki_} b{buf_}")
+                    _emit_swizzled_ds_read(
+                        ctx, ctx.vreg(a_names[(buf_, ki_)], 0, av),
+                        ctx.vreg("v_lds_rd_a"),
+                        offset=_a_off(mi_, ki_, tile, mfma, elem),
+                        ki=ki_, tile=tile, mfma=mfma, elem=elem,
+                        width=av,
+                        comment=f"LR A m{mi_}k{ki_} b{buf_}")
                 return emit
             path_ops.append(PlacedOp(
                 emit_fn=_mk_lr(), op_type="ds_read",
@@ -784,14 +806,18 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     preamble_inflight = nr + 1  # B[ki=0] reads + A[m0,k0]
     if ki_count > 1:
         for ni in range(nr):
-            ctx.ds_read(ctx.vreg(b_names[(ni, 1)], 0, bv),
-                        ctx.vreg("v_lds_rd_b"),
-                        offset=_b_off(ni, 1, tile, mfma, elem),
-                        width=bv, comment=f"LR B n{ni}k1")
-        ctx.ds_read(ctx.vreg(a_names[(0, 1)], 0, av),
-                    ctx.vreg("v_lds_rd_a"),
-                    offset=_a_off(0, 1, tile, mfma, elem),
-                    width=av, comment="LR A m0k1 b0")
+            _emit_swizzled_ds_read(
+                ctx, ctx.vreg(b_names[(ni, 1)], 0, bv),
+                ctx.vreg("v_lds_rd_b"),
+                offset=_b_off(ni, 1, tile, mfma, elem),
+                ki=1, tile=tile, mfma=mfma, elem=elem,
+                width=bv, comment=f"LR B n{ni}k1")
+        _emit_swizzled_ds_read(
+            ctx, ctx.vreg(a_names[(0, 1)], 0, av),
+            ctx.vreg("v_lds_rd_a"),
+            offset=_a_off(0, 1, tile, mfma, elem),
+            ki=1, tile=tile, mfma=mfma, elem=elem,
+            width=av, comment="LR A m0k1 b0")
         preamble_inflight += nr + 1  # B[ki=1] + A[m0,k1]
     # Wait for first batch (B[k0] + A[m0,k0]) to be ready.
     # Remaining reads (ki=1 batch) can stay outstanding.
