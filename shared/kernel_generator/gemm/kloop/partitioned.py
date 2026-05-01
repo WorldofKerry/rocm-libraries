@@ -20,7 +20,7 @@ from ..tile.tree import TilePhase
 from ..schedule.partition import PartitionPlan, Partition
 from ..schedule.mainloop import MainloopScheduler, ScheduleModule, ModuleKind
 from ..schedule.slot_placer import SlotPlacer, PlacedOp, Path, SchedulingRules
-from .dtl_interleaved import (
+from .setup import (
     phase_dtl_interleaved_setup,
     _emit_dtl_loads_a, _emit_dtl_loads_b,
     _a_off, _b_off,

@@ -344,15 +344,12 @@ class GemmTiling:
 
     def build_tile_tree(self, pipelined: bool = False,
                        optimized: bool = False,
-                       scheduled: bool = False,
                        interleaved: bool = False,
                        pgr2: bool = False,
                        dtl: bool = False,
                        interleaved_large: bool = False,
-                      auto_scheduled: bool = False,
                        pgr2_interleaved: bool = False,
                        dtl_interleaved: bool = False,
-                       dtl_scheduled: bool = False,
                        dtl_partitioned: bool = False,
                        wave_abi: bool = False) -> TileLevel:
         """Build the full tile tree with phases from TileDim chains.
@@ -376,7 +373,6 @@ class GemmTiling:
             WORKGROUP_PROLOGUE_PHASES, WORKGROUP_EPILOGUE_PHASES,
             WAVE_PROLOGUE_PHASES, WAVE_EPILOGUE_PHASES,
             PIPELINED_PROLOGUE_PHASES, OPTIMIZED_PROLOGUE_PHASES,
-            SCHEDULED_PROLOGUE_PHASES,
             PGR2_PROLOGUE_PHASES,
             DTL_PROLOGUE_PHASES,
             INTERLEAVED_LARGE_PROLOGUE_PHASES, INTERLEAVED_PROLOGUE_PHASES,
@@ -389,7 +385,7 @@ class GemmTiling:
 
         # Wave: per-wave compute tile
         # K-loop data movement phases go here (non-pipelined)
-        if pipelined or optimized or scheduled or interleaved or pgr2 or dtl or interleaved_large or auto_scheduled or pgr2_interleaved or dtl_interleaved or dtl_scheduled or dtl_partitioned or wave_abi:
+        if pipelined or optimized or interleaved or pgr2 or dtl or interleaved_large or pgr2_interleaved or dtl_interleaved or dtl_partitioned or wave_abi:
             # Pipelined/optimized: K-loop phase handles compute internally.
             # Wave gets a no-op emit so the tree walker skips it.
             wave_level = TileLevel(
@@ -407,31 +403,25 @@ class GemmTiling:
 
         # Workgroup: setup + K-loop structure + store
         if wave_abi:
-            from .kloop.dtl_interleaved import WAVE_ABI_PROLOGUE_PHASES
-            from .kloop.dtl_partitioned import phase_mx_scale_setup
+            from .kloop.setup import WAVE_ABI_PROLOGUE_PHASES
+            from .kloop.partitioned import phase_mx_scale_setup
             from .tile.tree import TilePhase
             # Wave ABI uses partitioned K-loop with wave ABI setup
-            from .kloop.dtl_partitioned import phase_dtl_partitioned_k_loop
+            from .kloop.partitioned import phase_dtl_partitioned_k_loop
             wg_pro = [
                 TilePhase("wave_abi_setup", WAVE_ABI_PROLOGUE_PHASES[0].emit),
                 TilePhase("mx_scale_setup", phase_mx_scale_setup),
                 TilePhase("dtl_partitioned_k_loop", phase_dtl_partitioned_k_loop),
             ]
         elif dtl_partitioned:
-            from .kloop.dtl_partitioned import DTL_PARTITIONED_PROLOGUE_PHASES
+            from .kloop.partitioned import DTL_PARTITIONED_PROLOGUE_PHASES
             wg_pro = list(DTL_PARTITIONED_PROLOGUE_PHASES)
-        elif dtl_scheduled:
-            from .kloop.dtl_scheduled import DTL_SCHEDULED_PROLOGUE_PHASES
-            wg_pro = list(DTL_SCHEDULED_PROLOGUE_PHASES)
         elif dtl_interleaved:
-            from .kloop.dtl_interleaved import DTL_INTERLEAVED_PROLOGUE_PHASES
+            from .kloop.setup import DTL_INTERLEAVED_PROLOGUE_PHASES
             wg_pro = list(DTL_INTERLEAVED_PROLOGUE_PHASES)
         elif pgr2_interleaved:
-            from .kloop.pgr2 import PGR2_INTERLEAVED_PROLOGUE_PHASES
+            from .kloop.simple import PGR2_INTERLEAVED_PROLOGUE_PHASES
             wg_pro = list(PGR2_INTERLEAVED_PROLOGUE_PHASES)
-        elif auto_scheduled:
-            from .kloop.auto_scheduled import _get_prologue_phases
-            wg_pro = _get_prologue_phases()
         elif interleaved_large:
             wg_pro = list(INTERLEAVED_LARGE_PROLOGUE_PHASES)
         elif dtl:
@@ -440,8 +430,6 @@ class GemmTiling:
             wg_pro = list(PGR2_PROLOGUE_PHASES)
         elif interleaved:
             wg_pro = list(INTERLEAVED_PROLOGUE_PHASES)
-        elif scheduled:
-            wg_pro = list(SCHEDULED_PROLOGUE_PHASES)
         elif optimized:
             wg_pro = list(OPTIMIZED_PROLOGUE_PHASES)
         elif pipelined:

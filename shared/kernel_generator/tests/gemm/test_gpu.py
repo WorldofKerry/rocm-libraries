@@ -478,22 +478,6 @@ class TestBaselineKernel:
 
 
 @requires_gpu
-class TestDTLScheduledKernel:
-    """DTL + flat ScheduleGraph auto-interleaving."""
-
-    @pytest.mark.parametrize("M,N,K", [
-        (256, 256, 64),
-        (256, 256, 128),
-        (4096, 4096, 4096),
-    ])
-    def test_correct(self, M, N, K):
-        D_gpu, D_ref = _run_variant(M, N, K, dtl_scheduled=True)
-        max_err = np.max(np.abs(D_gpu.astype(np.float32)
-                                - D_ref.astype(np.float32)))
-        assert max_err < 0.001, \
-            f"dtl_scheduled {M}x{N}x{K}: max_err={max_err}"
-
-
 @requires_gpu
 class TestDTLPartitionedKernel:
     """DTL + partition-based scheduling with SlotPlacer interleaving."""
