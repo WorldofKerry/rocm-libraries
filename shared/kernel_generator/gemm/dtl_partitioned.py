@@ -695,8 +695,11 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                     offset=_a_off(0, 1, tile, mfma, elem),
                     width=av, comment="LR A m0k1 b0")
         preamble_inflight += nr + 1  # B[ki=1] + A[m0,k1]
-    # lgkmcnt max is 15 on gfx9; cap to avoid assembler error
-    wait_cnt = min(preamble_inflight, 15)
+    # Wait for first batch (B[k0] + A[m0,k0]) to be ready.
+    # Remaining reads (ki=1 batch) can stay outstanding.
+    first_batch = nr + 1
+    remaining = preamble_inflight - first_batch
+    wait_cnt = min(remaining, 15)  # lgkmcnt max is 15 on gfx9
     ctx.s_waitcnt(f"lgkmcnt({wait_cnt})", comment="wait B[ki=0] + A[m0,k0]")
     if use_real_scales:
         ctx.s_waitcnt("vmcnt(0)", comment="wait scale VGPR loads")
