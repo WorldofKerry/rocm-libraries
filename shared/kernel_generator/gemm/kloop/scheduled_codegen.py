@@ -16,13 +16,13 @@ import math
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 
-from .schedule import (
+from ..schedule.schedule_ir import (
     OpKind, Value, TileOp, Slot, Schedule,
     SchedulingRules, VGPRPool, SlotPlacer, _new_op_id,
 )
-from .problem import GemmProblem, TileConfig
-from .asm_context import AsmContext
-from .asm_transforms import GemmLayouts, emit_affine
+from ..problem import GemmProblem, TileConfig
+from ..emit.context import AsmContext
+from ..emit.layouts import GemmLayouts, emit_affine
 
 __all__ = ["TilePlan", "emit_scheduled_kernel"]
 

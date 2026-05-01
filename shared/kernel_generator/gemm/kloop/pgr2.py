@@ -11,11 +11,11 @@ from __future__ import annotations
 
 import math
 
-from .asm_context import AsmContext
-from .asm_transforms import GemmLayouts
-from .problem import GemmProblem, TileConfig
-from .tile import TilePhase
-from .phases import (phase_load_kernargs, phase_thread_indexing,
+from ..emit.context import AsmContext
+from ..emit.layouts import GemmLayouts
+from ..problem import GemmProblem, TileConfig
+from ..tile.tree import TilePhase
+from ..emit.phases import (phase_load_kernargs, phase_thread_indexing,
                      phase_load_cluster_setup, phase_lds_addrs,
                      phase_init_acc, phase_global_addrs,
                      _emit_global_load_impl, _emit_lds_write_impl)

@@ -137,7 +137,7 @@ def bench_our_kernel(
     num_iters: int = NUM_ITERS,
 ) -> float:
     """Generate, assemble, and benchmark our GEMM kernel. Returns TFLOPS."""
-    from .kernel_pipeline import GemmKernel
+    from .kernel import GemmKernel
     from .problem import GemmProblem
 
     problem = GemmProblem(m=M, n=N, k=K)

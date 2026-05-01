@@ -18,8 +18,8 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Callable, Dict, List, Optional, Set, Tuple, Union
 
-from .partition_plan import PartitionPlan, Partition, VGPRTileAllocator
-from .problem import TileConfig
+from .partition import PartitionPlan, Partition, VGPRTileAllocator
+from ..problem import TileConfig
 
 __all__ = [
     "MainloopScheduler", "ScheduleModule", "ModuleKind", "DepEdge",

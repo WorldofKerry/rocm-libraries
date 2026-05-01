@@ -34,7 +34,7 @@ Quick start::
 """
 from __future__ import annotations
 
-from .transforms import (
+from .tile.transforms import (
     Dim, Transform, PassThrough, Tile, Flatten, Pad, Embed, Xor,
     TileDescriptor, tile_hierarchy,
 )
@@ -42,13 +42,13 @@ from .problem import (
     DataType, GemmProblem, TileConfig, MfmaConfig,
     SubTileConfig, PartitionConfig,
 )
-from .tile import TileLevel, TilePhase, build_gemm_tile_tree, walk_tile_tree
-from .context import TileContext, Binding, Lifetime
-from .asm_context import AsmContext
-from .asm_transforms import emit_affine, GemmLayouts
-from .kernel_pipeline import GemmKernel, MemoryView, default_mfma_visitor
+from .tile.tree import TileLevel, TilePhase, build_gemm_tile_tree, walk_tile_tree
+from .tile.context import TileContext, Binding, Lifetime
+from .emit.context import AsmContext
+from .emit.layouts import emit_affine, GemmLayouts
+from .kernel import GemmKernel, MemoryView, default_mfma_visitor
 from .tiling import TileDim, GemmTiling, ScheduleKind
-from .asm_emitter import assemble_kernel
+from .emit.emitter import assemble_kernel
 
 __all__ = [
     "Dim", "Transform", "PassThrough", "Tile", "Flatten", "Pad",

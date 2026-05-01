@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional, Tuple
 
-from .transforms import Dim, Tile, Flatten, TileDescriptor, tile_hierarchy
+from .tile.transforms import Dim, Tile, Flatten, TileDescriptor, tile_hierarchy
 
 __all__ = [
     "DataType", "GemmProblem", "MfmaConfig", "SubTileConfig",
@@ -248,7 +248,7 @@ class TileConfig:
         if self.swizzle is not None:
             return self.swizzle
         if self.lds_swizzle:
-            from .swizzle import XorSwizzle
+            from .memory.swizzle import XorSwizzle
             return XorSwizzle()
         return None
 

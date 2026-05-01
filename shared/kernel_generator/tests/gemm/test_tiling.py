@@ -197,7 +197,7 @@ class TestGemmTiling:
 
     def test_with_pipeline(self):
         """GemmTiling works with GemmKernel.build()."""
-        from kernel_generator.gemm.kernel_pipeline import GemmKernel
+        from kernel_generator.gemm.kernel import GemmKernel
         from kernel_generator.gemm.problem import GemmProblem
 
         tiling = GemmTiling.standard()

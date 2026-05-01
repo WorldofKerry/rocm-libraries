@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: MIT
 """Tests for the GemmKernel pipeline with tree-driven phases."""
 import pytest
-from kernel_generator.gemm.kernel_pipeline import (
+from kernel_generator.gemm.kernel import (
     GemmKernel, MemoryView, default_mfma_visitor,
 )
-from kernel_generator.gemm.tile import TilePhase
+from kernel_generator.gemm.tile.tree import TilePhase
 from kernel_generator.gemm.problem import GemmProblem, TileConfig, MfmaConfig
 
 
@@ -158,7 +158,7 @@ class TestPhaseReplacement:
 
     def test_replace_k_advance(self):
         """Custom K-advance adds a marker comment."""
-        from kernel_generator.gemm.phases import phase_k_advance
+        from kernel_generator.gemm.emit.phases import phase_k_advance
 
         def custom_advance(level, ctx):
             ctx.comment("CUSTOM_MARKER")
@@ -187,7 +187,7 @@ class TestPhaseReplacement:
         def custom_load(level, ctx):
             ctx.comment("CUSTOM_LOAD")
             # Still need to do the actual load for correctness
-            from kernel_generator.gemm.phases import phase_global_load
+            from kernel_generator.gemm.emit.phases import phase_global_load
             phase_global_load(level, ctx)
 
         kernel = GemmKernel.build(GemmProblem(128, 128, 32))

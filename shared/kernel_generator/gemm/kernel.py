@@ -24,14 +24,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
-from .asm_context import AsmContext
-from .asm_emitter import alloc_registers, alloc_registers_dtl, emit_header, emit_descriptor, assemble_kernel
-from .asm_transforms import emit_affine, GemmLayouts
-from .phases import default_mfma_visitor
+from .emit.context import AsmContext
+from .emit.emitter import alloc_registers, alloc_registers_dtl, emit_header, emit_descriptor, assemble_kernel
+from .emit.layouts import emit_affine, GemmLayouts
+from .emit.phases import default_mfma_visitor
 from .problem import GemmProblem, TileConfig
 from .tiling import GemmTiling
-from .tile import TileLevel, TilePhase, walk_tile_tree
-from .transforms import Embed, Dim
+from .tile.tree import TileLevel, TilePhase, walk_tile_tree
+from .tile.transforms import Embed, Dim
 
 __all__ = ["MemoryView", "GemmKernel", "AsmKernel", "default_mfma_visitor"]
 

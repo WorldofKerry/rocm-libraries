@@ -1,6 +1,6 @@
 """Tests for DataStream abstraction."""
 import pytest
-from kernel_generator.gemm.data_stream import (
+from kernel_generator.gemm.schedule.data_stream import (
     DataStream, StreamSource, StreamBuffering, StreamSchedule,
     make_gemm_streams,
 )

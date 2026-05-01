@@ -22,11 +22,11 @@ from __future__ import annotations
 
 import math
 
-from .asm_context import AsmContext
-from .asm_transforms import GemmLayouts
-from .problem import GemmProblem, TileConfig
-from .tile import TilePhase
-from .phases import phase_load_kernargs, phase_store_d
+from ..emit.context import AsmContext
+from ..emit.layouts import GemmLayouts
+from ..problem import GemmProblem, TileConfig
+from ..tile.tree import TilePhase
+from ..emit.phases import phase_load_kernargs, phase_store_d
 
 __all__ = ["phase_dtl_interleaved_k_loop", "DTL_INTERLEAVED_PROLOGUE_PHASES",
            "phase_wave_abi_setup", "WAVE_ABI_PROLOGUE_PHASES"]
@@ -239,7 +239,7 @@ def phase_wave_abi_setup(level, ctx):
 
     swz = tile.resolved_swizzle(elem)
     if swz is not None:
-        from .swizzle import DataLayout as SwzLayout, LDS_GFX950
+        from ..memory.swizzle import DataLayout as SwzLayout, LDS_GFX950
         swz_layout = SwzLayout(row_stride_bytes=row_stride_bytes,
                                mfma_k=mfma.k, mfma_m=mfma.m,
                                elem_bytes=elem, wave_size=tile.wave_size)
@@ -449,11 +449,11 @@ def phase_dtl_interleaved_setup(level, ctx):
               comment="thread_col_group")
     swz = tile.resolved_swizzle(elem)
     if swz is not None:
-        from .swizzle import DataLayout as SwzLayout
+        from ..memory.swizzle import DataLayout as SwzLayout
         swz_layout = SwzLayout(row_stride_bytes=int(tile.unroll_k * elem),
                                mfma_k=mfma.k, mfma_m=mfma.m,
                                elem_bytes=elem, wave_size=tile.wave_size)
-        from .swizzle import LDS_GFX950
+        from ..memory.swizzle import LDS_GFX950
         swz.emit_write_swizzle(ctx, swz_layout, LDS_GFX950,
                                ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),
                                ctx.vreg("v_tmp1"))
@@ -551,7 +551,7 @@ def phase_dtl_interleaved_setup(level, ctx):
 
     swz = tile.resolved_swizzle(elem)
     if swz is not None:
-        from .swizzle import DataLayout as SwzLayout, LDS_GFX950
+        from ..memory.swizzle import DataLayout as SwzLayout, LDS_GFX950
         swz_layout = SwzLayout(row_stride_bytes=row_stride_bytes,
                                mfma_k=mfma.k, mfma_m=mfma.m,
                                elem_bytes=elem, wave_size=tile.wave_size)

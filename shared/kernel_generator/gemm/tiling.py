@@ -43,13 +43,13 @@ from enum import Enum, auto
 from typing import List, Optional
 
 from .problem import MfmaConfig, TileConfig
-from .tile import TileLevel
+from .tile.tree import TileLevel
 
 
 def _noop_wave_emit(level, ctx):
     """No-op: compute is handled by the K-loop phase."""
     pass
-from .transforms import Dim, Tile, TileDescriptor
+from .tile.transforms import Dim, Tile, TileDescriptor
 
 __all__ = [
     "ScheduleKind", "TileDim", "GemmTiling",
@@ -372,7 +372,7 @@ class GemmTiling:
             pipelined: If True, use software-pipelined K-loop
                        (overlaps global_load(n+1) with compute(n)).
         """
-        from .phases import (
+        from .emit.phases import (
             WORKGROUP_PROLOGUE_PHASES, WORKGROUP_EPILOGUE_PHASES,
             WAVE_PROLOGUE_PHASES, WAVE_EPILOGUE_PHASES,
             PIPELINED_PROLOGUE_PHASES, OPTIMIZED_PROLOGUE_PHASES,
@@ -407,30 +407,30 @@ class GemmTiling:
 
         # Workgroup: setup + K-loop structure + store
         if wave_abi:
-            from .dtl_interleaved import WAVE_ABI_PROLOGUE_PHASES
-            from .dtl_partitioned import phase_mx_scale_setup
-            from .tile import TilePhase
+            from .kloop.dtl_interleaved import WAVE_ABI_PROLOGUE_PHASES
+            from .kloop.dtl_partitioned import phase_mx_scale_setup
+            from .tile.tree import TilePhase
             # Wave ABI uses partitioned K-loop with wave ABI setup
-            from .dtl_partitioned import phase_dtl_partitioned_k_loop
+            from .kloop.dtl_partitioned import phase_dtl_partitioned_k_loop
             wg_pro = [
                 TilePhase("wave_abi_setup", WAVE_ABI_PROLOGUE_PHASES[0].emit),
                 TilePhase("mx_scale_setup", phase_mx_scale_setup),
                 TilePhase("dtl_partitioned_k_loop", phase_dtl_partitioned_k_loop),
             ]
         elif dtl_partitioned:
-            from .dtl_partitioned import DTL_PARTITIONED_PROLOGUE_PHASES
+            from .kloop.dtl_partitioned import DTL_PARTITIONED_PROLOGUE_PHASES
             wg_pro = list(DTL_PARTITIONED_PROLOGUE_PHASES)
         elif dtl_scheduled:
-            from .dtl_scheduled import DTL_SCHEDULED_PROLOGUE_PHASES
+            from .kloop.dtl_scheduled import DTL_SCHEDULED_PROLOGUE_PHASES
             wg_pro = list(DTL_SCHEDULED_PROLOGUE_PHASES)
         elif dtl_interleaved:
-            from .dtl_interleaved import DTL_INTERLEAVED_PROLOGUE_PHASES
+            from .kloop.dtl_interleaved import DTL_INTERLEAVED_PROLOGUE_PHASES
             wg_pro = list(DTL_INTERLEAVED_PROLOGUE_PHASES)
         elif pgr2_interleaved:
-            from .pgr2_interleaved import PGR2_INTERLEAVED_PROLOGUE_PHASES
+            from .kloop.pgr2 import PGR2_INTERLEAVED_PROLOGUE_PHASES
             wg_pro = list(PGR2_INTERLEAVED_PROLOGUE_PHASES)
         elif auto_scheduled:
-            from .auto_scheduled_phase import _get_prologue_phases
+            from .kloop.auto_scheduled import _get_prologue_phases
             wg_pro = _get_prologue_phases()
         elif interleaved_large:
             wg_pro = list(INTERLEAVED_LARGE_PROLOGUE_PHASES)

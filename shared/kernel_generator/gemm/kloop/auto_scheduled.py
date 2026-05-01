@@ -12,10 +12,10 @@ from __future__ import annotations
 import math
 from typing import Dict, Tuple
 
-from .auto_scheduler import ScheduleGraph, OpType, SchedOp
-from .asm_context import AsmContext
-from .problem import GemmProblem, TileConfig
-from .tile import TilePhase
+from ..schedule.graph import ScheduleGraph, OpType, SchedOp
+from ..emit.context import AsmContext
+from ..problem import GemmProblem, TileConfig
+from ..tile.tree import TilePhase
 
 __all__ = ["phase_auto_scheduled_k_loop"]
 
@@ -27,7 +27,7 @@ def _layouts(ctx): return ctx._metadata["layouts"]
 
 def phase_auto_scheduled_k_loop(level, ctx):
     """K-loop with auto-scheduled compute phase."""
-    from .phases import (_emit_global_load_impl, _emit_lds_write_impl,
+    from ..emit.phases import (_emit_global_load_impl, _emit_lds_write_impl,
                          _emit_global_load_no_wait)
 
     tile = _tile(ctx)
@@ -201,7 +201,7 @@ def phase_auto_scheduled_k_loop(level, ctx):
 
 
 def _get_prologue_phases():
-    from .phases import (phase_load_kernargs, phase_thread_indexing,
+    from ..emit.phases import (phase_load_kernargs, phase_thread_indexing,
                          phase_load_cluster_setup, phase_lds_addrs,
                          phase_init_acc, phase_global_addrs)
     return [

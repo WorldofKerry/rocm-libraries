@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 """Tests for the coordinate transform system."""
 import pytest
-from kernel_generator.gemm.transforms import (
+from kernel_generator.gemm.tile.transforms import (
     Dim, PassThrough, Tile, Flatten, Pad, Embed, Xor,
     TileDescriptor, tile_hierarchy,
 )

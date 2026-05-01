@@ -14,12 +14,12 @@ from __future__ import annotations
 
 import math
 
-from .asm_context import AsmContext
-from .problem import GemmProblem, TileConfig
-from .tile import TilePhase
-from .partition_plan import PartitionPlan, Partition
-from .mainloop_scheduler import MainloopScheduler, ScheduleModule, ModuleKind
-from .slot_placer import SlotPlacer, PlacedOp, Path, SchedulingRules
+from ..emit.context import AsmContext
+from ..problem import GemmProblem, TileConfig
+from ..tile.tree import TilePhase
+from ..schedule.partition import PartitionPlan, Partition
+from ..schedule.mainloop import MainloopScheduler, ScheduleModule, ModuleKind
+from ..schedule.slot_placer import SlotPlacer, PlacedOp, Path, SchedulingRules
 from .dtl_interleaved import (
     phase_dtl_interleaved_setup,
     _emit_dtl_loads_a, _emit_dtl_loads_b,
@@ -237,7 +237,7 @@ def _recompute_ki_bases(ctx, tile, mfma, elem, ki_count):
     swz = tile.resolved_swizzle(elem) if hasattr(tile, 'resolved_swizzle') else None
     if swz is None or ki_count <= 1:
         return
-    from .swizzle import DataLayout as SwzLayout
+    from ..memory.swizzle import DataLayout as SwzLayout
     swz_layout = SwzLayout(row_stride_bytes=int(tile.unroll_k * elem),
                            mfma_k=mfma.k, mfma_m=mfma.m,
                            elem_bytes=elem, wave_size=tile.wave_size)
@@ -262,7 +262,7 @@ def _toggle_rd_with_ki(ctx, tile, mfma, elem, ki_count, base_name, matrix):
               comment=f"rd_{matrix} += db")
     swz = tile.resolved_swizzle(elem) if hasattr(tile, 'resolved_swizzle') else None
     if swz is not None and ki_count > 1:
-        from .swizzle import DataLayout as SwzLayout
+        from ..memory.swizzle import DataLayout as SwzLayout
         swz_layout = SwzLayout(row_stride_bytes=int(tile.unroll_k * elem),
                                mfma_k=mfma.k, mfma_m=mfma.m,
                                elem_bytes=elem, wave_size=tile.wave_size)
@@ -709,7 +709,7 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     # Loads next K-iteration's scale data during current iteration's
     # last MFMAs, after each register's last consumer.
     if use_real_scales and not use_swizzled_scales:
-        from .data_stream import compute_register_last_use, PrefetchOp, \
+        from ..schedule.data_stream import compute_register_last_use, PrefetchOp, \
             build_prefetch_path, place_prefetch_path
 
         # Collect all scale register names

@@ -19,11 +19,11 @@ from __future__ import annotations
 import math
 from typing import Optional
 
-from .asm_context import AsmContext
-from .asm_transforms import emit_affine, GemmLayouts
-from .problem import GemmProblem, TileConfig
-from .tile import TileLevel, TilePhase, walk_tile_tree
-from .transforms import Embed, Dim
+from .context import AsmContext
+from .layouts import emit_affine, GemmLayouts
+from ..problem import GemmProblem, TileConfig
+from ..tile.tree import TileLevel, TilePhase, walk_tile_tree
+from ..tile.transforms import Embed, Dim
 
 __all__ = [
     "WORKGROUP_PROLOGUE_PHASES",
@@ -1100,8 +1100,8 @@ def phase_scheduled_k_loop(level, ctx):
     slots with interleaved global loads and LDS writes, then emits
     assembly by walking the schedule.
     """
-    from .scheduled_codegen import TilePlan, emit_scheduled_kernel
-    from .schedule import SchedulingRules
+    from ..kloop.scheduled_codegen import TilePlan, emit_scheduled_kernel
+    from ..schedule.schedule_ir import SchedulingRules
 
     tile = _tile(ctx)
     problem = _problem(ctx)

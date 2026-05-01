@@ -10,7 +10,7 @@ import ctypes
 import pytest
 import numpy as np
 
-from kernel_generator.gemm.kernel_pipeline import GemmKernel
+from kernel_generator.gemm.kernel import GemmKernel
 from kernel_generator.gemm.problem import GemmProblem, TileConfig, MfmaConfig
 
 

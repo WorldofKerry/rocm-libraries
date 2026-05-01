@@ -35,9 +35,9 @@ import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
-from .asm_context import AsmContext
-from .transforms import Embed, Dim
-from .problem import GemmProblem, TileConfig
+from .context import AsmContext
+from ..tile.transforms import Embed, Dim
+from ..problem import GemmProblem, TileConfig
 
 __all__ = [
     "emit_affine", "GemmLayouts",

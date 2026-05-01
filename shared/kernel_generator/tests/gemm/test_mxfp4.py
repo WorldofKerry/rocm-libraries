@@ -5,7 +5,7 @@ import pytest
 import numpy as np
 from kernel_generator.gemm.problem import DataType, GemmProblem, MfmaConfig, TileConfig
 from kernel_generator.gemm.tiling import GemmTiling
-from kernel_generator.gemm.kernel_pipeline import GemmKernel
+from kernel_generator.gemm.kernel import GemmKernel
 
 
 class TestMfmaConfigMXFP4:
@@ -466,7 +466,7 @@ class TestWaveABIKernel:
 
     def test_wave_abi_emit(self):
         """Wave ABI kernel emits valid assembly."""
-        from kernel_generator.gemm.kernel_pipeline import GemmKernel
+        from kernel_generator.gemm.kernel import GemmKernel
         from kernel_generator.gemm.tiling import GemmTiling
 
         mx = MfmaConfig.mxfp4_16x16x128()
@@ -483,7 +483,7 @@ class TestWaveABIKernel:
 
     def test_wave_abi_assemble(self):
         """Wave ABI kernel assembles to .co successfully."""
-        from kernel_generator.gemm.kernel_pipeline import GemmKernel, export_wave_kernel
+        from kernel_generator.gemm.kernel import GemmKernel, export_wave_kernel
         from kernel_generator.gemm.tiling import GemmTiling
         import os
 
@@ -499,7 +499,7 @@ class TestWaveABIKernel:
 
     def test_wave_abi_kernarg_offsets(self):
         """Wave ABI kernel uses correct kernarg offsets for all fields."""
-        from kernel_generator.gemm.kernel_pipeline import GemmKernel
+        from kernel_generator.gemm.kernel import GemmKernel
         from kernel_generator.gemm.tiling import GemmTiling
 
         mx = MfmaConfig.mxfp4_16x16x128()
@@ -519,7 +519,7 @@ class TestWaveABIKernel:
 
     def test_wave_abi_kernel_name_prefix(self):
         """Wave ABI kernel name starts with 'wave_' for ABI dispatch."""
-        from kernel_generator.gemm.kernel_pipeline import GemmKernel, export_wave_kernel
+        from kernel_generator.gemm.kernel import GemmKernel, export_wave_kernel
         from kernel_generator.gemm.tiling import GemmTiling
 
         mx = MfmaConfig.mxfp4_16x16x128()

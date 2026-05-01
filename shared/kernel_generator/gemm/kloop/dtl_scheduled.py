@@ -16,11 +16,11 @@ from __future__ import annotations
 
 import math
 
-from .asm_context import AsmContext
-from .asm_transforms import GemmLayouts
-from .problem import GemmProblem, TileConfig
-from .tile import TilePhase
-from .auto_scheduler import ScheduleGraph, OpType, Latencies
+from ..emit.context import AsmContext
+from ..emit.layouts import GemmLayouts
+from ..problem import GemmProblem, TileConfig
+from ..tile.tree import TilePhase
+from ..schedule.graph import ScheduleGraph, OpType, Latencies
 from .dtl_interleaved import (
     phase_dtl_interleaved_setup,
     _emit_dtl_loads_a, _emit_dtl_loads_b,
