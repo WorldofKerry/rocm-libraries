@@ -803,7 +803,10 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     ctx.raw("")
 
     ctx.label("dtl_skip_all")
-    ctx.s_barrier(comment="sync DTL writes before preamble reads")
+    # No barrier needed here: DTL writes go to the OTHER buffer,
+    # preamble reads come from the CURRENT buffer. The suffix barrier
+    # from the previous iteration already synced all waves.
+    # On first iteration, the prologue barrier handles the sync.
     ctx.raw("")
 
     # Preamble: scale reads + B + A[m0]
