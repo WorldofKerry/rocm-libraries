@@ -249,6 +249,7 @@ def phase_dtl_partitioned_k_loop(level, ctx):
 
     partition_m = 2
     mfmas_per_mi = nr * ki_count  # 16
+    num_subtiles = mr // partition_m
 
     # ---- Registers ----
     ctx.alloc_sgpr_permanent(1, "s_lds_db_step")
@@ -349,9 +350,9 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                      ctx.sreg("s_scale_soff_b1"), "offen",
                      comment="scaleB group1 (ni=2,3)")
         else:
-            # Linear scale loads: one per mi/ni
-            ctx.comment("Load scales A (direct VGPR)")
-            for mi_ in range(mr):
+            # Linear scale loads: subtile 0's scale_a + all scale_b
+            ctx.comment("Load scales A subtile 0 (direct VGPR)")
+            for mi_ in range(partition_m):  # only subtile 0
                 if mi_ == 0:
                     ctx.inst("buffer_load_dword",
                              ctx.vreg(f"v_scale_a_m{mi_}"),
@@ -494,6 +495,33 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                 comment=f"A m{mi+1}k{ki}"))
         lr_paths.append(Path(ops=path_ops, reverse=False, module_id=mi))
 
+    # Scale A prefetch: load subtile N+1 during subtile N
+    scale_prefetch_paths = []
+    if use_real_scales and not use_swizzled_scales:
+        for st in range(num_subtiles - 1):  # subtile 0,1,2 prefetch for 1,2,3
+            path_ops = []
+            for mi_in_st in range(partition_m):
+                target_mi = (st + 1) * partition_m + mi_in_st
+                def _mk_scale_load(mi_=target_mi):
+                    def emit():
+                        if mi_ == 0:
+                            soff = "0"
+                        else:
+                            ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_stride_scale_a"),
+                                      str(mi_ * mfma.m),
+                                      comment=f"soff mi={mi_}")
+                            soff = ctx.sreg("s_tmp0")
+                        ctx.inst("buffer_load_dword",
+                                 ctx.vreg(f"v_scale_a_m{mi_}"),
+                                 ctx.vreg("v_dtl_off_scale_a"),
+                                 ctx.sreg("s_srd_scale_a", 0, 4),
+                                 soff, "offen", comment=f"scale A mi={mi_} (prefetch)")
+                    return emit
+                path_ops.append(PlacedOp(
+                    emit_fn=_mk_scale_load(), op_type="buffer_load",
+                    comment=f"scale_a m{target_mi}"))
+            scale_prefetch_paths.append(Path(ops=path_ops, reverse=False, module_id=100 + st))
+
     # Suffix ops for the last mi group (placed backward)
     suffix_ops = [
         PlacedOp(emit_fn=lambda: ctx.s_waitcnt("vmcnt(0)", comment="wait DTL"),
@@ -554,6 +582,27 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                     break
             if not placed:
                 placer.leftovers.append(op)
+
+    # Place scale_a prefetch paths within preceding subtile's MFMA range
+    if use_real_scales and not use_swizzled_scales:
+        mfmas_per_subtile = partition_m * mfmas_per_mi
+        for st, path in enumerate(scale_prefetch_paths):
+            # Place in subtile st's MFMA interval range
+            st_start_slot = st * mfmas_per_subtile * 2
+            st_end_slot = (st + 1) * mfmas_per_subtile * 2
+            # Place early in the subtile for max latency hiding
+            for i, op in enumerate(path.ops):
+                target = st_start_slot + 2 + i * 4
+                placed = False
+                for s in range(target, st_end_slot):
+                    if placer._can_place(s, op):
+                        placer._slots[s].append(op)
+                        if placer._on_place:
+                            placer._on_place(placer, s, op)
+                        placed = True
+                        break
+                if not placed:
+                    placer.leftovers.append(op)
 
     # Place suffix backward
     placer.place_path(suffix_path)
@@ -628,9 +677,9 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                      ctx.sreg("s_scale_soff_b1"), "offen",
                      comment="scaleB group1 (ni=2,3)")
         else:
-            # Linear scale loads: one per mi/ni
-            ctx.comment("Load scales A (direct VGPR)")
-            for mi_ in range(mr):
+            # Linear scale loads: subtile 0's scale_a + all scale_b
+            ctx.comment("Load scales A subtile 0 (direct VGPR)")
+            for mi_ in range(partition_m):  # only subtile 0
                 if mi_ == 0:
                     ctx.inst("buffer_load_dword",
                              ctx.vreg(f"v_scale_a_m{mi_}"),
@@ -720,6 +769,14 @@ def phase_dtl_partitioned_k_loop(level, ctx):
             ctx.s_waitcnt("lgkmcnt(0)",
                           comment=f"wait A[m{mfma_count // mfmas_per_mi}]")
             inflight_lgkm = 0
+
+        # Wait for prefetched scale_a at subtile boundaries
+        if use_real_scales and not use_swizzled_scales:
+            mfmas_per_subtile = partition_m * mfmas_per_mi
+            if mfma_count > 0 and mfma_count % mfmas_per_subtile == 0:
+                st_idx = mfma_count // mfmas_per_subtile
+                if st_idx < num_subtiles:
+                    ctx.s_waitcnt("vmcnt(0)", comment=f"wait scale_a subtile {st_idx}")
 
         # Partition boundary comments
         if mfma_count % (partition_m * mfmas_per_mi) == 0:
