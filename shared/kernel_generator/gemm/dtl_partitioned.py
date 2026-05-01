@@ -864,7 +864,11 @@ def phase_dtl_partitioned_k_loop(level, ctx):
             if mfma_count > 0 and mfma_count % mfmas_per_subtile == 0:
                 st_idx = mfma_count // mfmas_per_subtile
                 if st_idx < num_subtiles:
-                    ctx.s_waitcnt("vmcnt(0)", comment=f"wait scale_a subtile {st_idx}")
+                    # DTL loads (newest) can stay in-flight;
+                    # only scale prefetch loads (oldest) need to complete.
+                    num_dtl_ = num_loads_a + num_loads_b
+                    ctx.s_waitcnt(f"vmcnt({num_dtl_})",
+                                  comment=f"wait scale_a subtile {st_idx} (leave DTL)")
 
         # Partition boundary comments
         if mfma_count % (partition_m * mfmas_per_mi) == 0:
