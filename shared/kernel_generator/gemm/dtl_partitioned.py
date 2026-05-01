@@ -472,9 +472,14 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                                 comment=f"MFMA m{mi_}_n{ni_}_k{ki_}")
                     return emit
 
+                # Track which scale registers this MFMA reads for lifetime analysis
+                mfma_reads = ()
+                if use_real_scales and (mi, ki) in scale_a_names:
+                    mfma_reads = (scale_a_names[(mi, ki)], scale_b_names[(ni, ki)])
                 all_mfma_ops.append(PlacedOp(
                     emit_fn=_mk_mfma(), op_type="mfma",
-                    comment=f"m{mi}_n{ni}_k{ki}"))
+                    comment=f"m{mi}_n{ni}_k{ki}",
+                    reads_regs=mfma_reads))
 
     # LR paths: A-prefetch for mi+1, placed within mi's MFMA range
     lr_paths = []
@@ -523,8 +528,12 @@ def phase_dtl_partitioned_k_loop(level, ctx):
             scale_prefetch_paths.append(Path(ops=path_ops, reverse=False, module_id=100 + st))
 
     # Suffix ops for the last mi group (placed backward)
+    # When cross-iteration prefetch is active, the suffix vmcnt must
+    # leave the prefetch loads in-flight (they complete by next iter).
+    _pf_inflight = (partition_m + nr) if (use_real_scales and not use_swizzled_scales) else 0
     suffix_ops = [
-        PlacedOp(emit_fn=lambda: ctx.s_waitcnt("vmcnt(0)", comment="wait DTL"),
+        PlacedOp(emit_fn=lambda n=_pf_inflight: ctx.s_waitcnt(
+                 f"vmcnt({n})", comment=f"wait DTL (leave {n} prefetch in-flight)"),
                  op_type="wait", comment="vmcnt"),
         PlacedOp(emit_fn=lambda: ctx.v_add(ctx.vreg("v_lds_rd_a"),
                  ctx.sreg("s_lds_db_step"), ctx.vreg("v_lds_rd_a"),
@@ -607,6 +616,78 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     # Place suffix backward
     placer.place_path(suffix_path)
 
+    # Place cross-iteration scale prefetch (software pipelining)
+    # Loads next K-iteration's scale data during current iteration's
+    # last MFMAs, after each register's last consumer.
+    if use_real_scales and not use_swizzled_scales:
+        from .data_stream import compute_register_last_use, PrefetchOp, \
+            build_prefetch_path, place_prefetch_path
+
+        # Collect all scale register names
+        scale_reg_names = []
+        for mi_ in range(partition_m):
+            scale_reg_names.append(f"v_scale_a_m{mi_}")
+        for ni_ in range(nr):
+            scale_reg_names.append(f"v_scale_b_n{ni_}")
+
+        last_use = compute_register_last_use(all_mfma_ops, scale_reg_names)
+
+        # Build prefetch load ops
+        prefetch_loads = []
+        for mi_ in range(partition_m):
+            reg = f"v_scale_a_m{mi_}"
+            def _mk_pf_a(m=mi_):
+                def emit():
+                    if m == 0:
+                        soff = "0"
+                    else:
+                        ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_stride_scale_a"),
+                                  str(m * mfma.m), comment=f"soff mi={m}")
+                        soff = ctx.sreg("s_tmp0")
+                    ctx.inst("buffer_load_dword",
+                             ctx.vreg(f"v_scale_a_m{m}"),
+                             ctx.vreg("v_dtl_off_scale_a"),
+                             ctx.sreg("s_srd_scale_a", 0, 4),
+                             soff, "offen", comment=f"scale A mi={m} (next K)")
+                return emit
+            prefetch_loads.append(PrefetchOp(
+                reg_name=reg, emit_fn=_mk_pf_a(),
+                earliest_slot=last_use.get(reg, 0)))
+
+        for ni_ in range(nr):
+            reg = f"v_scale_b_n{ni_}"
+            def _mk_pf_b(n=ni_):
+                def emit():
+                    if n == 0:
+                        soff = "0"
+                    else:
+                        ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_stride_scale_b"),
+                                  str(n * mfma.n), comment=f"ni={n} * {mfma.n} * stride")
+                        soff = ctx.sreg("s_tmp0")
+                    ctx.inst("buffer_load_dword",
+                             ctx.vreg(f"v_scale_b_n{n}"),
+                             ctx.vreg("v_dtl_off_scale_b"),
+                             ctx.sreg("s_srd_scale_b", 0, 4),
+                             soff, "offen", comment=f"scale B ni={n} (next K)")
+                return emit
+            prefetch_loads.append(PrefetchOp(
+                reg_name=reg, emit_fn=_mk_pf_b(),
+                earliest_slot=last_use.get(reg, 0)))
+
+        # SRD advancement function
+        def _srd_advance():
+            for srd_name in ["s_srd_scale_a", "s_srd_scale_b"]:
+                ctx.inst("s_add_u32", ctx.sreg(srd_name, 0, 1),
+                         ctx.sreg(srd_name, 0, 1), str(scale_k_stride),
+                         comment=f"{srd_name} += {scale_k_stride} (next K)")
+                ctx.inst("s_addc_u32", ctx.sreg(srd_name, 1, 1),
+                         ctx.sreg(srd_name, 1, 1), "0", comment="carry")
+
+        pf_path = build_prefetch_path(
+            all_mfma_ops, prefetch_loads,
+            srd_advance_fn=_srd_advance)
+        place_prefetch_path(placer, pf_path, all_mfma_ops, prefetch_loads)
+
     schedule = placer.build()
 
     # ================================================================
@@ -631,7 +712,7 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                  ctx.sreg(srd, 1, 1), "0", comment="carry")
 
     # Advance scale SRDs
-    if use_real_scales and scale_k_stride > 0:
+    if use_real_scales and scale_k_stride > 0 and use_swizzled_scales:
         for srd in ["s_srd_scale_a", "s_srd_scale_b"]:
             ctx.inst("s_add_u32", ctx.sreg(srd, 0, 1),
                      ctx.sreg(srd, 0, 1), str(scale_k_stride),
@@ -678,40 +759,8 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                      comment="scaleB group1 (ni=2,3)")
         else:
             # Linear scale loads: subtile 0's scale_a + all scale_b
-            ctx.comment("Load scales A subtile 0 (direct VGPR)")
-            for mi_ in range(partition_m):  # only subtile 0
-                if mi_ == 0:
-                    ctx.inst("buffer_load_dword",
-                             ctx.vreg(f"v_scale_a_m{mi_}"),
-                             ctx.vreg("v_dtl_off_scale_a"),
-                             ctx.sreg("s_srd_scale_a", 0, 4),
-                             "0", "offen", comment=f"scale A mi={mi_}")
-                else:
-                    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_stride_scale_a"),
-                              str(mi_ * mfma.m),
-                              comment=f"mi={mi_} * {mfma.m} * stride_scale_a")
-                    ctx.inst("buffer_load_dword",
-                             ctx.vreg(f"v_scale_a_m{mi_}"),
-                             ctx.vreg("v_dtl_off_scale_a"),
-                             ctx.sreg("s_srd_scale_a", 0, 4),
-                             ctx.sreg("s_tmp0"), "offen", comment=f"scale A mi={mi_}")
-            ctx.comment("Load scales B (direct VGPR)")
-            for ni_ in range(nr):
-                if ni_ == 0:
-                    ctx.inst("buffer_load_dword",
-                             ctx.vreg(f"v_scale_b_n{ni_}"),
-                             ctx.vreg("v_dtl_off_scale_b"),
-                             ctx.sreg("s_srd_scale_b", 0, 4),
-                             "0", "offen", comment=f"scale B ni={ni_}")
-                else:
-                    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_stride_scale_b"),
-                              str(ni_ * mfma.n),
-                              comment=f"ni={ni_} * {mfma.n} * stride_scale_b")
-                    ctx.inst("buffer_load_dword",
-                             ctx.vreg(f"v_scale_b_n{ni_}"),
-                             ctx.vreg("v_dtl_off_scale_b"),
-                             ctx.sreg("s_srd_scale_b", 0, 4),
-                             ctx.sreg("s_tmp0"), "offen", comment=f"scale B ni={ni_}")
+            # Scale loads handled by cross-iteration prefetch
+            pass
         # No waitcnt here: scale loads overlap with barrier + LDS reads
     ctx.raw("")
 
@@ -800,7 +849,14 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     # Postamble
     ctx.s_barrier(comment="sync")
     ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0", comment="more?")
-    ctx.inst("s_cbranch_scc1", "k_loop", comment="loop")
+    if use_real_scales and not use_swizzled_scales and scale_k_stride > 0:
+        # On last iter (scc=0), skip to end; otherwise loop back.
+        # Scale prefetch loads are in-flight from MFMAs above.
+        ctx.inst("s_cbranch_scc0", "k_loop_end", comment="exit if last")
+        ctx.inst("s_branch", "k_loop", comment="loop back")
+        ctx.label("k_loop_end")
+    else:
+        ctx.inst("s_cbranch_scc1", "k_loop", comment="loop")
     ctx.raw("")
 
 

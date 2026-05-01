@@ -26,6 +26,7 @@ class PlacedOp:
     op_type: str = ""     # "mfma", "ds_read", "buffer_load", "wait", "barrier", "salu", "nop"
     module_id: int = -1   # which module this op belongs to
     comment: str = ""
+    reads_regs: tuple = ()  # register names this op reads (for lifetime analysis)
 
 
 @dataclass
