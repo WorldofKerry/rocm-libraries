@@ -281,3 +281,25 @@ output to the current manual `ComposableKLoop`:
   scheduler adapts automatically
 - **Experimentation**: users can add/remove blocks and the scheduler
   produces a valid loop -- no manual rewiring
+
+## Implementation Status
+
+### Completed
+- [x] `KLoopGraph` + `KLoopOp` + `Dep` data structures (`kloop_graph.py`)
+- [x] `MFMABlock`: declares MFMAs with RAW deps on A/B operands
+- [x] `DSReadBlock`: declares ds_reads with SYNC on barrier + WAR for A ping-pong
+- [x] `GlobalLoadBlock`: declares next-iter loads with cross-iter overlap
+- [x] `SuffixBlock`: declares vmcnt wait, toggle, negate (placed backward)
+- [x] `KLoopScheduler` with phases 1-5 (backbone, classify, forward, backward, auto-wait)
+- [x] `scheduled_kloop_phase`: emitter that builds graph, schedules, emits assembly
+- [x] `scheduled=True` flag on `GemmKernel.build()`
+- [x] Comparison tests: manual vs scheduled output matches exactly
+  (128 MFMAs, 32 ds_reads, 2 barriers, 32 buffer_loads -- all identical)
+- [x] MXFP4 support: emits, assembles, MFMA count matches composable
+- [x] 27 tests covering graph construction, scheduling, and comparison
+
+### Remaining
+- [ ] GPU correctness test (`scheduled=True` on actual hardware)
+- [ ] Performance benchmark (4096^3 through Tensile.sh)
+- [ ] ScaleBlock: register scale loads as graph ops with RAW deps to MFMAs
+- [ ] Remove manual `ComposableKLoop` once scheduled path is validated
