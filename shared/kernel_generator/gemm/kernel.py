@@ -180,7 +180,7 @@ class GemmKernel:
                 interleaved_large=interleaved_large,
                 wave_abi=wave_abi,
                 composable=composable,
-                scheduled=scheduled)
+                scheduled=scheduled or composable)
 
         tile_tree.validate()
 
@@ -219,7 +219,7 @@ class GemmKernel:
         lds_scale_half = 0
 
         # Double LDS for double-buffered mode
-        is_db = any(p.name in ("optimized_k_loop", "fully_interleaved_k_loop", "pgr2_k_loop", "dtl_k_loop", "interleaved_large_k_loop", "composable_k_loop", "scheduled_k_loop")
+        is_db = any(p.name in ("optimized_k_loop", "fully_interleaved_k_loop", "pgr2_k_loop", "dtl_k_loop", "interleaved_large_k_loop", "scheduled_k_loop")
                      for p in self.tile_tree.prologue_phases)
         lds_total = lds_half * 2 if is_db else lds_half
 

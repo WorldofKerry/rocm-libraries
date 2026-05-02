@@ -412,21 +412,21 @@ class GemmTiling:
             ]
         elif composable:
             from .kloop.setup import phase_dtl_interleaved_setup, phase_mx_scale_setup
-            from .kloop.composable import composable_kloop_phase
+            from .schedule.kloop_scheduler import scheduled_kloop_phase
             from .tile.tree import TilePhase
             wg_pro = [
                 TilePhase("dtl_setup", phase_dtl_interleaved_setup),
                 TilePhase("mx_scale_setup", phase_mx_scale_setup),
-                TilePhase("composable_k_loop", composable_kloop_phase),
+                TilePhase("scheduled_k_loop", scheduled_kloop_phase),
             ]
         elif wave_abi:
             from .kloop.setup import WAVE_ABI_PROLOGUE_PHASES, phase_mx_scale_setup
-            from .kloop.composable import composable_kloop_phase
+            from .schedule.kloop_scheduler import scheduled_kloop_phase
             from .tile.tree import TilePhase
             wg_pro = [
                 TilePhase("wave_abi_setup", WAVE_ABI_PROLOGUE_PHASES[0].emit),
                 TilePhase("mx_scale_setup", phase_mx_scale_setup),
-                TilePhase("composable_k_loop", composable_kloop_phase),
+                TilePhase("scheduled_k_loop", scheduled_kloop_phase),
             ]
 
         elif interleaved_large:
