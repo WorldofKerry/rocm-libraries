@@ -348,10 +348,6 @@ class GemmTiling:
                        pgr2: bool = False,
                        dtl: bool = False,
                        interleaved_large: bool = False,
-                       pgr2_interleaved: bool = False,
-                       dtl_interleaved: bool = False,
-                       dtl_partitioned: bool = False,
-                       non_dtl_partitioned: bool = False,
                        wave_abi: bool = False,
                        composable: bool = False) -> TileLevel:
         """Build the full tile tree with phases from TileDim chains.
@@ -387,7 +383,7 @@ class GemmTiling:
 
         # Wave: per-wave compute tile
         # K-loop data movement phases go here (non-pipelined)
-        if pipelined or optimized or non_dtl_partitioned or interleaved or pgr2 or dtl or interleaved_large or pgr2_interleaved or dtl_interleaved or dtl_partitioned or wave_abi or composable:
+        if pipelined or optimized or interleaved or pgr2 or dtl or interleaved_large or wave_abi or composable:
             # Pipelined/optimized: K-loop phase handles compute internally.
             # Wave gets a no-op emit so the tree walker skips it.
             wave_level = TileLevel(
@@ -405,8 +401,7 @@ class GemmTiling:
 
         # Workgroup: setup + K-loop structure + store
         if composable:
-            from .kloop.setup import phase_dtl_interleaved_setup
-            from .kloop.partitioned import phase_mx_scale_setup
+            from .kloop.setup import phase_dtl_interleaved_setup, phase_mx_scale_setup
             from .kloop.composable import composable_kloop_phase
             from .tile.tree import TilePhase
             wg_pro = [
@@ -415,28 +410,15 @@ class GemmTiling:
                 TilePhase("composable_k_loop", composable_kloop_phase),
             ]
         elif wave_abi:
-            from .kloop.setup import WAVE_ABI_PROLOGUE_PHASES
-            from .kloop.partitioned import phase_mx_scale_setup
+            from .kloop.setup import WAVE_ABI_PROLOGUE_PHASES, phase_mx_scale_setup
+            from .kloop.composable import composable_kloop_phase
             from .tile.tree import TilePhase
-            # Wave ABI uses partitioned K-loop with wave ABI setup
-            from .kloop.partitioned import phase_dtl_partitioned_k_loop
             wg_pro = [
                 TilePhase("wave_abi_setup", WAVE_ABI_PROLOGUE_PHASES[0].emit),
                 TilePhase("mx_scale_setup", phase_mx_scale_setup),
-                TilePhase("dtl_partitioned_k_loop", phase_dtl_partitioned_k_loop),
+                TilePhase("composable_k_loop", composable_kloop_phase),
             ]
-        elif non_dtl_partitioned:
-            from .kloop.partitioned import GLOBAL_LOAD_PARTITIONED_PROLOGUE_PHASES
-            wg_pro = list(GLOBAL_LOAD_PARTITIONED_PROLOGUE_PHASES)
-        elif dtl_partitioned:
-            from .kloop.partitioned import DTL_PARTITIONED_PROLOGUE_PHASES
-            wg_pro = list(DTL_PARTITIONED_PROLOGUE_PHASES)
-        elif dtl_interleaved:
-            from .kloop.setup import DTL_INTERLEAVED_PROLOGUE_PHASES
-            wg_pro = list(DTL_INTERLEAVED_PROLOGUE_PHASES)
-        elif pgr2_interleaved:
-            from .kloop.simple import PGR2_INTERLEAVED_PROLOGUE_PHASES
-            wg_pro = list(PGR2_INTERLEAVED_PROLOGUE_PHASES)
+
         elif interleaved_large:
             wg_pro = list(INTERLEAVED_LARGE_PROLOGUE_PHASES)
         elif dtl:

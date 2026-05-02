@@ -478,8 +478,8 @@ class TestBaselineKernel:
 
 @requires_gpu
 @requires_gpu
-class TestDTLPartitionedKernel:
-    """DTL + partition-based scheduling with SlotPlacer interleaving."""
+class TestComposablePartitionedKernel:
+    """Composable K-loop with partition-based scheduling."""
 
     @pytest.mark.parametrize("M,N,K", [
         (256, 256, 64),
@@ -487,16 +487,16 @@ class TestDTLPartitionedKernel:
         (4096, 4096, 4096),
     ])
     def test_correct(self, M, N, K):
-        D_gpu, D_ref = _run_variant(M, N, K, dtl_partitioned=True)
+        D_gpu, D_ref = _run_variant(M, N, K, composable=True)
         max_err = np.max(np.abs(D_gpu.astype(np.float32)
                                 - D_ref.astype(np.float32)))
         assert max_err < 0.001, \
-            f"dtl_partitioned {M}x{N}x{K}: max_err={max_err}"
+            f"composable {M}x{N}x{K}: max_err={max_err}"
 
     def test_emit_structure(self):
         """Verify the kernel uses the expected tile config."""
         problem = GemmProblem(m=4096, n=4096, k=4096)
-        kernel = GemmKernel.build(problem, dtl_partitioned=True)
+        kernel = GemmKernel.build(problem, composable=True)
         assert kernel.tile.wg_m == 256
         assert kernel.tile.wg_n == 256
         assert kernel.tile.unroll_k == 64
@@ -518,43 +518,17 @@ class TestSmallBaseline:
 
 
 @requires_gpu
-class TestDTLInterleavedKernel:
-    """DTL + hand-tuned interleaved schedule (reference variant)."""
+class TestComposableKernel:
+    """Composable K-loop with modular building blocks.."""
 
     @pytest.mark.parametrize("M,N,K", [
         (256, 256, 64),
         (256, 256, 128),
     ])
     def test_correct(self, M, N, K):
-        D_gpu, D_ref = _run_variant(M, N, K, dtl_interleaved=True)
+        D_gpu, D_ref = _run_variant(M, N, K, composable=True)
         max_err = np.max(np.abs(D_gpu.astype(np.float32)
                                 - D_ref.astype(np.float32)))
         assert max_err < 0.001, \
-            f"dtl_interleaved {M}x{N}x{K}: max_err={max_err}"
+            f"composable {M}x{N}x{K}: max_err={max_err}"
 
-
-@requires_gpu
-class TestSmallBaseline:
-    """Baseline kernel at smallest valid tile size."""
-
-    def test_128x128x32(self):
-        D_gpu, D_ref = _run_gemm(128, 128, 32)
-        max_err = np.max(np.abs(D_gpu.astype(np.float32)
-                                - D_ref.astype(np.float32)))
-        assert max_err < 0.01, f"Baseline 128x128x32: max_err={max_err}"
-
-
-@requires_gpu
-class TestDTLInterleavedKernel:
-    """DTL + hand-tuned A-prefetch interleaving (reference kernel)."""
-
-    @pytest.mark.parametrize("M,N,K", [
-        (256, 256, 64),
-        (256, 256, 128),
-    ])
-    def test_correct(self, M, N, K):
-        D_gpu, D_ref = _run_variant(M, N, K, dtl_interleaved=True)
-        max_err = np.max(np.abs(D_gpu.astype(np.float32)
-                                - D_ref.astype(np.float32)))
-        assert max_err < 0.001, \
-            f"dtl_interleaved {M}x{N}x{K}: max_err={max_err}"

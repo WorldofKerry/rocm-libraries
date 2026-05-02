@@ -29,7 +29,7 @@ def generate_custom_kernel(
     if composable:
         k = GemmKernel.build(p, tiling=t, composable=True)
     else:
-        k = GemmKernel.build(p, tiling=t, dtl_partitioned=True)
+        k = GemmKernel.build(p, tiling=t, composable=True)
 
     # Force 1D grid + column-major store for TensileLite compatibility
     k.use_1d_grid = True

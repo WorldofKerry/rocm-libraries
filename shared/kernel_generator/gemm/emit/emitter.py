@@ -343,7 +343,7 @@ def alloc_registers_dtl(ctx: AsmContext, problem: GemmProblem,
 
     # MX scale VGPRs
     if tile.mfma.is_mx:
-        # Constant scale fallback (Phase 1, still used by dtl_interleaved)
+        # Constant scale fallback (Phase 1)
         ctx.alloc_vgpr_permanent(1, "v_mxscale")
         # DTL offset VGPR for scale loads
         ctx.alloc_vgpr_permanent(1, "v_dtl_off_scale_a")
@@ -352,7 +352,7 @@ def alloc_registers_dtl(ctx: AsmContext, problem: GemmProblem,
         ctx.alloc_vgpr_permanent(1, "v_lds_rd_scale_a")
         ctx.alloc_vgpr_permanent(1, "v_lds_rd_scale_b")
         # Per-(mi,ki) and per-(ni,ki) scale VGPRs are allocated dynamically
-        # in dtl_partitioned.py's phase function
+        # in composable K-loop phase
 
     # Store registers
     ctx.alloc_vgpr_permanent(2, "v_addr_d")

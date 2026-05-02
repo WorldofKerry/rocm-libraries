@@ -72,7 +72,7 @@ def phase_load_kernargs(level: TileLevel, ctx: AsmContext) -> None:
     ctx.s_waitcnt("lgkmcnt(0)", comment="wait for kernarg loads")
     ctx.raw("")
 
-    # 1D WG decomposition (same as dtl_interleaved)
+    # 1D WG decomposition (DTL setup)
     if ctx._metadata.get("use_1d_grid", False):
         # 1D WG decomposition using pure scalar integer math
         # numWG_m = ceil(M / MT_M), tile_n = serial / numWG_m, tile_m = serial % numWG_m

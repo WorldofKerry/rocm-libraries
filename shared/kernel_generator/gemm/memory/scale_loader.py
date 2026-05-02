@@ -2,7 +2,7 @@
 
 MX data types require per-tile E8M0 scale factors loaded from global
 memory alongside the data tiles.  This module extracts scale loading
-logic from the monolithic ``partitioned.py`` K-loop into composable
+logic into composable
 classes so that different K-loop implementations (partitioned, simple,
 software-pipelined) can reuse the same scale plumbing.
 

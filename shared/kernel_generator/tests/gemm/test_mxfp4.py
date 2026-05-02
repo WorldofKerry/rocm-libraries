@@ -95,7 +95,7 @@ class TestMXFP4Kernel:
         tiling = GemmTiling.mxfp4_standard()
         problem = GemmProblem(128, 128, 256, dtype=DataType.MXFP4)
         return GemmKernel.build(
-            problem, tiling=tiling, dtl_partitioned=True)
+            problem, tiling=tiling, composable=True)
 
     def test_kernel_builds(self):
         kernel = self._build_mxfp4_kernel()
@@ -169,11 +169,11 @@ class TestMXFP4Kernel:
         assert result.acc_count == 64
 
     def test_fp16_still_works(self):
-        """Existing fp16 dtl_partitioned path still works."""
+        """Existing fp16 composable path still works."""
         tiling = GemmTiling.high_perf(wg_m=128, wg_n=128, unroll_k=64)
         problem = GemmProblem(128, 128, 64)
         kernel = GemmKernel.build(problem, tiling=tiling,
-                                  dtl_partitioned=True)
+                                  composable=True)
         result = kernel.emit()
         mfma_lines = [l for l in result.ctx.lines
                       if 'v_mfma_f32_16x16x32_f16' in l]
@@ -240,7 +240,7 @@ class TestMXFP4GPU:
         tiling = GemmTiling.mxfp4_standard()
         problem = GemmProblem(m, n, k, dtype=DataType.MXFP4)
         kernel = GemmKernel.build(problem, tiling=tiling,
-                                  dtl_partitioned=True)
+                                  composable=True)
         result = kernel.emit()
         co_path = result.assemble(output_path=output_path)
         return kernel, co_path
@@ -399,7 +399,7 @@ class TestMXFP4RealScales:
         tiling = GemmTiling.mxfp4_standard()
         problem = GemmProblem(m, n, k, dtype=DataType.MXFP4)
         kernel = GemmKernel.build(problem, tiling=tiling,
-                                  dtl_partitioned=True,
+                                  composable=True,
                                   )
         result = kernel.emit()
         co_path = result.assemble(output_path=output_path)

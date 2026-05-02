@@ -25,9 +25,9 @@ import math
 from ..emit.context import AsmContext
 from ..emit.layouts import GemmLayouts
 from ..problem import GemmProblem, MfmaConfig, TileConfig
-from ..tile.tree import TilePhase
+from ..tile.tree import TileLevel, TilePhase
 
-__all__ = ["phase_dtl_interleaved_k_loop", "DTL_INTERLEAVED_PROLOGUE_PHASES",
+__all__ = ["phase_mx_scale_setup", "phase_dtl_interleaved_setup",
            "phase_wave_abi_setup", "WAVE_ABI_PROLOGUE_PHASES"]
 
 
@@ -729,228 +729,187 @@ def _emit_dtl_loads_b(ctx: AsmContext, tile: TileConfig, problem: GemmProblem, n
                          ctx.sreg("s_soffset_b"), comment="soffset += stride")
 
 
-def phase_dtl_interleaved_k_loop(level: TileLevel, ctx: AsmContext) -> None:
-    """DTL + interleaved K-loop: DTL loads and toggle between MFMAs.
 
-    128 MFMAs split into phases:
-      Phase A (mi 0-3): compute X0 half + issue DTL loads between MFMAs
-      Phase B (mi 4):   vmcnt for DTL, barrier, toggle read addrs
-      Phase C (mi 4-7): compute X1 half + ds_read next iter from new buffer
+# ---------------------------------------------------------------------------
+# MX scale setup (moved from partitioned.py)
+# ---------------------------------------------------------------------------
+
+def _scale_lds_offset_a(tile: TileConfig) -> int:
+    """LDS byte offset where ScaleA region starts (within one half-buffer)."""
+    elem = tile.mfma.element_bytes
+    data_a = int(tile.wg_m * tile.unroll_k * elem)
+    data_b = int(tile.wg_n * tile.unroll_k * elem)
+    return data_a + data_b
+
+
+def _scale_lds_offset_b(tile: TileConfig) -> int:
+    """LDS byte offset where ScaleB region starts (within one half-buffer)."""
+    mx_block = tile.mfma.mx_block
+    scale_a_bytes = tile.wg_m * (tile.unroll_k // mx_block)
+    return _scale_lds_offset_a(tile) + scale_a_bytes
+
+
+def _scale_region_bytes(tile: TileConfig, dim_size: int) -> int:
+    """Bytes for one scale tensor region (e.g. ScaleA or ScaleB) per half."""
+    mx_block = tile.mfma.mx_block
+    return dim_size * (tile.unroll_k // mx_block)
+
+
+def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
+    """Set up scale SRDs for direct VGPR loading (no LDS).
+
+    Scale data is small enough to load directly from global memory
+    into VGPRs, bypassing LDS entirely. This keeps the full 64KB LDS
+    budget for data A/B.
+
+    Each MFMA tile needs 4 scale bytes (one per K-block of 32 elements).
+    The scale is per-MFMA-tile (shared across all lanes), loaded via
+    buffer_load_dword into a VGPR, then broadcast.
     """
-    tile = _tile(ctx)
-    problem = _problem(ctx)
-    elem = problem.element_bytes
+    tile = ctx._metadata["tile"]
     mfma = tile.mfma
-    layouts = _layouts(ctx)
+    use_dtl = ctx._metadata.get("use_dtl", True)
+    use_real_scales = ctx._metadata.get("use_real_scales", False)
+    use_swizzled_scales = ctx._metadata.get("swizzled_scales", False) and use_real_scales
+    if not mfma.is_mx or not use_real_scales:
+        return
 
-    mr = tile.mfma_m_repeat   # 8
-    nr = tile.mfma_n_repeat   # 8
-    ki_count = tile.k_iterations  # 2
-    av = mfma.a_vgprs   # 4
-    bv = mfma.b_vgprs   # 4
+    mx_block = mfma.mx_block
+    scale_k_cols = tile.unroll_k // mx_block
 
-    pad_e = tile.lds_pad // elem if tile.lds_pad > 0 else 0
-    # For DTL: per-load-line padding (not per-row)
-    if tile.lds_pad > 0:
-        threads_per_row_l = int(tile.unroll_k * elem) // 16
-        rows_per_load_l = tile.block_size // threads_per_row_l
-        num_loads_a_l = tile.wg_m // rows_per_load_l
-        num_loads_b_l = tile.wg_n // rows_per_load_l
-        lds_a_half = int(tile.wg_m * tile.unroll_k * elem) + num_loads_a_l * tile.lds_pad
-        lds_b_half = int(tile.wg_n * tile.unroll_k * elem) + num_loads_b_l * tile.lds_pad
-        lds_half = lds_a_half + lds_b_half
-    else:
-        lds_half = int((tile.wg_m + tile.wg_n) * tile.unroll_k * elem)
-    k_stride = int(tile.unroll_k * elem)
-    log2_uk = int(math.log2(tile.unroll_k))
+    ctx.comment("=== MX Scale Setup (direct VGPR, no LDS) ===")
 
-    threads_per_row = int(tile.unroll_k * elem) // 16
-    rows_per_load = tile.block_size // threads_per_row
-    num_loads_a = tile.wg_m // rows_per_load  # 8
-    num_loads_b = tile.wg_n // rows_per_load  # 8
-
-    ctx.alloc_sgpr_permanent(1, "s_lds_db_step")
-
-    ctx.comment("=== DTL Interleaved K-loop ===")
-    ctx.s_lshr(ctx.sreg("s_k_tiles"), ctx.sreg("s_K"), log2_uk,
-               comment=f"k_tiles = K / {tile.unroll_k}")
-    ctx.s_mov(ctx.sreg("s_lds_db_step"), str(lds_half),
-              comment=f"DB step = {lds_half}")
-    ctx.raw("")
-
-    # Prologue: DTL load first tile, wait, barrier
-    ctx.comment("Prologue: DTL tile 0")
-    _emit_dtl_loads_a(ctx, tile, problem, num_loads_a)
-    _emit_dtl_loads_b(ctx, tile, problem, num_loads_b)
-    ctx.s_waitcnt("vmcnt(0)", comment="wait DTL")
-    ctx.s_barrier(comment="sync")
-    ctx.raw("")
-
-    # Allocate operand registers
-    b_names = {}
-    for ni in range(nr):
-        for ki in range(ki_count):
-            name = f"v_b_s{ni}k{ki}"
-            if not ctx.has(name):
-                ctx.alloc_vgpr_permanent(bv, name)
-            b_names[(ni, ki)] = name
-
-    a_names = {}
-    for buf in range(2):
-        for ki in range(ki_count):
-            name = f"v_a_b{buf}k{ki}"
-            if not ctx.has(name):
-                ctx.alloc_vgpr_permanent(av, name)
-            a_names[(buf, ki)] = name
-
-    # === Main loop ===
-    ctx.label("k_loop")
-    ctx.raw("")
-
-    # --- K-tile counter and conditional DTL load setup ---
-    ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
-              comment="k_tiles--")
-    ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
-             comment="more tiles?")
-    ctx.inst("s_cbranch_scc0", "dtl_skip_all",
-             comment="skip DTL on last iter")
-
-    # Advance SRDs for next tile
-    for srd in ["s_srd_a", "s_srd_b"]:
-        ctx.inst("s_add_u32", ctx.sreg(srd, 0, 1),
-                 ctx.sreg(srd, 0, 1), str(k_stride), comment=f"{srd} += {k_stride}")
-        ctx.inst("s_addc_u32", ctx.sreg(srd, 1, 1),
-                 ctx.sreg(srd, 1, 1), "0", comment="carry")
-
-    # Toggle write addresses for DTL
-    ctx.inst("s_add_u32", ctx.sreg("s_lds_wr_a_sg"),
-             ctx.sreg("s_lds_wr_a_sg"), ctx.sreg("s_lds_db_step"),
-             comment="wr_a += db")
-    ctx.inst("s_add_u32", ctx.sreg("s_lds_wr_b_sg"),
-             ctx.sreg("s_lds_wr_b_sg"), ctx.sreg("s_lds_db_step"),
-             comment="wr_b += db")
-
-    # Issue all DTL loads
-    _emit_dtl_loads_a(ctx, tile, problem, num_loads_a)
-    _emit_dtl_loads_b(ctx, tile, problem, num_loads_b)
-    ctx.raw("")
-
-    ctx.label("dtl_skip_all")
-    ctx.raw("")
-
-    # --- Preamble: B[ki=0] + A[m0,ki=0], lgkmcnt, then B[ki=1] interleaved ---
-    ctx.comment("Preamble: B[ki=0] + A[m0]")
-    # Issue ki=0 B reads and A[m0,k0]
-    for ni in range(nr):
-        ctx.ds_read(ctx.vreg(b_names[(ni, 0)], 0, bv),
-                    ctx.vreg("v_lds_rd_b"),
-                    offset=_b_off(ni, 0, tile, mfma, elem),
-                    width=bv, comment=f"LR B n{ni}k0")
-
-    cur_a = 0
-    ctx.ds_read(ctx.vreg(a_names[(cur_a, 0)], 0, av),
-                ctx.vreg("v_lds_rd_a"),
-                offset=_a_off(0, 0, tile, mfma, elem),
-                width=av, comment=f"LR A m0k0 b{cur_a}")
-
-    # Issue ki=1 B reads (will be interleaved with mi=0 ki=0 MFMAs)
-    for ni in range(nr):
-        ctx.ds_read(ctx.vreg(b_names[(ni, 1)], 0, bv),
-                    ctx.vreg("v_lds_rd_b"),
-                    offset=_b_off(ni, 1, tile, mfma, elem),
-                    width=bv, comment=f"LR B n{ni}k1")
-
-    ctx.ds_read(ctx.vreg(a_names[(cur_a, 1)], 0, av),
-                ctx.vreg("v_lds_rd_a"),
-                offset=_a_off(0, 1, tile, mfma, elem),
-                width=av, comment=f"LR A m0k1 b{cur_a}")
-
-    # Wait for ki=0 reads (we need them for the first 8 MFMAs)
-    # There are 18 reads total, ki=0 was issued first (9 reads)
-    # lgkmcnt(9) means wait until 9 are left = first 9 are done
-    ctx.s_waitcnt("lgkmcnt(9)", comment="wait B[ki=0] + A[m0,k0]")
-    ctx.raw("")
-
-    # --- 128 MFMAs with interleaved ops ---
-    for mi in range(mr):
-        has_pf = mi < mr - 1
-        is_last = mi == mr - 1
-        if has_pf:
-            next_a = 1 - cur_a
-
-        mfma_idx = 0
-        for ki in range(ki_count):
-            # Wait for ki=1 data before first ki=1 MFMA of mi=0
-            if mi == 0 and ki == 1:
-                ctx.s_waitcnt("lgkmcnt(0)", comment="wait B[ki=1] + A[m0,k1]")
-            for ni in range(nr):
-                # A-prefetch: spread ds_reads at slots 2 and 10
-                # (earlier = more time for data to arrive before lgkmcnt)
-                if has_pf and mfma_idx == 2:
-                    ctx.ds_read(ctx.vreg(a_names[(next_a, 0)], 0, av),
-                                ctx.vreg("v_lds_rd_a"),
-                                offset=_a_off(mi + 1, 0, tile, mfma, elem),
-                                width=av, comment=f"LR A m{mi+1}k0 b{next_a}")
-                elif has_pf and mfma_idx == 10:
-                    ctx.ds_read(ctx.vreg(a_names[(next_a, 1)], 0, av),
-                                ctx.vreg("v_lds_rd_a"),
-                                offset=_a_off(mi + 1, 1, tile, mfma, elem),
-                                width=av, comment=f"LR A m{mi+1}k1 b{next_a}")
-
-                # Suffix ops in last mi group
-                if is_last and mfma_idx == 8:
-                    ctx.s_waitcnt("vmcnt(0)", comment="wait DTL")
-                elif is_last and mfma_idx == 10:
-                    ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.sreg("s_lds_db_step"),
-                              ctx.vreg("v_lds_rd_a"), comment="rd_a += db")
-                elif is_last and mfma_idx == 11:
-                    ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.sreg("s_lds_db_step"),
-                              ctx.vreg("v_lds_rd_b"), comment="rd_b += db")
-                elif is_last and mfma_idx == 12:
-                    ctx.inst("s_sub_u32", ctx.sreg("s_lds_db_step"), "0",
-                             ctx.sreg("s_lds_db_step"), comment="negate db")
-
-                acc_per = mfma.acc_vgprs
-                acc_off = (mi * nr + ni) * acc_per
-                if mfma.is_mx:
-                    ctx.inst(mfma.instruction_name,
-                             ctx.areg("acc_C", acc_off, acc_per),
-                             ctx.vreg(a_names[(cur_a, ki)], 0, av),
-                             ctx.vreg(b_names[(ni, ki)], 0, bv),
-                             ctx.areg("acc_C", acc_off, acc_per),
-                             ctx.vreg("v_mxscale"),
-                             ctx.vreg("v_mxscale"),
-                             f"cbsz:{mfma.cbsz} blgp:{mfma.blgp}",
-                             comment=f"MFMA m{mi}_n{ni}_k{ki}")
-                else:
-                    ctx.inst(mfma.instruction_name,
-                             ctx.areg("acc_C", acc_off, acc_per),
-                             ctx.vreg(a_names[(cur_a, ki)], 0, av),
-                             ctx.vreg(b_names[(ni, ki)], 0, bv),
-                             ctx.areg("acc_C", acc_off, acc_per),
-                             comment=f"MFMA m{mi}_n{ni}_k{ki}")
-                mfma_idx += 1
-
-        if has_pf:
-            ctx.s_waitcnt("lgkmcnt(0)", comment=f"wait A[{mi+1}]")
-            cur_a = next_a
+    # Wave ABI already loads scale ptrs/strides in setup phase
+    if not ctx._metadata.get("use_wave_abi", False):
+        # TensileLite kernarg offsets: MXSA@56, MXSB@72, strides@104,120
+        karg = ctx.sreg("s_kernarg")
+        ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_scale_a"), karg, "56",
+                 comment="scale A ptr (MXSA)")
+        ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_scale_b"), karg, "72",
+                 comment="scale B ptr (MXSB)")
+        ctx.inst("s_load_dword", ctx.sreg("s_stride_scale_a"), karg, "104",
+                 comment="strideMXSA0")
+        ctx.inst("s_load_dword", ctx.sreg("s_stride_scale_b"), karg, "120",
+                 comment="strideMXSB0")
+        ctx.s_waitcnt("lgkmcnt(0)", comment="wait scale kernargs")
         ctx.raw("")
 
-    # Suffix: only barrier remains (vmcnt + toggle moved into last mi group)
-    ctx.s_barrier(comment="sync")
-
-    ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0", comment="more?")
-    ctx.inst("s_cbranch_scc1", "k_loop", comment="loop")
+    # Scale SRD A
+    ctx.comment("Scale SRD A")
+    if use_swizzled_scales:
+        # Swizzled: offset = wg_id * (wg_m / 32) * stride
+        ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"),
+                  str(tile.wg_m // 32),
+                  comment=f"wg_id_x * {tile.wg_m // 32}")
+    else:
+        ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"), str(tile.wg_m),
+                  comment=f"wg_id_x * {tile.wg_m}")
+    ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+             ctx.sreg("s_stride_scale_a"), comment="* stride_scale_a")
+    ctx.inst("s_add_u32", ctx.sreg("s_srd_scale_a", 0, 1),
+             ctx.sreg("s_ptr_scale_a", 0, 1), ctx.sreg("s_tmp0"),
+             comment="SRD_scaleA lo")
+    ctx.inst("s_addc_u32", ctx.sreg("s_srd_scale_a", 1, 1),
+             ctx.sreg("s_ptr_scale_a", 1, 1), "0",
+             comment="SRD_scaleA hi")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_scale_a", 2, 1),
+             "0xFFFFFFFF", comment="limit")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_scale_a", 3, 1),
+             "0x20000", comment="flags")
     ctx.raw("")
 
+    # Scale SRD B
+    ctx.comment("Scale SRD B")
+    if use_swizzled_scales:
+        ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"),
+                  str(tile.wg_n // 32),
+                  comment=f"wg_id_y * {tile.wg_n // 32}")
+    else:
+        ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"), str(tile.wg_n),
+                  comment=f"wg_id_y * {tile.wg_n}")
+    ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+             ctx.sreg("s_stride_scale_b"), comment="* stride_scale_b")
+    ctx.inst("s_add_u32", ctx.sreg("s_srd_scale_b", 0, 1),
+             ctx.sreg("s_ptr_scale_b", 0, 1), ctx.sreg("s_tmp0"),
+             comment="SRD_scaleB lo")
+    ctx.inst("s_addc_u32", ctx.sreg("s_srd_scale_b", 1, 1),
+             ctx.sreg("s_ptr_scale_b", 1, 1), "0",
+             comment="SRD_scaleB hi")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_scale_b", 2, 1),
+             "0xFFFFFFFF", comment="limit")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_scale_b", 3, 1),
+             "0x20000", comment="flags")
+    ctx.raw("")
 
-DTL_INTERLEAVED_PROLOGUE_PHASES = [
-    TilePhase("dtl_interleaved_setup", phase_dtl_interleaved_setup),
-    TilePhase("dtl_interleaved_k_loop", phase_dtl_interleaved_k_loop),
-]
+    # Allocate scale soffset SGPRs for swizzled mode
+    if ctx._metadata.get("use_1d_grid", False) or ctx._metadata.get("use_wave_abi", False):
+        ctx.alloc_sgpr_permanent(1, "s_scale_soff_a0")
+        ctx.alloc_sgpr_permanent(1, "s_scale_soff_a1")
+        ctx.alloc_sgpr_permanent(1, "s_scale_soff_b0")
+        ctx.alloc_sgpr_permanent(1, "s_scale_soff_b1")
+
+    use_swizzled_scales = ctx._metadata.get("swizzled_scales", False)
+
+    if use_swizzled_scales:
+        # Pre-swizzled scale layout (AITER e8m0_shuffle):
+        # Per-lane voffset = (lane_id % 16) * 4
+        # Per-group soffset = (wave_m * 2 + group) * 256
+        # The 4 bytes at each position contain scales for:
+        #   byte[0]: (mi_lo, ki_lo), byte[1]: (mi_hi, ki_lo)
+        #   byte[2]: (mi_lo, ki_hi), byte[3]: (mi_hi, ki_hi)
+        ctx.comment("Scale swizzled voffset: lane_id * 4")
+        ctx.v_lshl(ctx.vreg("v_dtl_off_scale_a"),
+                   ctx.vreg("v_lane_id"), 2,
+                   comment="lane_id * 4 -> swizzled scale voffset")
+        ctx.inst("v_mov_b32", ctx.vreg("v_dtl_off_scale_b"),
+                 ctx.vreg("v_dtl_off_scale_a"),
+                 comment="scaleB voffset = same")
+        ctx.raw("")
+
+        # Compute SGPR soffsets for each mi-group and ni-group
+        # group0: (wave_m * 2) * 256, group1: (wave_m * 2 + 1) * 256
+        ctx.comment("Scale group soffsets")
+        ctx.v_lshl(ctx.vreg("v_tmp0"), ctx.vreg("v_wave_m"), 1,
+                   comment="wave_m * 2")
+        ctx.inst("v_readfirstlane_b32", ctx.sreg("s_tmp0"),
+                 ctx.vreg("v_tmp0"), comment="wave_m * 2 -> SGPR")
+        ctx.s_lshl(ctx.sreg("s_scale_soff_a0"), ctx.sreg("s_tmp0"), 8,
+                   comment="group0 soffset = wave_m*2 * 256")
+        ctx.inst("s_add_u32", ctx.sreg("s_scale_soff_a1"),
+                 ctx.sreg("s_scale_soff_a0"), "256",
+                 comment="group1 soffset = (wave_m*2+1) * 256")
+        # Same for B with wave_n
+        ctx.v_lshl(ctx.vreg("v_tmp0"), ctx.vreg("v_wave_n"), 1,
+                   comment="wave_n * 2")
+        ctx.inst("v_readfirstlane_b32", ctx.sreg("s_tmp0"),
+                 ctx.vreg("v_tmp0"), comment="wave_n * 2 -> SGPR")
+        ctx.s_lshl(ctx.sreg("s_scale_soff_b0"), ctx.sreg("s_tmp0"), 8,
+                   comment="group0 soffset B = wave_n*2 * 256")
+        ctx.inst("s_add_u32", ctx.sreg("s_scale_soff_b1"),
+                 ctx.sreg("s_scale_soff_b0"), "256",
+                 comment="group1 soffset B = (wave_n*2+1) * 256")
+        ctx.raw("")
+    else:
+        # Linear scale addressing (standalone path)
+        ctx.comment("Scale A wave-level voffset")
+        ctx.v_mul(ctx.vreg("v_tmp0"),
+                  str(tile.m_per_wave), ctx.vreg("v_wave_m"),
+                  comment=f"wave_m * {tile.m_per_wave}")
+        ctx.inst("v_mul_lo_u32", ctx.vreg("v_dtl_off_scale_a"),
+                 ctx.sreg("s_stride_scale_a"), ctx.vreg("v_tmp0"),
+                 comment="wave_m_base * stride_scale_a -> voffset_scale_a")
+        ctx.raw("")
+
+        ctx.comment("Scale B wave-level voffset")
+        ctx.v_mul(ctx.vreg("v_tmp0"),
+                  str(tile.n_per_wave), ctx.vreg("v_wave_n"),
+                  comment=f"wave_n * {tile.n_per_wave}")
+        ctx.inst("v_mul_lo_u32", ctx.vreg("v_dtl_off_scale_b"),
+                 ctx.sreg("s_stride_scale_b"), ctx.vreg("v_tmp0"),
+                 comment="wave_n_base * stride_scale_b -> voffset_scale_b")
+        ctx.raw("")
 
 
 WAVE_ABI_PROLOGUE_PHASES = [
     TilePhase("wave_abi_setup", phase_wave_abi_setup),
-    TilePhase("dtl_interleaved_k_loop", phase_dtl_interleaved_k_loop),
 ]

@@ -131,9 +131,6 @@ class GemmKernel:
               pgr2: bool = False,
               dtl: bool = False,
               interleaved_large: bool = False,
-              pgr2_interleaved: bool = False,
-              dtl_interleaved: bool = False,
-              dtl_partitioned: bool = False,
               wave_abi: bool = False,
               composable: bool = False,
               use_dtl: bool = True) -> GemmKernel:
@@ -157,14 +154,11 @@ class GemmKernel:
             if tile is not None:
                 tiling = GemmTiling.from_tile_config(tile)
             else:
-                if (dtl_interleaved or dtl_partitioned or wave_abi or composable) and use_dtl:
+                if (wave_abi or composable) and use_dtl:
                     # DTL variants need 256x256x64 for 128 MFMAs
                     tiling = GemmTiling.high_perf(
                         wg_m=256, wg_n=256, unroll_k=64)
-                elif dtl_partitioned and not use_dtl:
-                    tiling = GemmTiling.high_perf(
-                        wg_m=256, wg_n=256, unroll_k=64)
-                elif optimized or interleaved or pgr2 or dtl or interleaved_large or pgr2_interleaved or wave_abi:
+                elif optimized or interleaved or pgr2 or dtl or interleaved_large or wave_abi:
                     tiling = GemmTiling.high_perf()
                 else:
                     tiling = GemmTiling.standard()
@@ -183,10 +177,6 @@ class GemmKernel:
                 pgr2=pgr2,
                 dtl=dtl,
                 interleaved_large=interleaved_large,
-                pgr2_interleaved=pgr2_interleaved,
-                dtl_interleaved=dtl_interleaved,
-                dtl_partitioned=dtl_partitioned and use_dtl,
-                non_dtl_partitioned=dtl_partitioned and not use_dtl,
                 wave_abi=wave_abi,
                 composable=composable)
 
@@ -227,7 +217,7 @@ class GemmKernel:
         lds_scale_half = 0
 
         # Double LDS for double-buffered mode
-        is_db = any(p.name in ("optimized_k_loop", "fully_interleaved_k_loop", "pgr2_k_loop", "dtl_k_loop", "interleaved_large_k_loop", "pgr2_interleaved_k_loop", "dtl_interleaved_k_loop", "dtl_partitioned_k_loop")
+        is_db = any(p.name in ("optimized_k_loop", "fully_interleaved_k_loop", "pgr2_k_loop", "dtl_k_loop", "interleaved_large_k_loop", "composable_k_loop")
                      for p in self.tile_tree.prologue_phases)
         lds_total = lds_half * 2 if is_db else lds_half
 
