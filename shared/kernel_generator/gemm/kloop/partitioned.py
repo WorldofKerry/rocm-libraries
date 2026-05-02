@@ -74,7 +74,7 @@ def phase_mx_scale_setup(level, ctx):
     mfma = tile.mfma
     use_dtl = ctx._metadata.get("use_dtl", True)
     use_real_scales = ctx._metadata.get("use_real_scales", False)
-    use_swizzled_scales = (ctx._metadata.get("use_1d_grid", False) or ctx._metadata.get("use_wave_abi", False)) and use_real_scales
+    use_swizzled_scales = ctx._metadata.get("swizzled_scales", False) and use_real_scales
     if not mfma.is_mx or not use_real_scales:
         return
 
@@ -152,7 +152,7 @@ def phase_mx_scale_setup(level, ctx):
         ctx.alloc_sgpr_permanent(1, "s_scale_soff_b0")
         ctx.alloc_sgpr_permanent(1, "s_scale_soff_b1")
 
-    use_swizzled_scales = ctx._metadata.get("use_1d_grid", False) or ctx._metadata.get("use_wave_abi", False)
+    use_swizzled_scales = ctx._metadata.get("swizzled_scales", False)
 
     if use_swizzled_scales:
         # Pre-swizzled scale layout (AITER e8m0_shuffle):
@@ -329,7 +329,7 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     lds_half = lds_data_half
     mx_block = mfma.mx_block
     use_real_scales = ctx._metadata.get("use_real_scales", False)
-    use_swizzled_scales = (ctx._metadata.get("use_1d_grid", False) or ctx._metadata.get("use_wave_abi", False)) and use_real_scales
+    use_swizzled_scales = ctx._metadata.get("swizzled_scales", False) and use_real_scales
 
     k_stride = int(tile.unroll_k * elem)
     log2_uk = int(math.log2(tile.unroll_k))
@@ -374,7 +374,7 @@ def phase_dtl_partitioned_k_loop(level, ctx):
             a_names[(buf, ki)] = name
 
     # Scale VGPRs: allocation depends on scale format
-    use_swizzled_scales = (ctx._metadata.get("use_1d_grid", False) or ctx._metadata.get("use_wave_abi", False)) and use_real_scales
+    use_swizzled_scales = ctx._metadata.get("swizzled_scales", False) and use_real_scales
     scale_a_names = {}
     scale_b_names = {}
     if use_real_scales:

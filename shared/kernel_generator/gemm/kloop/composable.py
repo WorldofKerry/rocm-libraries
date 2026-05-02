@@ -422,8 +422,7 @@ def composable_kloop_phase(level, ctx):
     use_real_scales = ctx._metadata.get("use_real_scales", False)
     if use_real_scales and tile.mfma.is_mx:
         from ..memory.scale_loader import VMEMScaleLoader
-        swizzled = (ctx._metadata.get("use_1d_grid", False)
-                    or ctx._metadata.get("use_wave_abi", False))
+        swizzled = ctx._metadata.get("swizzled_scales", False)
         scale_loader = VMEMScaleLoader(ctx, tile, swizzled=swizzled)
 
     partition_m = ctx._metadata.get("partition_m", 4)

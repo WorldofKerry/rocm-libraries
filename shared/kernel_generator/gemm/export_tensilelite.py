@@ -33,6 +33,7 @@ def generate_custom_kernel(
 
     # Force 1D grid + column-major store for TensileLite compatibility
     k.use_1d_grid = True
+    k.swizzled_scales = False  # Use linear scale layout (MXScaleFormat: 0)
 
     if kernel_name is None:
         kernel_name = (f"Custom_Cijk_Alik_Bljk_F4BS_MXA32_MXB32"

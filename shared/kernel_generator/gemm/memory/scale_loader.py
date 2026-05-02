@@ -241,18 +241,19 @@ class VMEMScaleLoader(ScaleLoader):
                         for ki in range(ki_count):
                             self._scale_b_names[(ni_, ki)] = name
         else:
-            # Linear: one VGPR per mi (A) and per ni (B)
+            # Linear: one VGPR per (mi, ki) for A and (ni, ki) for B.
+            # Each ki covers a different K-range and needs different scale bytes.
             for mi in range(mr):
-                name = f"v_scale_a_m{mi}"
-                if not ctx.has(name):
-                    ctx.alloc_vgpr_permanent(1, name)
                 for ki in range(ki_count):
+                    name = f"v_scale_a_m{mi}k{ki}"
+                    if not ctx.has(name):
+                        ctx.alloc_vgpr_permanent(1, name)
                     self._scale_a_names[(mi, ki)] = name
             for ni in range(nr):
-                name = f"v_scale_b_n{ni}"
-                if not ctx.has(name):
-                    ctx.alloc_vgpr_permanent(1, name)
                 for ki in range(ki_count):
+                    name = f"v_scale_b_n{ni}k{ki}"
+                    if not ctx.has(name):
+                        ctx.alloc_vgpr_permanent(1, name)
                     self._scale_b_names[(ni, ki)] = name
 
     # -- SRD / offset setup -------------------------------------------------
@@ -317,22 +318,32 @@ class VMEMScaleLoader(ScaleLoader):
                      ctx.sreg("s_scale_soff_b1"), "offen",
                      comment="scaleB group1 (ni=2,3)")
         else:
+            ki_count = self._ki_count
+            ki_bytes = self._mfma.k // self._mx_block  # bytes per ki step
             ctx.comment("Load scales A subtile 0 (direct VGPR)")
             for mi_ in range(partition_m):
-                soff = "0" if mi_ == 0 else ctx.sreg(f"s_soff_sa_{mi_}")
-                ctx.inst("buffer_load_dword",
-                         ctx.vreg(f"v_scale_a_m{mi_}"),
-                         ctx.vreg("v_dtl_off_scale_a"),
-                         ctx.sreg("s_srd_scale_a", 0, 4),
-                         soff, "offen", comment=f"scale A mi={mi_}")
+                for ki_ in range(ki_count):
+                    soff = "0" if mi_ == 0 else ctx.sreg(f"s_soff_sa_{mi_}")
+                    off = ki_ * ki_bytes
+                    off_str = f" offset:{off}" if off > 0 else ""
+                    ctx.inst("buffer_load_dword",
+                             ctx.vreg(f"v_scale_a_m{mi_}k{ki_}"),
+                             ctx.vreg("v_dtl_off_scale_a"),
+                             ctx.sreg("s_srd_scale_a", 0, 4),
+                             soff, f"offen{off_str}",
+                             comment=f"scale A mi={mi_} ki={ki_}")
             ctx.comment("Load scales B (direct VGPR)")
             for ni_ in range(nr):
-                soff = "0" if ni_ == 0 else ctx.sreg(f"s_soff_sb_{ni_}")
-                ctx.inst("buffer_load_dword",
-                         ctx.vreg(f"v_scale_b_n{ni_}"),
-                         ctx.vreg("v_dtl_off_scale_b"),
-                         ctx.sreg("s_srd_scale_b", 0, 4),
-                         soff, "offen", comment=f"scale B ni={ni_}")
+                for ki_ in range(ki_count):
+                    soff = "0" if ni_ == 0 else ctx.sreg(f"s_soff_sb_{ni_}")
+                    off = ki_ * ki_bytes
+                    off_str = f" offset:{off}" if off > 0 else ""
+                    ctx.inst("buffer_load_dword",
+                             ctx.vreg(f"v_scale_b_n{ni_}k{ki_}"),
+                             ctx.vreg("v_dtl_off_scale_b"),
+                             ctx.sreg("s_srd_scale_b", 0, 4),
+                             soff, f"offen{off_str}",
+                             comment=f"scale B ni={ni_} ki={ki_}")
 
     # -- in-loop loads (after SRD advance) ----------------------------------
 
@@ -404,52 +415,63 @@ class VMEMScaleLoader(ScaleLoader):
 
         ctx = self._ctx
 
+        ki_count = self._ki_count
+        ki_bytes = self._mfma.k // self._mx_block
+
         # Determine last-use slot for each scale register
         scale_reg_names: List[str] = []
         for mi_ in range(partition_m):
-            scale_reg_names.append(f"v_scale_a_m{mi_}")
+            for ki_ in range(ki_count):
+                scale_reg_names.append(f"v_scale_a_m{mi_}k{ki_}")
         for ni_ in range(nr):
-            scale_reg_names.append(f"v_scale_b_n{ni_}")
+            for ki_ in range(ki_count):
+                scale_reg_names.append(f"v_scale_b_n{ni_}k{ki_}")
 
         last_use = compute_register_last_use(all_mfma_ops, scale_reg_names)
 
         prefetch_loads: List[PrefetchOp] = []
 
         for mi_ in range(partition_m):
-            reg = f"v_scale_a_m{mi_}"
+            for ki_ in range(ki_count):
+                reg = f"v_scale_a_m{mi_}k{ki_}"
+                off = ki_ * ki_bytes
+                off_str = f" offset:{off}" if off > 0 else ""
 
-            def _mk_pf_a(m=mi_):
-                def emit():
-                    soff = "0" if m == 0 else ctx.sreg(f"s_soff_sa_{m}")
-                    ctx.inst("buffer_load_dword",
-                             ctx.vreg(f"v_scale_a_m{m}"),
-                             ctx.vreg("v_dtl_off_scale_a"),
-                             ctx.sreg("s_srd_scale_a", 0, 4),
-                             soff, "offen",
-                             comment=f"scale A mi={m} (next K)")
-                return emit
+                def _mk_pf_a(m=mi_, k=ki_, o=off_str):
+                    def emit():
+                        soff = "0" if m == 0 else ctx.sreg(f"s_soff_sa_{m}")
+                        ctx.inst("buffer_load_dword",
+                                 ctx.vreg(f"v_scale_a_m{m}k{k}"),
+                                 ctx.vreg("v_dtl_off_scale_a"),
+                                 ctx.sreg("s_srd_scale_a", 0, 4),
+                                 soff, f"offen{o}",
+                                 comment=f"scale A mi={m} ki={k} (next K)")
+                    return emit
 
-            prefetch_loads.append(PrefetchOp(
-                reg_name=reg, emit_fn=_mk_pf_a(),
-                earliest_slot=last_use.get(reg, 0)))
+                prefetch_loads.append(PrefetchOp(
+                    reg_name=reg, emit_fn=_mk_pf_a(),
+                    earliest_slot=last_use.get(reg, 0)))
 
         for ni_ in range(nr):
-            reg = f"v_scale_b_n{ni_}"
+            for ki_ in range(ki_count):
+                reg = f"v_scale_b_n{ni_}k{ki_}"
+                off = ki_ * ki_bytes
+                off_str = f" offset:{off}" if off > 0 else ""
 
-            def _mk_pf_b(n=ni_):
-                def emit():
-                    soff = "0" if n == 0 else ctx.sreg(f"s_soff_sb_{n}")
-                    ctx.inst("buffer_load_dword",
-                             ctx.vreg(f"v_scale_b_n{n}"),
-                             ctx.vreg("v_dtl_off_scale_b"),
-                             ctx.sreg("s_srd_scale_b", 0, 4),
-                             soff, "offen",
-                             comment=f"scale B ni={n} (next K)")
-                return emit
+                def _mk_pf_b(n=ni_, k=ki_, o=off_str):
+                    def emit():
+                        soff = "0" if n == 0 else ctx.sreg(f"s_soff_sb_{n}")
+                        ctx.inst("buffer_load_dword",
+                                 ctx.vreg(f"v_scale_b_n{n}k{k}"),
+                                 ctx.vreg("v_dtl_off_scale_b"),
+                                 ctx.sreg("s_srd_scale_b", 0, 4),
+                                 soff, f"offen{o}",
+                                 comment=f"scale B ni={n} ki={k} (next K)")
+                    return emit
 
-            prefetch_loads.append(PrefetchOp(
-                reg_name=reg, emit_fn=_mk_pf_b(),
-                earliest_slot=last_use.get(reg, 0)))
+                prefetch_loads.append(PrefetchOp(
+                    reg_name=reg, emit_fn=_mk_pf_b(),
+                    earliest_slot=last_use.get(reg, 0)))
 
         pf_path = build_prefetch_path(
             all_mfma_ops, prefetch_loads,
@@ -476,26 +498,32 @@ class VMEMScaleLoader(ScaleLoader):
         ctx = self._ctx
         paths: List[Path] = []
 
+        ki_count = self._ki_count
+        ki_bytes = self._mfma.k // self._mx_block
+
         for st in range(num_subtiles - 1):
             path_ops: List[PlacedOp] = []
             for mi_in_st in range(partition_m):
                 target_mi = (st + 1) * partition_m + mi_in_st
+                for ki_ in range(ki_count):
+                    off = ki_ * ki_bytes
+                    off_str = f" offset:{off}" if off > 0 else ""
 
-                def _mk_scale_load(mi_=target_mi):
-                    def emit():
-                        soff = ("0" if mi_ == 0
-                                else ctx.sreg(f"s_soff_sa_{mi_}"))
-                        ctx.inst("buffer_load_dword",
-                                 ctx.vreg(f"v_scale_a_m{mi_}"),
-                                 ctx.vreg("v_dtl_off_scale_a"),
-                                 ctx.sreg("s_srd_scale_a", 0, 4),
-                                 soff, "offen",
-                                 comment=f"scale A mi={mi_} (prefetch)")
-                    return emit
+                    def _mk_scale_load(mi_=target_mi, k=ki_, o=off_str):
+                        def emit():
+                            soff = ("0" if mi_ == 0
+                                    else ctx.sreg(f"s_soff_sa_{mi_}"))
+                            ctx.inst("buffer_load_dword",
+                                     ctx.vreg(f"v_scale_a_m{mi_}k{k}"),
+                                     ctx.vreg("v_dtl_off_scale_a"),
+                                     ctx.sreg("s_srd_scale_a", 0, 4),
+                                     soff, f"offen{o}",
+                                     comment=f"scale A mi={mi_} ki={k} (pf)")
+                        return emit
 
-                path_ops.append(PlacedOp(
-                    emit_fn=_mk_scale_load(), op_type="buffer_load",
-                    comment=f"scale_a m{target_mi}"))
+                    path_ops.append(PlacedOp(
+                        emit_fn=_mk_scale_load(), op_type="buffer_load",
+                        comment=f"scale_a m{target_mi}k{ki_}"))
             paths.append(Path(ops=path_ops, reverse=False,
                               module_id=100 + st))
 
@@ -522,13 +550,13 @@ class VMEMScaleLoader(ScaleLoader):
         """Number of vmcnt-tracked scale loads after emit_initial_loads."""
         if self._swizzled:
             return 4  # 2 groups A + 2 groups B
-        return partition_m + self._nr
+        return (partition_m + self._nr) * self._ki_count
 
     def cross_iter_inflight(self, partition_m: int, nr: int) -> int:
         """Number of prefetch loads in-flight at end of iteration."""
         if self._swizzled:
             return 0
-        return partition_m + nr
+        return (partition_m + nr) * self._ki_count
 
     def emit_scale_wait(self, loader):
         """Emit vmcnt wait for scale loads after preamble reads.
