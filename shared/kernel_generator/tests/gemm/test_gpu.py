@@ -10,7 +10,7 @@ import pytest
 import numpy as np
 
 from kernel_generator.gemm.kernel import GemmKernel
-from kernel_generator.gemm.problem import GemmProblem, TileConfig
+from kernel_generator.gemm.problem import GemmProblem
 
 
 
@@ -150,25 +150,22 @@ class TestGPUCorrectness:
     """Verify GEMM produces correct results on GPU."""
 
     @pytest.mark.parametrize("M,N,K", [
-        (128, 128, 32),
-        (128, 128, 128),
         (256, 256, 256),
         (512, 512, 512),
         (1024, 1024, 1024),
     ])
     def test_square(self, M, N, K):
-        D_gpu, D_ref = _run_gemm(M, N, K)
+        D_gpu, D_ref = _run_variant(M, N, K, scheduled=True)
         assert np.allclose(D_gpu, D_ref, atol=1.0, rtol=0.05), \
             f"Max error: {np.max(np.abs(D_gpu.astype(np.float32) - D_ref.astype(np.float32)))}"
 
     def test_large(self):
-        D_gpu, D_ref = _run_gemm(4096, 4096, 4096)
+        D_gpu, D_ref = _run_variant(4096, 4096, 4096, scheduled=True)
         assert np.allclose(D_gpu, D_ref, atol=1.0, rtol=0.05)
 
     def test_identity(self):
         """A = I, B = I => D = I (for the first K rows/cols)."""
-        M, N, K = 128, 128, 128
-        # Override _run_gemm with identity inputs
+        M, N, K = 256, 256, 256
         problem = GemmProblem(m=M, n=N, k=K)
         kernel = GemmKernel.build(problem)
         result = kernel.emit()
@@ -192,11 +189,10 @@ class TestGPUCorrectness:
         hip.hipModuleLoad(ctypes.byref(module), co.encode())
         func = ctypes.c_void_p()
         hip.hipModuleGetFunction(ctypes.byref(func), module, b"gemm_kernel")
-        lds = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
         gm, gn = M // tile.wg_m, N // tile.wg_n
         _vals, args = _build_tl_args(d_A, d_B, d_D, M, N, K, gm, gn)
         hip.hipModuleLaunchKernel(
-            func, gm, gn, 1, tile.block_size, 1, 1, lds, None, args, None)
+            func, gm, gn, 1, tile.block_size, 1, 1, 0, None, args, None)
         hip.hipDeviceSynchronize()
 
         D = np.zeros((M, N), dtype=np.float16)
@@ -209,7 +205,7 @@ class TestGPUCorrectness:
 
     def test_all_ones(self):
         """A = 1, B = 1 => D[i,j] = K for all i,j."""
-        M, N, K = 128, 128, 128
+        M, N, K = 256, 256, 256
         problem = GemmProblem(m=M, n=N, k=K)
         kernel = GemmKernel.build(problem)
         result = kernel.emit()
@@ -233,11 +229,10 @@ class TestGPUCorrectness:
         hip.hipModuleLoad(ctypes.byref(module), co.encode())
         func = ctypes.c_void_p()
         hip.hipModuleGetFunction(ctypes.byref(func), module, b"gemm_kernel")
-        lds = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
         gm, gn = M // tile.wg_m, N // tile.wg_n
         _vals, args = _build_tl_args(d_A, d_B, d_D, M, N, K, gm, gn)
         hip.hipModuleLaunchKernel(
-            func, gm, gn, 1, tile.block_size, 1, 1, lds, None, args, None)
+            func, gm, gn, 1, tile.block_size, 1, 1, 0, None, args, None)
         hip.hipDeviceSynchronize()
 
         D = np.zeros((M, N), dtype=np.float16)
@@ -273,7 +268,6 @@ class TestGPUPerformance:
         hip.hipModuleLoad(ctypes.byref(module), co.encode())
         func = ctypes.c_void_p()
         hip.hipModuleGetFunction(ctypes.byref(func), module, b"gemm_kernel")
-        lds = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
         gm, gn = M // tile.wg_m, N // tile.wg_n
         _vals, args = _build_tl_args(d_A, d_B, d_D, M, N, K, gm, gn)
 
@@ -281,7 +275,7 @@ class TestGPUPerformance:
         for _ in range(3):
             hip.hipModuleLaunchKernel(
                 func, gm, gn, 1, tile.block_size, 1, 1,
-                lds, None, args, None)
+                0, None, args, None)
         hip.hipDeviceSynchronize()
 
         # Timed
@@ -290,7 +284,7 @@ class TestGPUPerformance:
         for _ in range(iters):
             hip.hipModuleLaunchKernel(
                 func, gm, gn, 1, tile.block_size, 1, 1,
-                lds, None, args, None)
+                0, None, args, None)
         hip.hipDeviceSynchronize()
         avg = (time.perf_counter() - t0) / iters
         tflops = 2 * M * N * K / avg / 1e12
@@ -302,106 +296,19 @@ class TestGPUPerformance:
 
 
 @requires_gpu
-class TestPipelinedKernel:
-    """Test the software-pipelined K-loop variant."""
+class TestScheduledKernelGPU:
+    """Test the scheduled K-loop variant on GPU."""
 
     @pytest.mark.parametrize("M,N,K", [
-        (128, 128, 32),
-        (128, 128, 128),
         (256, 256, 256),
         (512, 512, 512),
         (1024, 1024, 1024),
     ])
-    def test_pipelined_correct(self, M, N, K):
-        hip = HIP
-        problem = GemmProblem(m=M, n=N, k=K)
-        kernel = GemmKernel.build(problem, pipelined=True)
-        result = kernel.emit()
-        tile = kernel.tile
-        co = result.assemble(output_path=f"/tmp/test_pipe_{M}_{N}_{K}.co")
-
-        elem = 2
-        d_A, d_B, d_D = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
-        hip.hipMalloc(ctypes.byref(d_A), M * K * elem)
-        hip.hipMalloc(ctypes.byref(d_B), N * K * elem)
-        hip.hipMalloc(ctypes.byref(d_D), M * N * elem)
-
-        rng = np.random.RandomState(42)
-        scale = 1.0 / np.sqrt(K)
-        A = (rng.randn(M, K) * scale).astype(np.float16)
-        B = (rng.randn(N, K) * scale).astype(np.float16)
-        hip.hipMemcpy(d_A, A.ctypes.data_as(ctypes.c_void_p), M * K * elem, 1)
-        hip.hipMemcpy(d_B, B.ctypes.data_as(ctypes.c_void_p), N * K * elem, 1)
-        hip.hipMemset(d_D, 0, M * N * elem)
-
-        module = ctypes.c_void_p()
-        hip.hipModuleLoad(ctypes.byref(module), co.encode())
-        func = ctypes.c_void_p()
-        hip.hipModuleGetFunction(ctypes.byref(func), module, b"gemm_kernel")
-
-        lds = (tile.wg_m + tile.wg_n) * tile.unroll_k * elem
-        gm, gn = M // tile.wg_m, N // tile.wg_n
-        _vals, args = _build_tl_args(d_A, d_B, d_D, M, N, K, gm, gn)
-        ret = hip.hipModuleLaunchKernel(
-            func, gm, gn, 1, tile.block_size, 1, 1, lds, None, args, None)
-        assert ret == 0, f"Launch failed: {ret}"
-        hip.hipDeviceSynchronize()
-
-        D_gpu = np.zeros((M, N), dtype=np.float16)
-        hip.hipMemcpy(D_gpu.ctypes.data_as(ctypes.c_void_p), d_D, M * N * elem, 2)
-        hip.hipFree(d_A); hip.hipFree(d_B); hip.hipFree(d_D)
-        hip.hipModuleUnload(module)
-
-        D_ref = (A.astype(np.float32) @ B.astype(np.float32).T).astype(np.float16)
-        assert np.allclose(D_gpu, D_ref, atol=1.0, rtol=0.05), \
-            f"Max error: {np.max(np.abs(D_gpu.astype(np.float32) - D_ref.astype(np.float32)))}"
-
-    def test_pipelined_faster(self):
-        """Pipelined kernel should be faster than baseline at 4096^3."""
-        import time
-        hip = HIP
-        M = N = K = 4096
-        problem = GemmProblem(m=M, n=N, k=K)
-        tile = TileConfig()
-        problem.validate(tile)
-        elem = 2
-
-        def bench(kernel):
-            result = kernel.emit()
-            co = result.assemble(output_path=f"/tmp/test_perf_cmp.co")
-            d_A, d_B, d_D = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
-            hip.hipMalloc(ctypes.byref(d_A), M*K*elem)
-            hip.hipMalloc(ctypes.byref(d_B), N*K*elem)
-            hip.hipMalloc(ctypes.byref(d_D), M*N*elem)
-            module = ctypes.c_void_p()
-            hip.hipModuleLoad(ctypes.byref(module), co.encode())
-            func = ctypes.c_void_p()
-            hip.hipModuleGetFunction(ctypes.byref(func), module, b"gemm_kernel")
-            lds = (tile.wg_m+tile.wg_n)*tile.unroll_k*elem
-            gm, gn = M//tile.wg_m, N//tile.wg_n
-            _vals, args = _build_tl_args(d_A, d_B, d_D, M, N, K, gm, gn)
-            for _ in range(3):
-                hip.hipModuleLaunchKernel(func, gm, gn, 1, tile.block_size, 1, 1, lds, None, args, None)
-            hip.hipDeviceSynchronize()
-            iters = 10; t0 = time.perf_counter()
-            for _ in range(iters):
-                hip.hipModuleLaunchKernel(func, gm, gn, 1, tile.block_size, 1, 1, lds, None, args, None)
-            hip.hipDeviceSynchronize()
-            tflops = 2*M*N*K/(time.perf_counter()-t0)*iters/1e12
-            hip.hipFree(d_A); hip.hipFree(d_B); hip.hipFree(d_D)
-            hip.hipModuleUnload(module)
-            return tflops
-
-        # Baseline
-        base_kernel = GemmKernel.build(problem)
-        base_tflops = bench(base_kernel)
-
-        # Pipelined
-        pipe_kernel = GemmKernel.build(problem, pipelined=True)
-        pipe_tflops = bench(pipe_kernel)
-
-        assert pipe_tflops > base_tflops * 0.8, \
-            f"Pipelined ({pipe_tflops:.1f}) should not regress vs baseline ({base_tflops:.1f})"
+    def test_scheduled_correct(self, M, N, K):
+        D_gpu, D_ref = _run_variant(M, N, K, scheduled=True)
+        max_err = np.max(np.abs(D_gpu.astype(np.float32) - D_ref.astype(np.float32)))
+        assert max_err < 1.0, \
+            f"scheduled {M}x{N}x{K}: max_err={max_err}"
 
 
 # --- Variant kernel tests ---
@@ -462,18 +369,18 @@ def _run_variant(M, N, K, **build_kwargs):
 
 @requires_gpu
 class TestBaselineKernel:
-    """Baseline kernel (no optimizations, no DTL, no prefetch)."""
+    """Scheduled kernel at various sizes."""
 
     @pytest.mark.parametrize("M,N,K", [
-        (128, 128, 32),
-        (128, 128, 128),
         (256, 256, 64),
+        (256, 256, 256),
+        (512, 512, 512),
     ])
     def test_correct(self, M, N, K):
-        D_gpu, D_ref = _run_gemm(M, N, K)
+        D_gpu, D_ref = _run_variant(M, N, K, scheduled=True)
         max_err = np.max(np.abs(D_gpu.astype(np.float32)
                                 - D_ref.astype(np.float32)))
-        assert max_err < 0.01, f"Baseline {M}x{N}x{K}: max_err={max_err}"
+        assert max_err < 1.0, f"Scheduled {M}x{N}x{K}: max_err={max_err}"
 
 
 @requires_gpu
@@ -508,13 +415,13 @@ class TestComposablePartitionedKernel:
 
 @requires_gpu
 class TestSmallBaseline:
-    """Baseline kernel at the smallest valid tile size (128x128x32)."""
+    """Scheduled kernel at the smallest valid tile size (256x256x64)."""
 
     def test_correct(self):
-        D_gpu, D_ref = _run_gemm(128, 128, 32)
+        D_gpu, D_ref = _run_variant(256, 256, 64, scheduled=True)
         max_err = np.max(np.abs(D_gpu.astype(np.float32)
                                 - D_ref.astype(np.float32)))
-        assert max_err < 0.01, f"Small baseline: max_err={max_err}"
+        assert max_err < 1.0, f"Small scheduled: max_err={max_err}"
 
 
 @requires_gpu

@@ -30,7 +30,7 @@ Quick start::
         "global_load", my_prefetching_load)
 
     # Pipelined K-loop (10x faster)
-    kernel = GemmKernel.build(problem, pipelined=True)
+    kernel = GemmKernel.build(problem, scheduled=True)
 """
 from __future__ import annotations
 

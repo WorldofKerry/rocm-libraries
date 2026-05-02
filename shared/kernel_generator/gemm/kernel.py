@@ -12,12 +12,8 @@ Usage::
     result = kernel.emit()
     co = result.assemble()
 
-    # Pipelined K-loop (10x faster)
-    kernel = GemmKernel.build(problem, pipelined=True)
-
-    # Replace a phase
-    kernel.tile_tree = kernel.tile_tree.replace_phase(
-        "global_load", my_prefetching_load)
+    # Scheduled K-loop (default, production path)
+    kernel = GemmKernel.build(problem, scheduled=True)
 """
 from __future__ import annotations
 
@@ -125,15 +121,9 @@ class GemmKernel:
               kernel_name: str = "gemm_kernel",
               tile_tree: Optional[TileLevel] = None,
               tiling: Optional[GemmTiling] = None,
-              pipelined: bool = False,
-              optimized: bool = False,
-              interleaved: bool = False,
-              pgr2: bool = False,
-              dtl: bool = False,
-              interleaved_large: bool = False,
               wave_abi: bool = False,
               composable: bool = False,
-              scheduled: bool = False,
+              scheduled: bool = True,
               use_dtl: bool = True) -> GemmKernel:
         """Build a GemmKernel.  GemmTiling is the source of truth.
 
@@ -143,12 +133,6 @@ class GemmKernel:
             kernel_name: Name for the kernel function.
             tile_tree: Custom TileLevel tree (overrides auto-generation).
             tiling: GemmTiling with per-dimension TileDim chains.
-            pipelined: If True, use software-pipelined K-loop.
-            optimized: If True, use all optimizations (DB-LDS +
-                       pipelining + interleaved MFMA/LR + fine waitcnt).
-                       TileOp-based slot placement (DESIGN.md Phase 2).
-            interleaved: If True, use fully-interleaved K-loop that
-                         distributes ALL overhead between MFMAs.
         """
         # GemmTiling is always the source of truth
         if tiling is None:
@@ -156,11 +140,8 @@ class GemmKernel:
                 tiling = GemmTiling.from_tile_config(tile)
             else:
                 if (wave_abi or composable or scheduled) and use_dtl:
-                    # DTL variants need 256x256x64 for 128 MFMAs
                     tiling = GemmTiling.high_perf(
                         wg_m=256, wg_n=256, unroll_k=64)
-                elif optimized or interleaved or pgr2 or dtl or interleaved_large or wave_abi:
-                    tiling = GemmTiling.high_perf()
                 else:
                     tiling = GemmTiling.standard()
 
@@ -173,11 +154,6 @@ class GemmKernel:
         # Tree comes from tiling (unless explicitly overridden)
         if tile_tree is None:
             tile_tree = tiling.build_tile_tree(
-                pipelined=pipelined, optimized=optimized,
-                interleaved=interleaved,
-                pgr2=pgr2,
-                dtl=dtl,
-                interleaved_large=interleaved_large,
                 wave_abi=wave_abi,
                 composable=composable,
                 scheduled=scheduled or composable)
@@ -219,7 +195,7 @@ class GemmKernel:
         lds_scale_half = 0
 
         # Double LDS for double-buffered mode
-        is_db = any(p.name in ("optimized_k_loop", "fully_interleaved_k_loop", "pgr2_k_loop", "dtl_k_loop", "interleaved_large_k_loop", "scheduled_k_loop")
+        is_db = any(p.name in ("scheduled_k_loop",)
                      for p in self.tile_tree.prologue_phases)
         lds_total = lds_half * 2 if is_db else lds_half
 

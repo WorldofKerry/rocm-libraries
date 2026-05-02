@@ -141,7 +141,7 @@ def bench_our_kernel(
     from .problem import GemmProblem
 
     problem = GemmProblem(m=M, n=N, k=K)
-    kernel = GemmKernel.build(problem, pipelined=True)
+    kernel = GemmKernel.build(problem, scheduled=True)
     result = kernel.emit()
 
     with tempfile.TemporaryDirectory(prefix="kg_bench_") as tmpdir:

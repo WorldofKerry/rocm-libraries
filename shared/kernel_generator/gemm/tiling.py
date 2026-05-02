@@ -342,13 +342,7 @@ class GemmTiling:
             lds_pad=self.lds_pad, lds_swizzle=self.lds_swizzle, swizzle=self.swizzle,
         )
 
-    def build_tile_tree(self, pipelined: bool = False,
-                       optimized: bool = False,
-                       interleaved: bool = False,
-                       pgr2: bool = False,
-                       dtl: bool = False,
-                       interleaved_large: bool = False,
-                       wave_abi: bool = False,
+    def build_tile_tree(self, wave_abi: bool = False,
                        composable: bool = False,
                        scheduled: bool = False) -> TileLevel:
         """Build the full tile tree with phases from TileDim chains.
@@ -363,18 +357,9 @@ class GemmTiling:
                      + K-loop control + store epilogue
         - Wave: data movement (global_load, lds_write, k_advance)
         - MFMA leaf: visitor handles LDS read + MFMA
-
-        Args:
-            pipelined: If True, use software-pipelined K-loop
-                       (overlaps global_load(n+1) with compute(n)).
         """
         from .emit.phases import (
-            WORKGROUP_PROLOGUE_PHASES, WORKGROUP_EPILOGUE_PHASES,
-            WAVE_PROLOGUE_PHASES, WAVE_EPILOGUE_PHASES,
-            PIPELINED_PROLOGUE_PHASES, OPTIMIZED_PROLOGUE_PHASES,
-            PGR2_PROLOGUE_PHASES,
-            DTL_PROLOGUE_PHASES,
-            INTERLEAVED_LARGE_PROLOGUE_PHASES, INTERLEAVED_PROLOGUE_PHASES,
+            WORKGROUP_EPILOGUE_PHASES,
         )
 
         # Leaf: MFMA instruction (from HARDWARE TileDim leaves)
@@ -382,44 +367,15 @@ class GemmTiling:
             "mfma", m=self.mfma.m,
             n=self.mfma.n, k=self.mfma.k)
 
-        # Wave: per-wave compute tile
-        # K-loop data movement phases go here (non-pipelined)
-        if pipelined or optimized or interleaved or pgr2 or dtl or interleaved_large or wave_abi or composable or scheduled:
-            # Pipelined/optimized: K-loop phase handles compute internally.
-            # Wave gets a no-op emit so the tree walker skips it.
-            wave_level = TileLevel(
-                "wave", m=self.m_per_wave,
-                n=self.n_per_wave, k=self.unroll_k,
-                inner=mfma_level,
-                emit=_noop_wave_emit)
-        else:
-            wave_level = TileLevel(
-                "wave", m=self.m_per_wave,
-                n=self.n_per_wave, k=self.unroll_k,
-                inner=mfma_level,
-                prologue_phases=list(WAVE_PROLOGUE_PHASES),
-                epilogue_phases=list(WAVE_EPILOGUE_PHASES))
+        # Wave: K-loop phase handles compute internally; noop emit.
+        wave_level = TileLevel(
+            "wave", m=self.m_per_wave,
+            n=self.n_per_wave, k=self.unroll_k,
+            inner=mfma_level,
+            emit=_noop_wave_emit)
 
         # Workgroup: setup + K-loop structure + store
-        if scheduled:
-            from .kloop.setup import phase_dtl_interleaved_setup, phase_mx_scale_setup
-            from .schedule.kloop_scheduler import scheduled_kloop_phase
-            from .tile.tree import TilePhase
-            wg_pro = [
-                TilePhase("dtl_setup", phase_dtl_interleaved_setup),
-                TilePhase("mx_scale_setup", phase_mx_scale_setup),
-                TilePhase("scheduled_k_loop", scheduled_kloop_phase),
-            ]
-        elif composable:
-            from .kloop.setup import phase_dtl_interleaved_setup, phase_mx_scale_setup
-            from .schedule.kloop_scheduler import scheduled_kloop_phase
-            from .tile.tree import TilePhase
-            wg_pro = [
-                TilePhase("dtl_setup", phase_dtl_interleaved_setup),
-                TilePhase("mx_scale_setup", phase_mx_scale_setup),
-                TilePhase("scheduled_k_loop", scheduled_kloop_phase),
-            ]
-        elif wave_abi:
+        if wave_abi:
             from .kloop.setup import WAVE_ABI_PROLOGUE_PHASES, phase_mx_scale_setup
             from .schedule.kloop_scheduler import scheduled_kloop_phase
             from .tile.tree import TilePhase
@@ -429,20 +385,17 @@ class GemmTiling:
                 TilePhase("scheduled_k_loop", scheduled_kloop_phase),
             ]
 
-        elif interleaved_large:
-            wg_pro = list(INTERLEAVED_LARGE_PROLOGUE_PHASES)
-        elif dtl:
-            wg_pro = list(DTL_PROLOGUE_PHASES)
-        elif pgr2:
-            wg_pro = list(PGR2_PROLOGUE_PHASES)
-        elif interleaved:
-            wg_pro = list(INTERLEAVED_PROLOGUE_PHASES)
-        elif optimized:
-            wg_pro = list(OPTIMIZED_PROLOGUE_PHASES)
-        elif pipelined:
-            wg_pro = list(PIPELINED_PROLOGUE_PHASES)
         else:
-            wg_pro = list(WORKGROUP_PROLOGUE_PHASES)
+            # Default / scheduled / composable: use scheduled K-loop
+            from .kloop.setup import phase_dtl_interleaved_setup, phase_mx_scale_setup
+            from .schedule.kloop_scheduler import scheduled_kloop_phase
+            from .tile.tree import TilePhase
+            wg_pro = [
+                TilePhase("dtl_setup", phase_dtl_interleaved_setup),
+                TilePhase("mx_scale_setup", phase_mx_scale_setup),
+                TilePhase("scheduled_k_loop", scheduled_kloop_phase),
+            ]
+
         workgroup_level = TileLevel(
             "workgroup", m=self.wg_m, n=self.wg_n,
             k=self.unroll_k, inner=wave_level, parallel=True,
