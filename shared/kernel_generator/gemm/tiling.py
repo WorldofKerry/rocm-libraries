@@ -349,7 +349,8 @@ class GemmTiling:
                        dtl: bool = False,
                        interleaved_large: bool = False,
                        wave_abi: bool = False,
-                       composable: bool = False) -> TileLevel:
+                       composable: bool = False,
+                       scheduled: bool = False) -> TileLevel:
         """Build the full tile tree with phases from TileDim chains.
 
         The chain structure determines the tree levels:
@@ -383,7 +384,7 @@ class GemmTiling:
 
         # Wave: per-wave compute tile
         # K-loop data movement phases go here (non-pipelined)
-        if pipelined or optimized or interleaved or pgr2 or dtl or interleaved_large or wave_abi or composable:
+        if pipelined or optimized or interleaved or pgr2 or dtl or interleaved_large or wave_abi or composable or scheduled:
             # Pipelined/optimized: K-loop phase handles compute internally.
             # Wave gets a no-op emit so the tree walker skips it.
             wave_level = TileLevel(
@@ -400,7 +401,16 @@ class GemmTiling:
                 epilogue_phases=list(WAVE_EPILOGUE_PHASES))
 
         # Workgroup: setup + K-loop structure + store
-        if composable:
+        if scheduled:
+            from .kloop.setup import phase_dtl_interleaved_setup, phase_mx_scale_setup
+            from .schedule.kloop_scheduler import scheduled_kloop_phase
+            from .tile.tree import TilePhase
+            wg_pro = [
+                TilePhase("dtl_setup", phase_dtl_interleaved_setup),
+                TilePhase("mx_scale_setup", phase_mx_scale_setup),
+                TilePhase("scheduled_k_loop", scheduled_kloop_phase),
+            ]
+        elif composable:
             from .kloop.setup import phase_dtl_interleaved_setup, phase_mx_scale_setup
             from .kloop.composable import composable_kloop_phase
             from .tile.tree import TilePhase

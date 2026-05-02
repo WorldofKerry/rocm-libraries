@@ -563,3 +563,141 @@ class TestKLoopSchedulerBasic:
                 if op.kind == OpKind.DS_READ:
                     placed.add(op.name)
         assert all_reads == placed
+
+
+class TestScheduledVsManual:
+    """Compare scheduled and manual (composable) kernel output."""
+
+    def _emit_both(self, **kwargs):
+        """Build and emit both composable and scheduled kernels."""
+        from kernel_generator.gemm.kernel import GemmKernel
+
+        problem = kwargs.pop("problem", GemmProblem(256, 256, 64))
+
+        k_manual = GemmKernel.build(problem, composable=True, **kwargs)
+        r_manual = k_manual.emit()
+
+        k_sched = GemmKernel.build(problem, scheduled=True, **kwargs)
+        r_sched = k_sched.emit()
+
+        return r_manual, r_sched
+
+    def _extract_mfma_lines(self, result):
+        """Extract MFMA instruction lines (comment part)."""
+        return [l.strip() for l in result.ctx.lines if 'v_mfma_f32' in l or 'v_mfma_scale' in l]
+
+    def _extract_ds_read_lines(self, result):
+        """Extract ds_read instruction lines."""
+        return [l.strip() for l in result.ctx.lines if 'ds_read' in l]
+
+    def _count(self, result, pattern):
+        return sum(1 for l in result.ctx.lines if pattern in l)
+
+    def test_fp16_mfma_count_matches(self):
+        """Same number of MFMAs in both paths."""
+        r_man, r_sch = self._emit_both()
+        assert self._count(r_man, 'v_mfma_f32') == self._count(r_sch, 'v_mfma_f32')
+
+    def test_fp16_ds_read_count_matches(self):
+        """Same number of ds_reads in both paths."""
+        r_man, r_sch = self._emit_both()
+        assert self._count(r_man, 'ds_read') == self._count(r_sch, 'ds_read')
+
+    def test_fp16_mfma_order_matches(self):
+        """MFMA comments (mi,ni,ki) should be in same order."""
+        r_man, r_sch = self._emit_both()
+        man_mfmas = self._extract_mfma_lines(r_man)
+        sch_mfmas = self._extract_mfma_lines(r_sch)
+        # Extract just the MFMA comment (m{mi}_n{ni}_k{ki})
+        import re
+        def extract_comment(line):
+            m = re.search(r'm\d+_n\d+_k\d+', line)
+            return m.group(0) if m else line
+
+        man_order = [extract_comment(l) for l in man_mfmas]
+        sch_order = [extract_comment(l) for l in sch_mfmas]
+        assert man_order == sch_order, (
+            f"MFMA order differs at index "
+            f"{next(i for i,(a,b) in enumerate(zip(man_order,sch_order)) if a!=b)}")
+
+    def test_fp16_barrier_count_matches(self):
+        """Same number of barriers."""
+        r_man, r_sch = self._emit_both()
+        assert self._count(r_man, 's_barrier') == self._count(r_sch, 's_barrier')
+
+    def test_fp16_total_lines_within_10pct(self):
+        """Total line count should be within 10%."""
+        r_man, r_sch = self._emit_both()
+        man_lines = len(r_man.ctx.lines)
+        sch_lines = len(r_sch.ctx.lines)
+        ratio = abs(man_lines - sch_lines) / max(man_lines, 1)
+        assert ratio < 0.10, (
+            f"Line count differs by {ratio:.0%}: "
+            f"manual={man_lines}, scheduled={sch_lines}")
+
+    def test_fp16_assembles(self):
+        """Scheduled kernel assembles to a .co file."""
+        import os, tempfile
+        from kernel_generator.gemm.kernel import GemmKernel
+        problem = GemmProblem(256, 256, 64)
+        k = GemmKernel.build(problem, scheduled=True)
+        result = k.emit()
+        with tempfile.TemporaryDirectory() as d:
+            co = result.assemble(output_path=os.path.join(d, "test.co"))
+            assert os.path.exists(co)
+            assert os.path.getsize(co) > 0
+
+
+class TestScheduledMXFP4:
+    """Scheduled path for MXFP4 kernels."""
+
+    def test_mxfp4_emits(self):
+        """MXFP4 scheduled kernel emits valid assembly."""
+        from kernel_generator.gemm.kernel import GemmKernel
+        mx = MfmaConfig.mxfp4_16x16x128()
+        tiling = GemmTiling.high_perf(
+            wg_m=256, wg_n=256, unroll_k=256, mfma=mx)
+        problem = GemmProblem(256, 256, 256, dtype=DataType.MXFP4)
+        k = GemmKernel.build(problem, tiling=tiling, scheduled=True)
+        result = k.emit()
+        # Should have MFMAs
+        mfma_count = sum(1 for l in result.ctx.lines
+                         if 'v_mfma_scale' in l or 'v_mfma_f32' in l)
+        assert mfma_count > 0, "No MFMAs found"
+        # Should have ds_reads
+        ds_reads = sum(1 for l in result.ctx.lines if 'ds_read' in l)
+        assert ds_reads > 0, "No ds_reads found"
+
+    def test_mxfp4_mfma_count_matches_composable(self):
+        """MXFP4 scheduled and composable produce same MFMA count."""
+        from kernel_generator.gemm.kernel import GemmKernel
+        mx = MfmaConfig.mxfp4_16x16x128()
+        tiling = GemmTiling.high_perf(
+            wg_m=256, wg_n=256, unroll_k=256, mfma=mx)
+        problem = GemmProblem(256, 256, 256, dtype=DataType.MXFP4)
+
+        k_man = GemmKernel.build(problem, tiling=tiling, composable=True)
+        r_man = k_man.emit()
+
+        k_sch = GemmKernel.build(problem, tiling=tiling, scheduled=True)
+        r_sch = k_sch.emit()
+
+        def count(r, pat):
+            return sum(1 for l in r.ctx.lines if pat in l)
+
+        assert count(r_man, 'v_mfma_scale') == count(r_sch, 'v_mfma_scale')
+
+    def test_mxfp4_assembles(self):
+        """MXFP4 scheduled kernel assembles to .co."""
+        import os, tempfile
+        from kernel_generator.gemm.kernel import GemmKernel
+        mx = MfmaConfig.mxfp4_16x16x128()
+        tiling = GemmTiling.high_perf(
+            wg_m=256, wg_n=256, unroll_k=256, mfma=mx)
+        problem = GemmProblem(256, 256, 256, dtype=DataType.MXFP4)
+        k = GemmKernel.build(problem, tiling=tiling, scheduled=True)
+        result = k.emit()
+        with tempfile.TemporaryDirectory() as d:
+            co = result.assemble(output_path=os.path.join(d, "mxfp4.co"))
+            assert os.path.exists(co)
+            assert os.path.getsize(co) > 0

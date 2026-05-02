@@ -133,6 +133,7 @@ class GemmKernel:
               interleaved_large: bool = False,
               wave_abi: bool = False,
               composable: bool = False,
+              scheduled: bool = False,
               use_dtl: bool = True) -> GemmKernel:
         """Build a GemmKernel.  GemmTiling is the source of truth.
 
@@ -154,7 +155,7 @@ class GemmKernel:
             if tile is not None:
                 tiling = GemmTiling.from_tile_config(tile)
             else:
-                if (wave_abi or composable) and use_dtl:
+                if (wave_abi or composable or scheduled) and use_dtl:
                     # DTL variants need 256x256x64 for 128 MFMAs
                     tiling = GemmTiling.high_perf(
                         wg_m=256, wg_n=256, unroll_k=64)
@@ -178,7 +179,8 @@ class GemmKernel:
                 dtl=dtl,
                 interleaved_large=interleaved_large,
                 wave_abi=wave_abi,
-                composable=composable)
+                composable=composable,
+                scheduled=scheduled)
 
         tile_tree.validate()
 
@@ -217,7 +219,7 @@ class GemmKernel:
         lds_scale_half = 0
 
         # Double LDS for double-buffered mode
-        is_db = any(p.name in ("optimized_k_loop", "fully_interleaved_k_loop", "pgr2_k_loop", "dtl_k_loop", "interleaved_large_k_loop", "composable_k_loop")
+        is_db = any(p.name in ("optimized_k_loop", "fully_interleaved_k_loop", "pgr2_k_loop", "dtl_k_loop", "interleaved_large_k_loop", "composable_k_loop", "scheduled_k_loop")
                      for p in self.tile_tree.prologue_phases)
         lds_total = lds_half * 2 if is_db else lds_half
 

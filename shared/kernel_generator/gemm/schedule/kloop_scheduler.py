@@ -205,6 +205,22 @@ class KLoopScheduler:
                     side_ops[pos].append(op)
                     break
 
+        # Phase 4b: Place suffix ops backward from end
+        suffix_names = ["suffix_vmcnt", "suffix_toggle", "suffix_negate"]
+        suffix_ops_list = [g.ops[n] for n in suffix_names if n in g.ops]
+        epilogue_ops: List[KLoopOp] = []
+        if suffix_ops_list:
+            # Place backward: last suffix at last MFMA, etc.
+            cursor = n_mfma - 1
+            for op in reversed(suffix_ops_list):
+                while cursor >= 0 and reads_per_interval.get(cursor, 0) >= 1:
+                    cursor -= 1
+                if cursor >= 0:
+                    side_ops[cursor].insert(0, op)
+                    cursor -= 1
+                else:
+                    epilogue_ops.append(op)
+
         # Phase 5: Auto-wait insertion
         waits = self._compute_waits(
             mfma_order, side_ops, pre_body, preamble, mfma_positions)
@@ -212,6 +228,7 @@ class KLoopScheduler:
         return ScheduledKLoop(
             mfma_order=mfma_order,
             side_ops=side_ops,
+            epilogue_ops=epilogue_ops,
             pre_body_ops=pre_body,
             barrier_op=barrier_op,
             prefetch_ops=prefetch_ops,
@@ -314,3 +331,221 @@ class KLoopScheduler:
                 if op.kind == OpKind.DS_READ:
                     summary[op.name] = i
         return summary
+
+
+# ===================================================================
+# Phase function: emit a scheduled K-loop as assembly
+# ===================================================================
+
+def scheduled_kloop_phase(level, ctx) -> None:
+    """Phase function: dependency-driven scheduled K-loop.
+
+    Drop-in replacement for composable_kloop_phase. Builds a KLoopGraph,
+    schedules it, and emits the result as assembly.
+    """
+    import math
+    from ..problem import TileConfig, GemmProblem
+    from ..memory.global_loader import GlobalLoader, DTLLoader, BufferLoader
+    from ..memory.lds_reader import LDSReader
+    from .kloop_graph import (
+        KLoopGraph, MFMABlock, DSReadBlock, GlobalLoadBlock, SuffixBlock,
+    )
+
+    tile = ctx._metadata["tile"]
+    problem = ctx._metadata["problem"]
+    use_dtl = ctx._metadata.get("use_dtl", True)
+
+    # Build loader/reader (same as composable_kloop_phase)
+    loader_cls = ctx._metadata.get("loader_cls",
+                                   DTLLoader if use_dtl else BufferLoader)
+    loader = loader_cls(ctx, tile, problem)
+    swizzle = ctx._metadata.get("swizzle", None)
+    reader = LDSReader(ctx, tile, problem, swizzle=swizzle)
+
+    # Store reader in metadata for MFMABlock emit closures
+    ctx._metadata["_reader"] = reader
+
+    scale_loader = None
+    use_real_scales = ctx._metadata.get("use_real_scales", False)
+    if use_real_scales and tile.mfma.is_mx:
+        from ..memory.scale_loader import VMEMScaleLoader
+        swizzled = ctx._metadata.get("swizzled_scales", False)
+        scale_loader = VMEMScaleLoader(ctx, tile, swizzled=swizzled)
+
+    # Build dependency graph
+    graph = KLoopGraph(tile, problem)
+    GlobalLoadBlock(loader).register(graph)
+    DSReadBlock(reader).register(graph)
+    MFMABlock(ctx, tile, scale_loader).register(graph)
+    SuffixBlock(reader, scale_loader, loader).register(graph)
+    graph.validate()
+
+    # Schedule
+    scheduler = KLoopScheduler(graph)
+    result = scheduler.schedule()
+
+    # === Emit assembly ===
+    elem = problem.element_bytes
+    lds_data_half = int((tile.wg_m + tile.wg_n) * tile.unroll_k * elem)
+    log2_uk = int(math.log2(tile.unroll_k))
+
+    # DB step register
+    ctx.alloc_sgpr_permanent(1, "s_lds_db_step")
+
+    ctx.comment("=== Scheduled K-loop ===")
+    ctx.s_lshr(ctx.sreg("s_k_tiles"), ctx.sreg("s_K"), log2_uk,
+               comment=f"k_tiles = K / {tile.unroll_k}")
+    ctx.s_mov(ctx.sreg("s_lds_db_step"), str(lds_data_half),
+              comment=f"DB step = {lds_data_half}")
+    ctx.raw("")
+
+    # Precompute offsets
+    loader.precompute_soffsets()
+    if scale_loader:
+        scale_loader.precompute_soffsets()
+
+    # Prologue: load first tile
+    ctx.comment("Prologue: load tile 0")
+    loader.emit_loads()
+    if scale_loader:
+        scale_loader.emit_initial_loads(4)
+        extra = scale_loader.num_initial_inflight(4)
+        ctx.s_waitcnt(f"vmcnt({extra})",
+                      comment=f"wait DTL (leave {extra} scale loads)")
+    else:
+        ctx.s_waitcnt("vmcnt(0)", comment="wait DTL loads")
+    ctx.s_barrier(comment="sync first tile")
+    ctx.raw("")
+
+    # ============== K-loop body ==============
+    ctx.label("k_loop")
+    ctx.raw("")
+
+    # Pre-body: early B reads (overlap with arriving loads)
+    ctx.comment("Early B reads (overlap with loads)")
+    for op in result.pre_body_ops:
+        if op.emit:
+            op.emit()
+
+    # Conditional next-tile load
+    ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
+              comment="k_tiles--")
+    ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
+             comment="more tiles?")
+    ctx.inst("s_cbranch_scc0", "load_skip_all",
+             comment="skip loads on last iter")
+
+    for op in result.prefetch_ops:
+        if op.emit:
+            op.emit()
+
+    if scale_loader:
+        if not scale_loader.has_cross_iter_prefetch:
+            scale_loader.advance()
+        scale_loader.emit_loop_loads()
+
+    ctx.raw("")
+    ctx.label("load_skip_all")
+
+    loader.emit_sync()
+    ctx.raw("")
+
+    # Preamble reads
+    ctx.comment("Preamble: A[m0] + B ki=1")
+    for op in result.preamble_ops:
+        if op.emit:
+            op.emit()
+
+    # Compute preamble inflight count
+    nr = tile.mfma_n_repeat
+    ki_count = tile.k_iterations
+    preamble_inflight = nr + 1  # B[ki=0] + A[m0,k0]
+    if ki_count > 1:
+        preamble_inflight += nr + 1
+
+    first_batch = nr + 1
+    remaining = preamble_inflight - first_batch
+    wait_cnt = min(remaining, 15)
+    ctx.s_waitcnt(f"lgkmcnt({wait_cnt})",
+                  comment="wait B[ki=0] + A[m0,k0]")
+
+    if scale_loader:
+        scale_loader.emit_scale_wait(loader)
+    ctx.raw("")
+
+    # Recompute per-ki LDS read bases
+    reader.emit_recompute_ki_bases()
+    ctx.raw("")
+
+    # Emit scheduled MFMA body
+    mr = tile.mfma_m_repeat
+    mfmas_per_mi = nr * ki_count
+    partition_m = 4
+    inflight_lgkm = preamble_inflight
+    mfma_count = 0
+
+    for i, mfma_op in enumerate(result.mfma_order):
+        # Auto-wait from scheduler
+        if i in result.waits:
+            ctx.s_waitcnt(result.waits[i],
+                          comment=f"auto-wait before MFMA[{i}]")
+            inflight_lgkm = 0
+
+        # Wait for preamble B[ki=1] before mi=0 ki=1
+        if mfma_count == nr and inflight_lgkm > 0:
+            ctx.s_waitcnt("lgkmcnt(0)",
+                          comment="wait B[ki=1] + A[m0,k1]")
+            inflight_lgkm = 0
+
+        # Wait at mi boundaries for A prefetch
+        if (mfma_count > 0 and mfma_count % mfmas_per_mi == 0
+                and inflight_lgkm > 0):
+            ctx.s_waitcnt("lgkmcnt(0)",
+                          comment=f"wait A[m{mfma_count // mfmas_per_mi}]")
+            inflight_lgkm = 0
+
+        # Scale subtile boundary wait
+        if scale_loader:
+            mps = partition_m * mfmas_per_mi
+            n_st = mr // partition_m
+            if mfma_count > 0 and mfma_count % mps == 0:
+                st_idx = mfma_count // mps
+                if st_idx < n_st:
+                    scale_loader.emit_subtile_wait(loader, st_idx)
+
+        # Partition comment
+        if mfma_count % (partition_m * mfmas_per_mi) == 0:
+            ctx.comment(
+                f"--- Partition {mfma_count // (partition_m * mfmas_per_mi)} ---")
+
+        # Side ops (reads, suffix)
+        for op in result.side_ops[i]:
+            if op.emit:
+                op.emit()
+            if op.kind == OpKind.DS_READ:
+                inflight_lgkm += 1
+
+        # MFMA
+        if mfma_op.emit:
+            mfma_op.emit()
+        mfma_count += 1
+
+    # Epilogue ops
+    for op in result.epilogue_ops:
+        if op.emit:
+            op.emit()
+
+    # Postamble
+    ctx.s_barrier(comment="sync")
+    has_pf = (scale_loader
+              and scale_loader.has_cross_iter_prefetch)
+    ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
+             comment="more?")
+    if has_pf:
+        ctx.inst("s_cbranch_scc0", "k_loop_end",
+                 comment="exit if last")
+        ctx.inst("s_branch", "k_loop", comment="loop back")
+        ctx.label("k_loop_end")
+    else:
+        ctx.inst("s_cbranch_scc1", "k_loop", comment="loop")
+    ctx.raw("")

@@ -15,7 +15,7 @@ from ..problem import TileConfig, GemmProblem, MfmaConfig
 
 __all__ = [
     "OpKind", "DepKind", "KLoopOp", "Dep", "KLoopGraph",
-    "BuildingBlock", "MFMABlock", "DSReadBlock", "GlobalLoadBlock",
+    "BuildingBlock", "MFMABlock", "DSReadBlock", "GlobalLoadBlock", "SuffixBlock",
 ]
 
 
@@ -316,3 +316,61 @@ class GlobalLoadBlock(BuildingBlock):
 
         # barrier after load completes
         graph.add_dep("global_load_next", "barrier", DepKind.SYNC)
+
+
+class SuffixBlock(BuildingBlock):
+    """Declares suffix ops: vmcnt wait, LDS read toggle, DB step negate.
+
+    These are placed backward from the end of the MFMA body to
+    maximize overlap between current-iteration compute and
+    next-iteration loads.
+    """
+
+    def __init__(self, reader: object, scale_loader: object = None,
+                 loader: object = None) -> None:
+        self.reader = reader
+        self.scale_loader = scale_loader
+        self.loader = loader
+
+    def register(self, graph: KLoopGraph) -> None:
+        reader = self.reader
+        sl = self.scale_loader
+        loader = self.loader
+
+        pf_inflight = 0
+        if sl and hasattr(sl, 'has_cross_iter_prefetch') and sl.has_cross_iter_prefetch:
+            pf_inflight = sl.cross_iter_inflight(4, graph.tile.mfma_n_repeat)
+
+        def _emit_vmcnt():
+            reader.ctx.s_waitcnt(
+                f"vmcnt({pf_inflight})",
+                comment=f"wait loads (leave {pf_inflight} prefetch in-flight)")
+
+        def _emit_toggle():
+            reader.toggle_read()
+
+        def _emit_negate():
+            ctx = reader.ctx
+            ctx.inst("s_sub_u32", ctx.sreg("s_lds_db_step"),
+                     "0", ctx.sreg("s_lds_db_step"),
+                     comment="negate db")
+
+        graph.add_op(KLoopOp(
+            "suffix_vmcnt", OpKind.WAIT, _emit_vmcnt,
+            comment="vmcnt wait for DTL loads"))
+
+        graph.add_op(KLoopOp(
+            "suffix_toggle", OpKind.SCALAR, _emit_toggle,
+            comment="toggle LDS read buffer"))
+
+        graph.add_op(KLoopOp(
+            "suffix_negate", OpKind.SCALAR, _emit_negate,
+            comment="negate DB step"))
+
+        # Suffix deps: vmcnt before toggle, toggle before negate
+        graph.add_dep("suffix_vmcnt", "suffix_toggle", DepKind.RAW)
+        graph.add_dep("suffix_toggle", "suffix_negate", DepKind.RAW)
+
+        # Suffix must happen after all MFMAs of the last partition that
+        # reads from the current buffer. In practice, placed backward
+        # from the end by the scheduler.
