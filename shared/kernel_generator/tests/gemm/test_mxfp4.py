@@ -530,3 +530,46 @@ class TestWaveABIKernel:
         name, _ = export_wave_kernel(k, "/tmp/test_wave_name.co")
         assert name.startswith("wave_"), \
             f"Kernel name must start with 'wave_' for hipBLASLt dispatch, got '{name}'"
+
+
+class TestScheduledMXFP4Kernel:
+    """MXFP4 kernel using scheduled K-loop."""
+
+    def _build_mxfp4_kernel(self):
+        tiling = GemmTiling.mxfp4_standard()
+        problem = GemmProblem(128, 128, 256, dtype=DataType.MXFP4)
+        return GemmKernel.build(
+            problem, tiling=tiling, scheduled=True)
+
+    def test_kernel_builds(self):
+        kernel = self._build_mxfp4_kernel()
+        assert kernel.tile.mfma.is_mx
+
+    def test_emit_succeeds(self):
+        kernel = self._build_mxfp4_kernel()
+        result = kernel.emit()
+        assert len(result.asm_text) > 0
+
+    def test_has_mfma_scale(self):
+        """Assembly must contain v_mfma_scale instruction."""
+        kernel = self._build_mxfp4_kernel()
+        result = kernel.emit()
+        scale_lines = [l for l in result.ctx.lines
+                       if 'v_mfma_scale' in l]
+        assert len(scale_lines) > 0
+
+    def test_mfma_count_matches_composable(self):
+        """Same MFMA count as composable path."""
+        tiling = GemmTiling.mxfp4_standard()
+        problem = GemmProblem(128, 128, 256, dtype=DataType.MXFP4)
+
+        k_man = GemmKernel.build(problem, tiling=tiling, composable=True)
+        r_man = k_man.emit()
+
+        k_sch = GemmKernel.build(problem, tiling=tiling, scheduled=True)
+        r_sch = k_sch.emit()
+
+        def count_mfma(r):
+            return sum(1 for l in r.ctx.lines if 'v_mfma_scale' in l)
+
+        assert count_mfma(r_man) == count_mfma(r_sch)
