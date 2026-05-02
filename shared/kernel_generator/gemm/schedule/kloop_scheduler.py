@@ -404,6 +404,9 @@ def scheduled_kloop_phase(level, ctx) -> None:
     if scale_loader:
         scale_loader.precompute_soffsets()
 
+    # PGR=2: prefetch 2 tiles in prologue for better latency hiding
+    pgr2 = ctx._metadata.get("pgr2", False)
+
     # Prologue: load first tile
     ctx.comment("Prologue: load tile 0")
     loader.emit_loads()
@@ -416,6 +419,21 @@ def scheduled_kloop_phase(level, ctx) -> None:
         ctx.s_waitcnt("vmcnt(0)", comment="wait DTL loads")
     ctx.s_barrier(comment="sync first tile")
     ctx.raw("")
+
+    if pgr2:
+        # Prefetch tile 1 into the other LDS buffer (skip if K = unroll_k)
+        ctx.comment("PGR2: prefetch tile 1")
+        ctx.inst("s_cmp_le_u32", ctx.sreg("s_k_tiles"), "1",
+                 comment="skip prefetch if only 1 tile")
+        ctx.inst("s_cbranch_scc1", "pgr2_skip",
+                 comment="skip if k_tiles <= 1")
+        loader.advance()
+        loader.toggle_write()
+        loader.emit_loads()
+        ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
+                  comment="k_tiles-- (prefetched tile 1)")
+        ctx.label("pgr2_skip")
+        ctx.raw("")
 
     # ============== K-loop body ==============
     ctx.label("k_loop")
