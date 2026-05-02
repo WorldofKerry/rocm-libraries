@@ -13,7 +13,7 @@ import math
 
 from ..emit.context import AsmContext
 from ..emit.layouts import GemmLayouts
-from ..problem import GemmProblem, TileConfig
+from ..problem import GemmProblem, MfmaConfig, TileConfig
 from ..tile.tree import TilePhase
 from ..emit.phases import (phase_load_kernargs, phase_thread_indexing,
                      phase_load_cluster_setup, phase_lds_addrs,
@@ -23,22 +23,22 @@ from ..emit.phases import (phase_load_kernargs, phase_thread_indexing,
 __all__ = ["phase_pgr2_interleaved_k_loop", "PGR2_INTERLEAVED_PROLOGUE_PHASES"]
 
 
-def _tile(ctx): return ctx._metadata["tile"]
-def _problem(ctx): return ctx._metadata["problem"]
-def _layouts(ctx): return ctx._metadata["layouts"]
+def _tile(ctx: AsmContext) -> TileConfig: return ctx._metadata["tile"]
+def _problem(ctx: AsmContext) -> GemmProblem: return ctx._metadata["problem"]
+def _layouts(ctx: AsmContext) -> GemmLayouts: return ctx._metadata["layouts"]
 
 
-def _a_off(mi, ki, tile, mfma, elem):
+def _a_off(mi: int, ki: int, tile: TileConfig, mfma: MfmaConfig, elem: float) -> int:
     pad_e = tile.lds_pad // elem if tile.lds_pad > 0 else 0
     return (mi * mfma.m * (tile.unroll_k + pad_e) + ki * mfma.k) * elem
 
 
-def _b_off(ni, ki, tile, mfma, elem):
+def _b_off(ni: int, ki: int, tile: TileConfig, mfma: MfmaConfig, elem: float) -> int:
     pad_e = tile.lds_pad // elem if tile.lds_pad > 0 else 0
     return (ni * mfma.n * (tile.unroll_k + pad_e) + ki * mfma.k) * elem
 
 
-def _emit_gloads(ctx, problem, tile, buf_suffix):
+def _emit_gloads(ctx: AsmContext, problem: GemmProblem, tile: TileConfig, buf_suffix: str) -> None:
     """Issue all global loads into buf_suffix."""
     for name, addr_name in [("A", "v_addr_a"), ("B", "v_addr_b")]:
         gn = f"v_gload{buf_suffix}_{name.lower()}"
@@ -53,7 +53,7 @@ def _emit_gloads(ctx, problem, tile, buf_suffix):
                      comment=f"gload {name}[{i}:{i+cnt}]")
 
 
-def _emit_ds_writes(ctx, tile, buf_suffix):
+def _emit_ds_writes(ctx: AsmContext, tile: TileConfig, buf_suffix: str) -> None:
     """Write global load buffer to LDS."""
     for name in ["a", "b"]:
         gn = f"v_gload{buf_suffix}_{name}"
@@ -66,7 +66,7 @@ def _emit_ds_writes(ctx, tile, buf_suffix):
                          comment=f"ds_wr {name.upper()}[{i}:{i+cnt}]")
 
 
-def _emit_ds_writes_individual(ctx, tile, buf_suffix):
+def _emit_ds_writes_individual(ctx: AsmContext, tile: TileConfig, buf_suffix: str) -> list:
     """Return list of callables, each issuing one ds_write."""
     ops = []
     for name in ["a", "b"]:
@@ -75,7 +75,7 @@ def _emit_ds_writes_individual(ctx, tile, buf_suffix):
         for i in range(0, load.count, 4):
             cnt = min(4, load.count - i)
             _i, _cnt, _gn, _name = i, cnt, gn, name
-            def emit(_i=_i, _cnt=_cnt, _gn=_gn, _name=_name):
+            def emit(_i: int = _i, _cnt: int = _cnt, _gn: str = _gn, _name: str = _name) -> None:
                 ctx.ds_write(ctx.vreg(f"v_lds_wr_{_name}"),
                              ctx.vreg(_gn, _i, _cnt),
                              offset=_i * 4, width=_cnt,
@@ -84,8 +84,8 @@ def _emit_ds_writes_individual(ctx, tile, buf_suffix):
     return ops
 
 
-def _emit_compute(ctx, tile, mfma, mr, nr, ki_count, a_names, b_names,
-                  elem, label, write_ops=None, do_vmcnt=False, do_toggle=False):
+def _emit_compute(ctx: AsmContext, tile: TileConfig, mfma: MfmaConfig, mr: int, nr: int, ki_count: int, a_names: dict, b_names: dict,
+                  elem: float, label: str, write_ops: object = None, do_vmcnt: bool = False, do_toggle: bool = False) -> None:
     """Emit compute phase: preamble + MFMAs with A-prefetch.
     write_ops/do_vmcnt/do_toggle are handled in the caller now.
     """
@@ -147,7 +147,7 @@ def _emit_compute(ctx, tile, mfma, mr, nr, ki_count, a_names, b_names,
 
 
 
-def phase_pgr2_interleaved_k_loop(level, ctx):
+def phase_pgr2_interleaved_k_loop(level: TileLevel, ctx: AsmContext) -> None:
     """K-loop with PGR=2: gloads before compute, writes in late MFMAs."""
     tile = _tile(ctx)
     problem = _problem(ctx)

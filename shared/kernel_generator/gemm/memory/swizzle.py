@@ -7,8 +7,12 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from collections import Counter
-from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..emit.context import AsmContext
+    from ..problem import TileConfig, MfmaConfig
 
 __all__ = [
     "BankingLevel", "BankedMemoryConfig",
@@ -99,7 +103,7 @@ class DataLayout:
     wave_size: int = 64
 
     @staticmethod
-    def from_tile(tile, mfma, elem_bytes: float) -> DataLayout:
+    def from_tile(tile: TileConfig, mfma: MfmaConfig, elem_bytes: float) -> DataLayout:
         return DataLayout(
             row_stride_bytes=int(tile.unroll_k * elem_bytes),
             mfma_k=mfma.k,
@@ -172,7 +176,7 @@ class Swizzle(ABC):
         ...
 
     @abstractmethod
-    def emit_write_swizzle(self, ctx, layout: DataLayout,
+    def emit_write_swizzle(self, ctx: AsmContext, layout: DataLayout,
                            mem: BankedMemoryConfig,
                            v_thread_row: str, v_thread_col: str,
                            v_out: str) -> None:
@@ -183,7 +187,7 @@ class Swizzle(ABC):
         ...
 
     @abstractmethod
-    def emit_read_setup(self, ctx, layout: DataLayout,
+    def emit_read_setup(self, ctx: AsmContext, layout: DataLayout,
                         mem: BankedMemoryConfig,
                         v_lane_row: str, v_k_group: str,
                         v_row_base: str,
@@ -230,15 +234,15 @@ class Swizzle(ABC):
 class IdentitySwizzle(Swizzle):
     """No permutation.  Baseline for testing and memories without banks."""
 
-    def forward(self, row, col, num_cols):
+    def forward(self, row: int, col: int, num_cols: int) -> int:
         return col
 
-    def emit_write_swizzle(self, ctx, layout, mem,
-                           v_thread_row, v_thread_col, v_out):
+    def emit_write_swizzle(self, ctx: AsmContext, layout: DataLayout, mem: BankedMemoryConfig,
+                           v_thread_row: str, v_thread_col: str, v_out: str) -> None:
         ctx.v_mov(v_out, v_thread_col, comment="identity swizzle (no-op)")
 
-    def emit_read_setup(self, ctx, layout, mem,
-                        v_lane_row, v_k_group, v_row_base, out_vregs):
+    def emit_read_setup(self, ctx: AsmContext, layout: DataLayout, mem: BankedMemoryConfig,
+                        v_lane_row: str, v_k_group: str, v_row_base: str, out_vregs: List[str]) -> None:
         # Single base: row_base + k_group * access_width
         ctx.v_lshl(out_vregs[0], v_k_group, 4,
                    comment="k_group * 16")
@@ -257,16 +261,16 @@ class XorSwizzle(Swizzle):
     Achieves 4-way on gfx950 (not optimal, but zero extra K-loop cost).
     """
 
-    def __init__(self, shift_r: int = 2, shift_l: int = 1):
+    def __init__(self, shift_r: int = 2, shift_l: int = 1) -> None:
         self.shift_r = shift_r
         self.shift_l = shift_l
 
-    def forward(self, row, col, num_cols):
+    def forward(self, row: int, col: int, num_cols: int) -> int:
         f = ((row >> self.shift_r) << self.shift_l) & (num_cols - 1)
         return col ^ f
 
-    def emit_write_swizzle(self, ctx, layout, mem,
-                           v_thread_row, v_thread_col, v_out):
+    def emit_write_swizzle(self, ctx: AsmContext, layout: DataLayout, mem: BankedMemoryConfig,
+                           v_thread_row: str, v_thread_col: str, v_out: str) -> None:
         nc = layout.num_cols
         tmp = ctx.vreg("v_tmp3")  # must differ from v_out and v_thread_col
         ctx.v_lshr(tmp, v_thread_row, self.shift_r,
@@ -278,8 +282,8 @@ class XorSwizzle(Swizzle):
         ctx.inst("v_xor_b32", v_out, v_thread_col, tmp,
                  comment="col ^ f(row)")
 
-    def emit_read_setup(self, ctx, layout, mem,
-                        v_lane_row, v_k_group, v_row_base, out_vregs):
+    def emit_read_setup(self, ctx: AsmContext, layout: DataLayout, mem: BankedMemoryConfig,
+                        v_lane_row: str, v_k_group: str, v_row_base: str, out_vregs: List[str]) -> None:
         nc = layout.num_cols
         tmp = ctx.vreg("v_tmp2")
         # f(lane_row)
@@ -319,18 +323,18 @@ class RotationSwizzle(Swizzle):
     Achieves optimal 2-way with cross_lane, 4-way without.
     """
 
-    def __init__(self, use_cross_lane: bool = True):
+    def __init__(self, use_cross_lane: bool = True) -> None:
         self.use_cross_lane = use_cross_lane
 
-    def forward(self, row, col, num_cols, _rows_per_br=None):
+    def forward(self, row: int, col: int, num_cols: int, _rows_per_br: Optional[int] = None) -> int:
         rpbr = _rows_per_br if _rows_per_br is not None else max(1, 128 // (num_cols * 16))
         lds_row_id = row // rpbr
         rotation = (lds_row_id // 2) * 2
         return (rotation + col) % num_cols
         # permlane16_swap effect verified on GPU, not modeled here
 
-    def emit_write_swizzle(self, ctx, layout, mem,
-                           v_thread_row, v_thread_col, v_out):
+    def emit_write_swizzle(self, ctx: AsmContext, layout: DataLayout, mem: BankedMemoryConfig,
+                           v_thread_row: str, v_thread_col: str, v_out: str) -> None:
         rpbr = layout.rows_per_bank_row
         nc = layout.num_cols
         tmp = ctx.vreg("v_tmp2")
@@ -363,8 +367,8 @@ class RotationSwizzle(Swizzle):
             ctx.inst("s_mov_b64", "exec", "-1",
                      comment="restore exec")
 
-    def emit_read_setup(self, ctx, layout, mem,
-                        v_lane_row, v_k_group, v_row_base, out_vregs):
+    def emit_read_setup(self, ctx: AsmContext, layout: DataLayout, mem: BankedMemoryConfig,
+                        v_lane_row: str, v_k_group: str, v_row_base: str, out_vregs: List[str]) -> None:
         rpbr = layout.rows_per_bank_row
         nc = layout.num_cols
         tmp = ctx.vreg("v_tmp2")
@@ -422,16 +426,16 @@ class RotationSwizzle(Swizzle):
 class ComposedSwizzle(Swizzle):
     """Chain multiple swizzle patterns: col' = sN(...s2(s1(row, col)))."""
 
-    def __init__(self, *stages: Swizzle):
+    def __init__(self, *stages: Swizzle) -> None:
         self.stages = stages
 
-    def forward(self, row, col, num_cols):
+    def forward(self, row: int, col: int, num_cols: int) -> int:
         for s in self.stages:
             col = s.forward(row, col, num_cols)
         return col
 
-    def emit_write_swizzle(self, ctx, layout, mem,
-                           v_thread_row, v_thread_col, v_out):
+    def emit_write_swizzle(self, ctx: AsmContext, layout: DataLayout, mem: BankedMemoryConfig,
+                           v_thread_row: str, v_thread_col: str, v_out: str) -> None:
         current = v_thread_col
         for i, s in enumerate(self.stages):
             out = v_out if i == len(self.stages) - 1 else ctx.vreg(f"v_tmp{2+i}")
@@ -439,8 +443,8 @@ class ComposedSwizzle(Swizzle):
                                  v_thread_row, current, out)
             current = out
 
-    def emit_read_setup(self, ctx, layout, mem,
-                        v_lane_row, v_k_group, v_row_base, out_vregs):
+    def emit_read_setup(self, ctx: AsmContext, layout: DataLayout, mem: BankedMemoryConfig,
+                        v_lane_row: str, v_k_group: str, v_row_base: str, out_vregs: List[str]) -> None:
         # For composed swizzles, the last stage does the full setup
         # with the composed forward() handling column mapping
         # Fall back to the last stage's emit with modified column

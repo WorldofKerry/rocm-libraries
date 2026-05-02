@@ -11,7 +11,7 @@ VGPR tiles are reused across partitions via VGPRTileAllocator.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Set, Tuple
 
 from ..problem import TileConfig
 
@@ -40,7 +40,7 @@ class Partition:
 class _TilePool:
     """Single-matrix free-list tile allocator."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._next_id: int = 0
         self._free: List[int] = []
         self._map: Dict[Tuple[int, int], int] = {}
@@ -81,7 +81,7 @@ class VGPRTileAllocator:
     after N's MFMAs complete and reused for partition N+1's loads.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._a = _TilePool()
         self._b = _TilePool()
 

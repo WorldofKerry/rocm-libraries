@@ -38,7 +38,7 @@ Usage::
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum, auto
 from typing import List, Optional
 
@@ -46,7 +46,7 @@ from .problem import MfmaConfig, TileConfig
 from .tile.tree import TileLevel
 
 
-def _noop_wave_emit(level, ctx):
+def _noop_wave_emit(level: TileLevel, ctx: object) -> None:
     """No-op: compute is handled by the K-loop phase."""
     pass
 from .tile.transforms import Dim, Tile, TileDescriptor

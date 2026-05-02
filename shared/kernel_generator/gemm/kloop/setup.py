@@ -24,20 +24,19 @@ import math
 
 from ..emit.context import AsmContext
 from ..emit.layouts import GemmLayouts
-from ..problem import GemmProblem, TileConfig
+from ..problem import GemmProblem, MfmaConfig, TileConfig
 from ..tile.tree import TilePhase
-from ..emit.phases import phase_load_kernargs, phase_store_d
 
 __all__ = ["phase_dtl_interleaved_k_loop", "DTL_INTERLEAVED_PROLOGUE_PHASES",
            "phase_wave_abi_setup", "WAVE_ABI_PROLOGUE_PHASES"]
 
 
-def _tile(ctx): return ctx._metadata["tile"]
-def _problem(ctx): return ctx._metadata["problem"]
-def _layouts(ctx): return ctx._metadata["layouts"]
+def _tile(ctx: AsmContext) -> TileConfig: return ctx._metadata["tile"]
+def _problem(ctx: AsmContext) -> GemmProblem: return ctx._metadata["problem"]
+def _layouts(ctx: AsmContext) -> GemmLayouts: return ctx._metadata["layouts"]
 
 
-def _a_off(mi, ki, tile, mfma, elem):
+def _a_off(mi: int, ki: int, tile: TileConfig, mfma: MfmaConfig, elem: float) -> int:
     """LDS byte offset for A operand at (mi, ki).
 
     When lds_swizzle is enabled the ki contribution is handled by
@@ -55,7 +54,7 @@ def _a_off(mi, ki, tile, mfma, elem):
     return int(row_start * row_stride + lines_crossed * pad_bytes + ki * mfma.k * elem)
 
 
-def _b_off(ni, ki, tile, mfma, elem):
+def _b_off(ni: int, ki: int, tile: TileConfig, mfma: MfmaConfig, elem: float) -> int:
     """LDS byte offset for B operand at (ni, ki)."""
     row_start = ni * mfma.n
     row_stride = int(tile.unroll_k * elem)
@@ -68,7 +67,7 @@ def _b_off(ni, ki, tile, mfma, elem):
     return int(row_start * row_stride + lines_crossed * pad_bytes + ki * mfma.k * elem)
 
 
-def phase_wave_abi_setup(level, ctx):
+def phase_wave_abi_setup(level: TileLevel, ctx: AsmContext) -> None:
     """Setup for WaveGemmKernelArgs ABI (rocRoller custom kernel path).
 
     WaveGemmKernelArgs layout (104 bytes, all u64):
@@ -359,7 +358,7 @@ def phase_wave_abi_setup(level, ctx):
         ctx.raw("")
 
 
-def phase_dtl_interleaved_setup(level, ctx):
+def phase_dtl_interleaved_setup(level: TileLevel, ctx: AsmContext) -> None:
     """Setup SRDs, offsets, LDS read addrs, accumulators for DTL kernel."""
     tile = _tile(ctx)
     problem = _problem(ctx)
@@ -672,7 +671,7 @@ def phase_dtl_interleaved_setup(level, ctx):
         ctx.raw("")
 
 
-def _emit_dtl_loads_a(ctx, tile, problem, num_loads):
+def _emit_dtl_loads_a(ctx: AsmContext, tile: TileConfig, problem: GemmProblem, num_loads: int) -> None:
     """Issue DTL loads for A matrix."""
     elem = problem.element_bytes
     threads_per_row = int(tile.unroll_k * elem) // 16
@@ -701,7 +700,7 @@ def _emit_dtl_loads_a(ctx, tile, problem, num_loads):
                          ctx.sreg("s_soffset_a"), comment="soffset += stride")
 
 
-def _emit_dtl_loads_b(ctx, tile, problem, num_loads):
+def _emit_dtl_loads_b(ctx: AsmContext, tile: TileConfig, problem: GemmProblem, num_loads: int) -> None:
     """Issue DTL loads for B matrix."""
     elem = problem.element_bytes
     threads_per_row = int(tile.unroll_k * elem) // 16
@@ -730,7 +729,7 @@ def _emit_dtl_loads_b(ctx, tile, problem, num_loads):
                          ctx.sreg("s_soffset_b"), comment="soffset += stride")
 
 
-def phase_dtl_interleaved_k_loop(level, ctx):
+def phase_dtl_interleaved_k_loop(level: TileLevel, ctx: AsmContext) -> None:
     """DTL + interleaved K-loop: DTL loads and toggle between MFMAs.
 
     128 MFMAs split into phases:

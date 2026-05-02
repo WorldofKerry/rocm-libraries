@@ -5,7 +5,6 @@ import pytest
 from kernel_generator.gemm.problem import (
     DataType, GemmProblem, MfmaConfig, TileConfig,
 )
-from kernel_generator.gemm.tile.transforms import Dim
 
 
 # ===========================================================================

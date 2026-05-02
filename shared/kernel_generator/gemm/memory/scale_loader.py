@@ -17,9 +17,15 @@ Three concrete strategies:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional
+from typing import Dict, List
 
-from ..schedule.slot_placer import PlacedOp, Path
+from ..schedule.slot_placer import PlacedOp, Path, SlotPlacer
+from ..emit.context import AsmContext
+from ..problem import TileConfig, MfmaConfig
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .global_loader import GlobalLoader
 from ..schedule.data_stream import (
     PrefetchOp,
     build_prefetch_path,
@@ -42,31 +48,31 @@ class ScaleLoader(ABC):
     """Base class for MX scale loading strategies."""
 
     @abstractmethod
-    def alloc_registers(self):
+    def alloc_registers(self) -> None:
         """Allocate VGPRs/SGPRs for scale storage."""
 
     @abstractmethod
-    def emit_setup(self):
+    def emit_setup(self) -> None:
         """Set up scale SRDs, voffsets, soffsets."""
 
     @abstractmethod
-    def emit_initial_loads(self, partition_m: int):
+    def emit_initial_loads(self, partition_m: int) -> None:
         """Load scales for the first subtile + all B scales (prologue)."""
 
     @abstractmethod
-    def emit_loop_loads(self):
+    def emit_loop_loads(self) -> None:
         """Issue scale loads within the K-loop (after SRD advance)."""
 
     @abstractmethod
-    def advance(self):
+    def advance(self) -> None:
         """Advance scale SRDs by one K-step."""
 
     @abstractmethod
-    def make_prefetch_ops(self, all_mfma_ops, partition_m, nr):
+    def make_prefetch_ops(self, all_mfma_ops: list, partition_m: int, nr: int) -> tuple:
         """Return list of ``PlacedOp`` s for cross-iteration scale prefetch."""
 
     @abstractmethod
-    def make_subtile_prefetch_paths(self, partition_m, num_subtiles):
+    def make_subtile_prefetch_paths(self, partition_m: int, num_subtiles: int) -> List[Path]:
         """Return list of ``Path`` s for subtile-level scale_a prefetch."""
 
     @property
@@ -87,25 +93,25 @@ class ScaleLoader(ABC):
 class NullScaleLoader(ScaleLoader):
     """No-op loader for non-MX data types."""
 
-    def alloc_registers(self):
+    def alloc_registers(self) -> None:
         pass
 
-    def emit_setup(self):
+    def emit_setup(self) -> None:
         pass
 
-    def emit_initial_loads(self, partition_m: int):
+    def emit_initial_loads(self, partition_m: int) -> None:
         pass
 
-    def emit_loop_loads(self):
+    def emit_loop_loads(self) -> None:
         pass
 
-    def advance(self):
+    def advance(self) -> None:
         pass
 
-    def make_prefetch_ops(self, all_mfma_ops, partition_m, nr):
+    def make_prefetch_ops(self, all_mfma_ops: list, partition_m: int, nr: int) -> list:
         return []
 
-    def make_subtile_prefetch_paths(self, partition_m, num_subtiles):
+    def make_subtile_prefetch_paths(self, partition_m: int, num_subtiles: int) -> list:
         return []
 
     @property
@@ -126,7 +132,7 @@ class NullScaleLoader(ScaleLoader):
     def has_cross_iter_prefetch(self) -> bool:
         return False
 
-    def precompute_soffsets(self):
+    def precompute_soffsets(self) -> None:
         pass
 
     def num_initial_inflight(self, partition_m: int) -> int:
@@ -135,17 +141,17 @@ class NullScaleLoader(ScaleLoader):
     def cross_iter_inflight(self, partition_m: int, nr: int) -> int:
         return 0
 
-    def emit_scale_wait(self, loader):
+    def emit_scale_wait(self, loader: GlobalLoader) -> None:
         pass
 
-    def emit_subtile_wait(self, loader, st_idx: int):
+    def emit_subtile_wait(self, loader: GlobalLoader, st_idx: int) -> None:
         pass
 
-    def emit_mfma(self, ctx, mfma, acc, a_reg, b_reg, mi, ni, ki):
+    def emit_mfma(self, ctx: AsmContext, mfma: MfmaConfig, acc: str, a_reg: str, b_reg: str, mi: int, ni: int, ki: int) -> None:
         pass
 
-    def place_cross_iter_prefetch(self, placer, all_mfma_ops,
-                                  partition_m, nr):
+    def place_cross_iter_prefetch(self, placer: SlotPlacer, all_mfma_ops: list,
+                                  partition_m: int, nr: int) -> None:
         pass
 
 
@@ -177,7 +183,7 @@ class VMEMScaleLoader(ScaleLoader):
         swizzled: If ``True``, use the AITER pre-swizzled scale layout.
     """
 
-    def __init__(self, ctx, tile, swizzled: bool = False):
+    def __init__(self, ctx: AsmContext, tile: TileConfig, swizzled: bool = False) -> None:
         self._ctx = ctx
         self._tile = tile
         self._mfma = tile.mfma
@@ -215,7 +221,7 @@ class VMEMScaleLoader(ScaleLoader):
 
     # -- register allocation ------------------------------------------------
 
-    def alloc_registers(self):
+    def alloc_registers(self) -> None:
         """Allocate VGPRs for scale A and scale B storage."""
         ctx = self._ctx
         mr, nr, ki_count = self._mr, self._nr, self._ki_count
@@ -258,7 +264,7 @@ class VMEMScaleLoader(ScaleLoader):
 
     # -- SRD / offset setup -------------------------------------------------
 
-    def emit_setup(self):
+    def emit_setup(self) -> None:
         """Precompute scale soffset SGPRs (linear mode only).
 
         For the swizzled mode the soffsets are computed in
@@ -289,7 +295,7 @@ class VMEMScaleLoader(ScaleLoader):
 
     # -- initial (prologue) loads -------------------------------------------
 
-    def emit_initial_loads(self, partition_m: int):
+    def emit_initial_loads(self, partition_m: int) -> None:
         """Issue ``buffer_load_dword`` for the first subtile of A + all B."""
         ctx = self._ctx
         nr = self._nr
@@ -347,7 +353,7 @@ class VMEMScaleLoader(ScaleLoader):
 
     # -- in-loop loads (after SRD advance) ----------------------------------
 
-    def emit_loop_loads(self):
+    def emit_loop_loads(self) -> None:
         """Issue scale loads inside the K-loop body.
 
         Swizzled mode reloads all groups every iteration.  Linear mode
@@ -383,7 +389,7 @@ class VMEMScaleLoader(ScaleLoader):
 
     # -- SRD advance --------------------------------------------------------
 
-    def advance(self):
+    def advance(self) -> None:
         """Advance both scale SRDs by ``scale_k_stride`` bytes."""
         ctx = self._ctx
         stride = self._scale_k_stride
@@ -396,7 +402,7 @@ class VMEMScaleLoader(ScaleLoader):
 
     # -- cross-iteration prefetch -------------------------------------------
 
-    def make_prefetch_ops(self, all_mfma_ops, partition_m, nr):
+    def make_prefetch_ops(self, all_mfma_ops: list, partition_m: int, nr: int) -> tuple:
         """Build ``PrefetchOp`` list and a ``Path`` for cross-iteration prefetch.
 
         Linear mode only.  After each scale register's last MFMA consumer
@@ -437,8 +443,8 @@ class VMEMScaleLoader(ScaleLoader):
                 off = ki_ * ki_bytes
                 off_str = f" offset:{off}" if off > 0 else ""
 
-                def _mk_pf_a(m=mi_, k=ki_, o=off_str):
-                    def emit():
+                def _mk_pf_a(m: int = mi_, k: int = ki_, o: str = off_str) -> object:
+                    def emit() -> None:
                         soff = "0" if m == 0 else ctx.sreg(f"s_soff_sa_{m}")
                         ctx.inst("buffer_load_dword",
                                  ctx.vreg(f"v_scale_a_m{m}k{k}"),
@@ -458,8 +464,8 @@ class VMEMScaleLoader(ScaleLoader):
                 off = ki_ * ki_bytes
                 off_str = f" offset:{off}" if off > 0 else ""
 
-                def _mk_pf_b(n=ni_, k=ki_, o=off_str):
-                    def emit():
+                def _mk_pf_b(n: int = ni_, k: int = ki_, o: str = off_str) -> object:
+                    def emit() -> None:
                         soff = "0" if n == 0 else ctx.sreg(f"s_soff_sb_{n}")
                         ctx.inst("buffer_load_dword",
                                  ctx.vreg(f"v_scale_b_n{n}k{k}"),
@@ -481,7 +487,7 @@ class VMEMScaleLoader(ScaleLoader):
 
     # -- subtile prefetch paths ---------------------------------------------
 
-    def make_subtile_prefetch_paths(self, partition_m, num_subtiles):
+    def make_subtile_prefetch_paths(self, partition_m: int, num_subtiles: int) -> List[Path]:
         """Build ``Path`` list for subtile-level scale_a prefetch.
 
         During subtile *N* 's MFMAs we issue ``buffer_load_dword`` for
@@ -509,8 +515,8 @@ class VMEMScaleLoader(ScaleLoader):
                     off = ki_ * ki_bytes
                     off_str = f" offset:{off}" if off > 0 else ""
 
-                    def _mk_scale_load(mi_=target_mi, k=ki_, o=off_str):
-                        def emit():
+                    def _mk_scale_load(mi_: int = target_mi, k: int = ki_, o: str = off_str) -> object:
+                        def emit() -> None:
                             soff = ("0" if mi_ == 0
                                     else ctx.sreg(f"s_soff_sa_{mi_}"))
                             ctx.inst("buffer_load_dword",
@@ -541,7 +547,7 @@ class VMEMScaleLoader(ScaleLoader):
         """True if linear mode uses cross-iteration prefetch."""
         return not self._swizzled
 
-    def precompute_soffsets(self):
+    def precompute_soffsets(self) -> None:
         """Alias for emit_setup() -- called by ComposableKLoop."""
         self.alloc_registers()
         self.emit_setup()
@@ -558,7 +564,7 @@ class VMEMScaleLoader(ScaleLoader):
             return 0
         return (partition_m + nr) * self._ki_count
 
-    def emit_scale_wait(self, loader):
+    def emit_scale_wait(self, loader: GlobalLoader) -> None:
         """Emit vmcnt wait for scale loads after preamble reads.
 
         For linear mode with DTL, leaves DTL loads in-flight.
@@ -572,7 +578,7 @@ class VMEMScaleLoader(ScaleLoader):
         else:
             ctx.s_waitcnt("vmcnt(0)", comment="wait scale VGPR loads")
 
-    def emit_subtile_wait(self, loader, st_idx: int):
+    def emit_subtile_wait(self, loader: GlobalLoader, st_idx: int) -> None:
         """Emit vmcnt wait at subtile boundary for prefetched scale_a."""
         if self._swizzled:
             return
@@ -581,7 +587,7 @@ class VMEMScaleLoader(ScaleLoader):
         ctx.s_waitcnt(f"vmcnt({num_dtl})",
                       comment=f"wait scale_a subtile {st_idx} (leave DTL)")
 
-    def emit_mfma(self, ctx, mfma, acc, a_reg, b_reg, mi, ni, ki):
+    def emit_mfma(self, ctx: AsmContext, mfma: MfmaConfig, acc: str, a_reg: str, b_reg: str, mi: int, ni: int, ki: int) -> None:
         """Emit MFMA instruction with proper scale operands."""
         sa_name = self._scale_a_names.get((mi, ki))
         sb_name = self._scale_b_names.get((ni, ki))
@@ -609,8 +615,8 @@ class VMEMScaleLoader(ScaleLoader):
                      f"cbsz:{mfma.cbsz} blgp:{mfma.blgp}",
                      comment=f"MFMA m{mi}_n{ni}_k{ki}")
 
-    def place_cross_iter_prefetch(self, placer, all_mfma_ops,
-                                  partition_m, nr):
+    def place_cross_iter_prefetch(self, placer: SlotPlacer, all_mfma_ops: list,
+                                  partition_m: int, nr: int) -> None:
         """Place cross-iteration prefetch ops into the SlotPlacer schedule."""
         if self._swizzled:
             return

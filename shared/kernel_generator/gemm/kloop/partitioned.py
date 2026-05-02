@@ -15,13 +15,11 @@ from __future__ import annotations
 import math
 
 from ..emit.context import AsmContext
-from ..problem import GemmProblem, TileConfig
+from ..problem import GemmProblem, MfmaConfig, TileConfig
 from ..tile.tree import TilePhase
-from ..schedule.partition import PartitionPlan, Partition
-from ..schedule.mainloop import MainloopScheduler, ScheduleModule, ModuleKind
 from ..schedule.slot_placer import SlotPlacer, PlacedOp, Path, SchedulingRules
 from ..emit.phases import (
-    phase_load_kernargs, phase_store_d,
+    phase_load_kernargs,
     phase_thread_indexing, phase_load_cluster_setup, phase_lds_addrs,
     phase_init_acc, phase_global_addrs,
 )
@@ -38,7 +36,7 @@ __all__ = ["phase_dtl_partitioned_k_loop", "DTL_PARTITIONED_PROLOGUE_PHASES", "G
 # MX scale helpers
 # ---------------------------------------------------------------------------
 
-def _scale_lds_offset_a(tile):
+def _scale_lds_offset_a(tile: TileConfig) -> int:
     """LDS byte offset where ScaleA region starts (within one half-buffer)."""
     elem = tile.mfma.element_bytes
     data_a = int(tile.wg_m * tile.unroll_k * elem)
@@ -46,20 +44,20 @@ def _scale_lds_offset_a(tile):
     return data_a + data_b
 
 
-def _scale_lds_offset_b(tile):
+def _scale_lds_offset_b(tile: TileConfig) -> int:
     """LDS byte offset where ScaleB region starts (within one half-buffer)."""
     mx_block = tile.mfma.mx_block
     scale_a_bytes = tile.wg_m * (tile.unroll_k // mx_block)
     return _scale_lds_offset_a(tile) + scale_a_bytes
 
 
-def _scale_region_bytes(tile, dim_size):
+def _scale_region_bytes(tile: TileConfig, dim_size: int) -> int:
     """Bytes for one scale tensor region (e.g. ScaleA or ScaleB) per half."""
     mx_block = tile.mfma.mx_block
     return dim_size * (tile.unroll_k // mx_block)
 
 
-def phase_mx_scale_setup(level, ctx):
+def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
     """Set up scale SRDs for direct VGPR loading (no LDS).
 
     Scale data is small enough to load directly from global memory
@@ -215,8 +213,8 @@ def phase_mx_scale_setup(level, ctx):
 
 
 
-def _emit_swizzled_ds_read(ctx, dst, base_reg, offset, ki, tile, mfma, elem,
-                           width=4, comment=""):
+def _emit_swizzled_ds_read(ctx: AsmContext, dst: str, base_reg: str, offset: int, ki: int, tile: TileConfig, mfma: MfmaConfig, elem: float,
+                           width: int = 4, comment: str = "") -> None:
     """Emit ds_read using per-ki base VGPR.
     
     ki=0 uses base_reg directly.
@@ -238,7 +236,7 @@ def _emit_swizzled_ds_read(ctx, dst, base_reg, offset, ki, tile, mfma, elem,
 
 
 
-def _recompute_ki_bases(ctx, tile, mfma, elem, ki_count):
+def _recompute_ki_bases(ctx: AsmContext, tile: TileConfig, mfma: MfmaConfig, elem: float, ki_count: int) -> None:
     """Recompute per-ki LDS read base VGPRs from v_lds_rd_a/b."""
     swz = tile.resolved_swizzle(elem) if hasattr(tile, 'resolved_swizzle') else None
     if swz is None or ki_count <= 1:
@@ -263,13 +261,13 @@ def _recompute_ki_bases(ctx, tile, mfma, elem, ki_count):
 
 
 
-def _emit_global_loads(ctx, tile, problem):
+def _emit_global_loads(ctx: AsmContext, tile: TileConfig, problem: GemmProblem) -> None:
     """Issue global_load for A and B (non-DTL path)."""
     from ..emit.phases import _emit_global_load_no_wait
     _emit_global_load_no_wait(ctx, problem, tile)
 
 
-def _emit_ds_writes(ctx, tile):
+def _emit_ds_writes(ctx: AsmContext, tile: TileConfig) -> None:
     """Write loaded data from VGPRs to LDS (non-DTL path)."""
     for name in ["a", "b"]:
         load = ctx.get(f"v_gload_{name}")
@@ -281,7 +279,7 @@ def _emit_ds_writes(ctx, tile):
                          comment=f"LDS write {name.upper()}[{i}:{i+cnt}]")
 
 
-def _advance_global_addrs(ctx, problem, tile):
+def _advance_global_addrs(ctx: AsmContext, problem: GemmProblem, tile: TileConfig) -> None:
     """Advance A/B global pointers by unroll_k (non-DTL path)."""
     k_stride = int(tile.unroll_k * problem.element_bytes)
     for addr in ["v_addr_a", "v_addr_b"]:
@@ -292,7 +290,7 @@ def _advance_global_addrs(ctx, problem, tile):
                  ctx.vreg(addr, 1, 1), "0", "vcc", comment="carry")
 
 
-def _toggle_rd_with_ki(ctx, tile, mfma, elem, ki_count, base_name, matrix):
+def _toggle_rd_with_ki(ctx: AsmContext, tile: TileConfig, mfma: MfmaConfig, elem: float, ki_count: int, base_name: str, matrix: str) -> None:
     """Toggle read base + recompute per-ki bases after DB swap."""
     ctx.v_add(ctx.vreg(base_name),
               ctx.sreg("s_lds_db_step"), ctx.vreg(base_name),
@@ -310,7 +308,7 @@ def _toggle_rd_with_ki(ctx, tile, mfma, elem, ki_count, base_name, matrix):
                      ctx.vreg(base_name), str(xor_bytes),
                      comment=f"rd_{matrix}_k{ki} = rd_{matrix} ^ {xor_bytes}")
 
-def phase_dtl_partitioned_k_loop(level, ctx):
+def phase_dtl_partitioned_k_loop(level: TileLevel, ctx: AsmContext) -> None:
     """DTL K-loop with partition-based scheduling."""
     tile = ctx._metadata["tile"]
     problem = ctx._metadata["problem"]
@@ -530,7 +528,7 @@ def phase_dtl_partitioned_k_loop(level, ctx):
     # ================================================================
 
     # Helper to compute scale LDS read offset for A or B
-    def _scale_rd_off_a(mi, ki):
+    def _scale_rd_off_a(mi: int, ki: int) -> int:
         """ds_read_u8 offset for A scale at (mi, ki).
 
         Scale LDS layout: [wg_m, scale_k_cols], row-major, 1 byte/elem.
@@ -539,7 +537,7 @@ def phase_dtl_partitioned_k_loop(level, ctx):
         """
         return mi * mfma.m * (tile.unroll_k // mx_block) + ki * (mfma.k // mx_block)
 
-    def _scale_rd_off_b(ni, ki):
+    def _scale_rd_off_b(ni: int, ki: int) -> int:
         """ds_read_u8 offset for B scale at (ni, ki)."""
         return ni * mfma.n * (tile.unroll_k // mx_block) + ki * (mfma.k // mx_block)
 
@@ -551,9 +549,9 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                 acc_per = mfma.acc_vgprs
                 acc_off = (mi * nr + ni) * acc_per
 
-                def _mk_mfma(mi_=mi, ni_=ni, ki_=ki, buf_=cur_buf,
-                              acc_off_=acc_off, acc_per_=acc_per):
-                    def emit():
+                def _mk_mfma(mi_: int = mi, ni_: int = ni, ki_: int = ki, buf_: int = cur_buf,
+                              acc_off_: int = acc_off, acc_per_: int = acc_per) -> object:
+                    def emit() -> None:
                         if use_real_scales and (mi_, ki_) in scale_a_names:
                             sa_name = scale_a_names[(mi_, ki_)]
                             sb_name = scale_b_names[(ni_, ki_)]
@@ -623,8 +621,8 @@ def phase_dtl_partitioned_k_loop(level, ctx):
         next_buf = (mi + 1) % 2
         path_ops = []
         for ki in range(ki_count):
-            def _mk_lr(mi_=mi + 1, ki_=ki, buf_=next_buf):
-                def emit():
+            def _mk_lr(mi_: int = mi + 1, ki_: int = ki, buf_: int = next_buf) -> object:
+                def emit() -> None:
                     _emit_swizzled_ds_read(
                         ctx, ctx.vreg(a_names[(buf_, ki_)], 0, av),
                         ctx.vreg("v_lds_rd_a"),
@@ -645,8 +643,8 @@ def phase_dtl_partitioned_k_loop(level, ctx):
             path_ops = []
             for mi_in_st in range(partition_m):
                 target_mi = (st + 1) * partition_m + mi_in_st
-                def _mk_scale_load(mi_=target_mi):
-                    def emit():
+                def _mk_scale_load(mi_: int = target_mi) -> object:
+                    def emit() -> None:
                         soff = "0" if mi_ == 0 else ctx.sreg(f"s_soff_sa_{mi_}")
                         ctx.inst("buffer_load_dword",
                                  ctx.vreg(f"v_scale_a_m{mi_}"),
@@ -761,8 +759,8 @@ def phase_dtl_partitioned_k_loop(level, ctx):
         prefetch_loads = []
         for mi_ in range(partition_m):
             reg = f"v_scale_a_m{mi_}"
-            def _mk_pf_a(m=mi_):
-                def emit():
+            def _mk_pf_a(m: int = mi_) -> object:
+                def emit() -> None:
                     soff = "0" if m == 0 else ctx.sreg(f"s_soff_sa_{m}")
                     ctx.inst("buffer_load_dword",
                              ctx.vreg(f"v_scale_a_m{m}"),
@@ -776,8 +774,8 @@ def phase_dtl_partitioned_k_loop(level, ctx):
 
         for ni_ in range(nr):
             reg = f"v_scale_b_n{ni_}"
-            def _mk_pf_b(n=ni_):
-                def emit():
+            def _mk_pf_b(n: int = ni_) -> object:
+                def emit() -> None:
                     soff = "0" if n == 0 else ctx.sreg(f"s_soff_sb_{n}")
                     ctx.inst("buffer_load_dword",
                              ctx.vreg(f"v_scale_b_n{n}"),
@@ -790,7 +788,7 @@ def phase_dtl_partitioned_k_loop(level, ctx):
                 earliest_slot=last_use.get(reg, 0)))
 
         # SRD advancement function
-        def _srd_advance():
+        def _srd_advance() -> None:
             for srd_name in ["s_srd_scale_a", "s_srd_scale_b"]:
                 ctx.inst("s_add_u32", ctx.sreg(srd_name, 0, 1),
                          ctx.sreg(srd_name, 0, 1), str(scale_k_stride),

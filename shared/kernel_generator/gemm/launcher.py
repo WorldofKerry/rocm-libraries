@@ -11,11 +11,8 @@ Provides:
 from __future__ import annotations
 
 import ctypes
-import os
-import subprocess
 import time
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import numpy as np
@@ -331,7 +328,7 @@ class GemmLauncher:
 
         hip = _load_hip()
 
-        def _check(ret, msg="HIP error"):
+        def _check(ret: int, msg: str = "HIP error") -> None:
             if ret != 0:
                 raise RuntimeError(f"{msg}: error code {ret}")
 
@@ -448,7 +445,7 @@ class GemmLauncher:
 
         hip = _load_hip()
 
-        def _check(ret, msg="HIP error"):
+        def _check(ret: int, msg: str = "HIP error") -> None:
             if ret != 0:
                 raise RuntimeError(f"{msg}: error code {ret}")
 
@@ -580,7 +577,6 @@ class GemmLauncher:
         lds_size = 0
 
         # Build args array for hipModuleLaunchKernel (void** of pointers to each arg)
-        import struct as _struct
         _header = [ctypes.c_uint32(0), ctypes.c_uint32(0),
                    ctypes.c_uint32(0), ctypes.c_uint32(total_wgs)]
         _sizes = [ctypes.c_uint32(p.m), ctypes.c_uint32(p.n),

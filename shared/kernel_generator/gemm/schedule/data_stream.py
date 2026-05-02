@@ -15,7 +15,7 @@ Examples:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
@@ -185,7 +185,7 @@ class StreamSchedule:
 
 # ── Factory functions for common GEMM streams ────────────────────────
 
-def make_gemm_streams(mfma, ki_count: int,
+def make_gemm_streams(mfma: object, ki_count: int,
                       use_scales: bool = False,
                       scale_source: StreamSource = StreamSource.GLOBAL
                       ) -> List[DataStream]:
@@ -319,7 +319,7 @@ def build_prefetch_path(
     return Path(ops=ops, reverse=False, module_id=module_id)
 
 
-def place_prefetch_path(placer, path, mfma_ops, prefetch_loads):
+def place_prefetch_path(placer: object, path: object, mfma_ops: list, prefetch_loads: list) -> None:
     """Place prefetch ops in the SlotPlacer, respecting earliest_slot constraints.
 
     Unlike regular paths where ops are placed sequentially, prefetch ops

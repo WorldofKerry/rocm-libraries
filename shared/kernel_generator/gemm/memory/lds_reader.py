@@ -6,13 +6,14 @@ and ping-pong A buffer management.
 """
 from __future__ import annotations
 
-import math
-from ..schedule.slot_placer import PlacedOp, Path
+from ..schedule.slot_placer import PlacedOp
+from ..emit.context import AsmContext
+from ..problem import GemmProblem, MfmaConfig, TileConfig
 
 __all__ = ["LDSReader"]
 
 
-def _a_off(mi, ki, tile, mfma, elem):
+def _a_off(mi: int, ki: int, tile: TileConfig, mfma: MfmaConfig, elem: float) -> int:
     """LDS byte offset for A operand at (mi, ki).
 
     With swizzle: ki is handled by base-register selection, so
@@ -29,7 +30,7 @@ def _a_off(mi, ki, tile, mfma, elem):
     return int(row_start * row_stride + lines_crossed * pad_bytes + ki * mfma.k * elem)
 
 
-def _b_off(ni, ki, tile, mfma, elem):
+def _b_off(ni: int, ki: int, tile: TileConfig, mfma: MfmaConfig, elem: float) -> int:
     """LDS byte offset for B operand at (ni, ki)."""
     row_start = ni * mfma.n
     row_stride = int(tile.unroll_k * elem)
@@ -56,7 +57,7 @@ class LDSReader:
         swizzle: Optional Swizzle instance. If None, uses tile.resolved_swizzle().
     """
 
-    def __init__(self, ctx, tile, problem, swizzle=None):
+    def __init__(self, ctx: AsmContext, tile: TileConfig, problem: GemmProblem, swizzle: object = None) -> None:
         self.ctx = ctx
         self.tile = tile
         self.problem = problem
@@ -98,7 +99,7 @@ class LDSReader:
                     ctx.alloc_vgpr_permanent(av, name)
                 self.a_names[(buf, ki)] = name
 
-    def emit_read_a(self, mi, ki, buf):
+    def emit_read_a(self, mi: int, ki: int, buf: int) -> None:
         """Emit ds_read for A operand at (mi, ki) into buffer buf."""
         self._emit_swizzled_ds_read(
             dst=self.ctx.vreg(self.a_names[(buf, ki)], 0, self.av),
@@ -107,7 +108,7 @@ class LDSReader:
             ki=ki, width=self.av,
             comment=f"LR A m{mi}k{ki} b{buf}")
 
-    def emit_read_b(self, ni, ki):
+    def emit_read_b(self, ni: int, ki: int) -> None:
         """Emit ds_read for B operand at (ni, ki)."""
         self._emit_swizzled_ds_read(
             dst=self.ctx.vreg(self.b_names[(ni, ki)], 0, self.bv),
@@ -116,7 +117,7 @@ class LDSReader:
             ki=ki, width=self.bv,
             comment=f"LR B n{ni}k{ki}")
 
-    def emit_preamble(self):
+    def emit_preamble(self) -> int:
         """Emit preamble reads: B[ki=0], A[m0,k0], B[ki=1], A[m0,k1].
 
         Returns the number of in-flight lgkm reads after preamble.
@@ -146,7 +147,7 @@ class LDSReader:
                       comment="wait B[ki=0] + A[m0,k0]")
         return inflight
 
-    def emit_recompute_ki_bases(self):
+    def emit_recompute_ki_bases(self) -> None:
         """Recompute per-ki LDS read base VGPRs (after toggle or first use)."""
         if self._swizzle is None or self.ki_count <= 1:
             return
@@ -164,7 +165,7 @@ class LDSReader:
                 self.ctx.inst("v_xor_b32", out, base, str(xor_bytes),
                               comment=f"rd_{matrix}_k{ki} = rd_{matrix} ^ {xor_bytes}")
 
-    def toggle_read(self):
+    def toggle_read(self) -> None:
         """Toggle LDS read bases for double-buffering + recompute ki bases."""
         ctx = self.ctx
         for matrix in ["a", "b"]:
@@ -186,7 +187,7 @@ class LDSReader:
                              ctx.vreg(base_name), str(xor_bytes),
                              comment=f"rd_{matrix}_k{ki} = rd_{matrix} ^ {xor_bytes}")
 
-    def make_lr_ops(self, mi):
+    def make_lr_ops(self, mi: int) -> list:
         """Return PlacedOps for A-prefetch reads for mi+1.
 
         These are ds_reads that load the NEXT mi's A data into the
@@ -197,8 +198,8 @@ class LDSReader:
         next_buf = (mi + 1) % 2
         ops = []
         for ki in range(self.ki_count):
-            def _mk(mi_=mi + 1, ki_=ki, buf_=next_buf):
-                def emit():
+            def _mk(mi_: int = mi + 1, ki_: int = ki, buf_: int = next_buf) -> object:
+                def emit() -> None:
                     self.emit_read_a(mi_, ki_, buf_)
                 return emit
             ops.append(PlacedOp(
@@ -206,7 +207,7 @@ class LDSReader:
                 comment=f"A m{mi+1}k{ki}"))
         return ops
 
-    def make_suffix_ops(self):
+    def make_suffix_ops(self) -> list:
         """Return PlacedOps for LDS toggle at end of iteration."""
         ops = [
             PlacedOp(
@@ -221,7 +222,7 @@ class LDSReader:
         ]
         return ops
 
-    def _emit_swizzled_ds_read(self, dst, base_reg, offset, ki, width, comment):
+    def _emit_swizzled_ds_read(self, dst: str, base_reg: str, offset: int, ki: int, width: int, comment: str) -> None:
         """Emit ds_read using per-ki base VGPR when swizzle is active."""
         ctx = self.ctx
         if self._swizzle is not None and ki > 0:

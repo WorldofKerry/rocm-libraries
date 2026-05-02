@@ -16,10 +16,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Callable, Dict, List, Optional
 
-from .partition import PartitionPlan, Partition, VGPRTileAllocator
-from ..problem import TileConfig
+from .partition import PartitionPlan
 
 __all__ = [
     "MainloopScheduler", "ScheduleModule", "ModuleKind", "DepEdge",
@@ -70,7 +69,7 @@ class ScheduleModule:
     # Metadata
     comment: str = ""
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (f"Module({self.kind.name}, P{self.partition_id}, "
                 f"sik={self.sub_iter_k}, mt={self.mt_iteration}, "
                 f"\"{self.comment}\")")
@@ -94,7 +93,7 @@ class MainloopScheduler:
         modules = sched.mainloop_modules()  # flat list for SlotPlacer
     """
 
-    def __init__(self, plan: PartitionPlan):
+    def __init__(self, plan: PartitionPlan) -> None:
         self.plan = plan
         self.partition_schedules: List[PartitionSchedule] = []
         self._all_modules: List[ScheduleModule] = []

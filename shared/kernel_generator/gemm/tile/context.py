@@ -73,7 +73,7 @@ class TileContext:
                                     acc, a, b, comment=f"mfma k={ki}"))
     """
 
-    def __init__(self, module=None):
+    def __init__(self, module: object = None) -> None:
         self._bindings: Dict[str, Binding] = {}
         self._scope_stack: List[str] = []
         self._next: Dict[str, int] = {"v": 0, "s": 0, "acc": 0}
@@ -87,7 +87,7 @@ class TileContext:
     # -- Scope management ---------------------------------------------------
 
     @contextmanager
-    def scope(self, name: str):
+    def scope(self, name: str) -> Iterator[TileContext]:
         """Enter a tile-level scope.  SCOPED bindings auto-freed on exit."""
         self._scope_stack.append(name)
         try:
@@ -242,7 +242,7 @@ class TileContext:
         return name in self._bindings
 
     def vgpr(self, name: str, offset: int = 0,
-             count: Optional[int] = None):
+             count: Optional[int] = None) -> object:
         """Resolve a binding to a stinkytofu VGPR register object.
 
         Imports stinkytofu lazily so dry-run mode works without it.
@@ -253,7 +253,7 @@ class TileContext:
         return st.vgpr(b.start + offset, c)
 
     def sgpr(self, name: str, offset: int = 0,
-             count: Optional[int] = None):
+             count: Optional[int] = None) -> object:
         """Resolve a binding to a stinkytofu SGPR register object."""
         import stinkytofu as st
         b = self.get(name)
@@ -261,7 +261,7 @@ class TileContext:
         return st.sgpr(b.start + offset, c)
 
     def acc(self, name: str, offset: int = 0,
-            count: Optional[int] = None):
+            count: Optional[int] = None) -> object:
         """Resolve a binding to a stinkytofu accumulator register object."""
         import stinkytofu as st
         b = self.get(name)

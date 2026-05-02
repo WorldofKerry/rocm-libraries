@@ -29,8 +29,9 @@ from __future__ import annotations
 import math
 
 from ..problem import TileConfig, GemmProblem
-from ..tile.tree import TilePhase
-from ..schedule.slot_placer import SlotPlacer, PlacedOp, Path, SchedulingRules
+from ..emit.context import AsmContext
+
+from ..schedule.slot_placer import SlotPlacer, PlacedOp, PlacedSchedule, Path, SchedulingRules
 from ..memory.global_loader import GlobalLoader, DTLLoader, BufferLoader
 from ..memory.lds_reader import LDSReader
 
@@ -51,9 +52,9 @@ class ComposableKLoop:
             barrier + branch
     """
 
-    def __init__(self, ctx, tile, problem, loader, reader,
-                 scale_loader=None, partition_m=4,
-                 scheduling_rules=None):
+    def __init__(self, ctx: AsmContext, tile: TileConfig, problem: GemmProblem, loader: GlobalLoader, reader: LDSReader,
+                 scale_loader: object = None, partition_m: int = 4,
+                 scheduling_rules: object = None) -> None:
         self.ctx = ctx
         self.tile = tile
         self.problem = problem
@@ -73,7 +74,7 @@ class ComposableKLoop:
         lds_data_half = int((tile.wg_m + tile.wg_n) * tile.unroll_k * self.elem)
         self.lds_half = lds_data_half
 
-    def emit(self):
+    def emit(self) -> None:
         """Emit the complete K-loop."""
         ctx = self.ctx
         tile = self.tile
@@ -196,7 +197,7 @@ class ComposableKLoop:
     # Schedule construction
     # ------------------------------------------------------------------
 
-    def _build_mfma_ops(self):
+    def _build_mfma_ops(self) -> list:
         """Build PlacedOps for all MFMAs."""
         ctx = self.ctx
         mfma = self.mfma
@@ -211,9 +212,9 @@ class ComposableKLoop:
                     acc_per = mfma.acc_vgprs
                     acc_off = (mi * self.nr + ni) * acc_per
 
-                    def _mk(mi_=mi, ni_=ni, ki_=ki, buf_=cur_buf,
-                            aoff=acc_off, aper=acc_per):
-                        def emit():
+                    def _mk(mi_: int = mi, ni_: int = ni, ki_: int = ki, buf_: int = cur_buf,
+                            aoff: int = acc_off, aper: int = acc_per) -> object:
+                        def emit() -> None:
                             a_reg = ctx.vreg(
                                 reader.a_names[(buf_, ki_)], 0, reader.av)
                             b_reg = ctx.vreg(
@@ -251,7 +252,7 @@ class ComposableKLoop:
                         reads_regs=reads))
         return ops
 
-    def _build_lr_paths(self):
+    def _build_lr_paths(self) -> list:
         """Build LR (ds_read) paths for A-prefetch."""
         paths = []
         for mi in range(self.mr - 1):
@@ -261,7 +262,7 @@ class ComposableKLoop:
                                        module_id=mi)))
         return paths
 
-    def _build_suffix_path(self):
+    def _build_suffix_path(self) -> Path:
         """Build suffix ops: vmcnt wait + toggle + negate."""
         ctx = self.ctx
         pf_inflight = 0
@@ -279,7 +280,7 @@ class ComposableKLoop:
         ops.extend(self.reader.make_suffix_ops())
         return Path(ops=ops, reverse=True, module_id=99)
 
-    def _run_slot_placer(self, all_mfma_ops, lr_paths, suffix_path):
+    def _run_slot_placer(self, all_mfma_ops: list, lr_paths: list, suffix_path: Path) -> PlacedSchedule:
         """Schedule ops between MFMAs via SlotPlacer."""
         rules = self.scheduling_rules or SchedulingRules(
             total_slots=(len(all_mfma_ops) - 1) * 2,
@@ -346,7 +347,7 @@ class ComposableKLoop:
     # Emission
     # ------------------------------------------------------------------
 
-    def _emit_scheduled_body(self, schedule, preamble_inflight):
+    def _emit_scheduled_body(self, schedule: PlacedSchedule, preamble_inflight: int) -> None:
         """Walk the schedule and emit MFMA + side ops with waitcnts."""
         ctx = self.ctx
         inflight_lgkm = preamble_inflight
@@ -399,7 +400,7 @@ class ComposableKLoop:
                 op.emit_fn()
 
 
-def composable_kloop_phase(level, ctx):
+def composable_kloop_phase(level: TileLevel, ctx: AsmContext) -> None:
     """Phase function: auto-configured composable K-loop.
 
     Reads config from ctx._metadata:

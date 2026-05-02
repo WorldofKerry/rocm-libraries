@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import pytest
-from kernel_generator.gemm.tile.context import TileContext, Binding, Lifetime
+from kernel_generator.gemm.tile.context import TileContext
 
 
 # ===========================================================================

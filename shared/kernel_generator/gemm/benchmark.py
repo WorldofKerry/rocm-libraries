@@ -80,7 +80,7 @@ class BenchmarkRow:
 
 # -- HIP helpers ------------------------------------------------------------
 
-def _load_hip():
+def _load_hip() -> object:
     """Load and configure the HIP runtime via ctypes."""
     try:
         hip = ctypes.CDLL("libamdhip64.so")
@@ -131,7 +131,7 @@ def _check(ret: int, msg: str = "HIP error") -> None:
 # -- Our kernel benchmark ---------------------------------------------------
 
 def bench_our_kernel(
-    hip,
+    hip: object,
     M: int, N: int, K: int,
     num_warmup: int = NUM_WARMUP,
     num_iters: int = NUM_ITERS,

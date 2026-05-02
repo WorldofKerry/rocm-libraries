@@ -37,7 +37,7 @@ class PlacedSchedule:
     epilogue: List[PlacedOp] = field(default_factory=list)   # ops after last MFMA
     leftovers: List[PlacedOp] = field(default_factory=list)  # couldn't be placed
 
-    def emit_all(self):
+    def emit_all(self) -> None:
         """Call all emit_fns in scheduled order."""
         for op in self.prologue:
             if op.emit_fn:
@@ -72,7 +72,7 @@ class SlotPlacer:
     def __init__(self, mfmas: List[PlacedOp],
                  validators: List[Callable] = None,
                  adjusters: List[Callable] = None,
-                 on_place: Optional[Callable] = None):
+                 on_place: Optional[Callable] = None) -> None:
         """
         Args:
             mfmas: MFMA ops in execution order (the spine).
@@ -201,7 +201,7 @@ class SchedulingRules:
     Tracks placement state to enforce constraints across the full schedule.
     """
 
-    def __init__(self, total_slots: int, min_ds_read_gap: int = 8):
+    def __init__(self, total_slots: int, min_ds_read_gap: int = 8) -> None:
         self._ds_read_intervals: set = set()  # intervals with a ds_read
         self._m0_intervals: set = set()        # intervals with m0 write
         self._buf_load_count: int = 0
@@ -264,7 +264,7 @@ class SchedulingRules:
             self._buf_load_count += 1
             self._last_buf_load_slot = slot_idx
 
-    def setup_buffer_load_spreading(self, total_slots: int, num_buffer_loads: int):
+    def setup_buffer_load_spreading(self, total_slots: int, num_buffer_loads: int) -> None:
         """Compute target spacing for buffer_load spreading."""
         if num_buffer_loads > 0:
             self._buf_load_target_spacing = max(1, total_slots // num_buffer_loads)

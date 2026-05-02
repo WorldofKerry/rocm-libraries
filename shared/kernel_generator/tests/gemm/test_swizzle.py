@@ -1,7 +1,6 @@
 """Tests for the swizzle module -- pure Python, no GPU required."""
 import pytest
 from kernel_generator.gemm.memory.swizzle import (
-    BankingLevel, BankedMemoryConfig,
     LDS_GFX950, LDS_GFX1250,
     DataLayout,
     IdentitySwizzle, XorSwizzle, RotationSwizzle, ComposedSwizzle,

@@ -3,7 +3,7 @@
 """Tests for the subtile layer: SubTileConfig, PartitionConfig, VGPRTileAllocator."""
 import pytest
 from kernel_generator.gemm.problem import (
-    DataType, GemmProblem, MfmaConfig, SubTileConfig, PartitionConfig, TileConfig,
+    MfmaConfig, SubTileConfig, PartitionConfig, TileConfig,
 )
 # ===========================================================================
 # SubTileConfig

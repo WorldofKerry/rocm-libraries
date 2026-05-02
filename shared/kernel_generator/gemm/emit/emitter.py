@@ -8,16 +8,14 @@ Tree builders live in tiling.py and kernel_pipeline.py.
 """
 from __future__ import annotations
 
-import math
 import os
 import subprocess
 import tempfile
-from dataclasses import dataclass
+
 from typing import Optional
 
 from .context import AsmContext
-from ..problem import GemmProblem, TileConfig, MfmaConfig
-from ..tile.tree import TileLevel, TilePhase
+from ..problem import GemmProblem, TileConfig
 
 __all__ = ["assemble_kernel"]
 

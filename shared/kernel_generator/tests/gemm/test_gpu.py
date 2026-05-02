@@ -5,13 +5,12 @@
 These tests require a GPU (MI355X / gfx950) and ROCm.
 Skipped automatically if hipMalloc fails.
 """
-import os
 import ctypes
 import pytest
 import numpy as np
 
 from kernel_generator.gemm.kernel import GemmKernel
-from kernel_generator.gemm.problem import GemmProblem, TileConfig, MfmaConfig
+from kernel_generator.gemm.problem import GemmProblem, TileConfig
 
 
 

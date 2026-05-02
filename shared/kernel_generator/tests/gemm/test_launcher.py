@@ -3,14 +3,12 @@
 """Tests for the launcher and assembly pipeline."""
 from __future__ import annotations
 
-import os
-import tempfile
 
 import numpy as np
 import pytest
 
-from kernel_generator.gemm.launcher import GemmLauncher, GemmResult
-from kernel_generator.gemm.problem import DataType, GemmProblem, TileConfig, MfmaConfig
+from kernel_generator.gemm.launcher import GemmLauncher
+from kernel_generator.gemm.problem import GemmProblem, TileConfig
 
 # Check for stinkytofu C extension
 try:

@@ -6,8 +6,9 @@ double-buffer toggling and synchronization.
 """
 from __future__ import annotations
 
-import math
 from abc import ABC, abstractmethod
+from ..emit.context import AsmContext
+from ..problem import GemmProblem, TileConfig
 
 __all__ = ["GlobalLoader", "DTLLoader", "BufferLoader"]
 
@@ -15,7 +16,7 @@ __all__ = ["GlobalLoader", "DTLLoader", "BufferLoader"]
 class GlobalLoader(ABC):
     """Base class for global-to-LDS data movement strategies."""
 
-    def __init__(self, ctx, tile, problem):
+    def __init__(self, ctx: AsmContext, tile: TileConfig, problem: GemmProblem) -> None:
         self.ctx = ctx
         self.tile = tile
         self.problem = problem
@@ -29,23 +30,23 @@ class GlobalLoader(ABC):
         self.k_stride = int(tile.unroll_k * self.elem)
 
     @abstractmethod
-    def emit_first_tile(self, extra_vmcnt: int = 0):
+    def emit_first_tile(self, extra_vmcnt: int = 0) -> None:
         """Load first tile, wait, barrier. extra_vmcnt leaves that many in-flight."""
 
     @abstractmethod
-    def emit_loads(self):
+    def emit_loads(self) -> None:
         """Issue loads for next K-tile (within K-loop, after advance)."""
 
     @abstractmethod
-    def advance(self):
+    def advance(self) -> None:
         """Advance global addresses/SRDs by unroll_k."""
 
     @abstractmethod
-    def toggle_write(self):
+    def toggle_write(self) -> None:
         """Toggle LDS write bases for double-buffering."""
 
     @abstractmethod
-    def emit_sync(self):
+    def emit_sync(self) -> None:
         """Wait for loads to land in LDS (strategy-specific)."""
 
     @property
@@ -53,7 +54,7 @@ class GlobalLoader(ABC):
     def num_inflight(self) -> int:
         """Number of vmcnt-tracked loads in-flight after emit_loads."""
 
-    def precompute_soffsets(self):
+    def precompute_soffsets(self) -> None:
         """Precompute scalar offsets for loads. Override if needed."""
         pass
 
@@ -66,7 +67,7 @@ class DTLLoader(GlobalLoader):
     set up by the setup phase. Uses vmcnt for synchronization.
     """
 
-    def precompute_soffsets(self):
+    def precompute_soffsets(self) -> None:
         """Precompute DTL scalar offsets to avoid cumulative s_add in K-loop."""
         ctx = self.ctx
         ctx.comment("Precompute DTL soffsets")
@@ -82,7 +83,7 @@ class DTLLoader(GlobalLoader):
                       comment=f"dtl_soff_b[{i}] = {i} * soffset_b")
         ctx.raw("")
 
-    def emit_first_tile(self, extra_vmcnt: int = 0):
+    def emit_first_tile(self, extra_vmcnt: int = 0) -> None:
         self._emit_dtl_loads_a()
         self._emit_dtl_loads_b()
         if extra_vmcnt > 0:
@@ -92,11 +93,11 @@ class DTLLoader(GlobalLoader):
             self.ctx.s_waitcnt("vmcnt(0)", comment="wait DTL loads")
         self.ctx.s_barrier(comment="sync first tile")
 
-    def emit_loads(self):
+    def emit_loads(self) -> None:
         self._emit_dtl_loads_a()
         self._emit_dtl_loads_b()
 
-    def advance(self):
+    def advance(self) -> None:
         ctx = self.ctx
         for srd in ["s_srd_a", "s_srd_b"]:
             ctx.inst("s_add_u32", ctx.sreg(srd, 0, 1),
@@ -105,7 +106,7 @@ class DTLLoader(GlobalLoader):
             ctx.inst("s_addc_u32", ctx.sreg(srd, 1, 1),
                      ctx.sreg(srd, 1, 1), "0", comment="carry")
 
-    def toggle_write(self):
+    def toggle_write(self) -> None:
         ctx = self.ctx
         ctx.inst("s_add_u32", ctx.sreg("s_lds_wr_a_sg"),
                  ctx.sreg("s_lds_wr_a_sg"), ctx.sreg("s_lds_db_step"),
@@ -114,7 +115,7 @@ class DTLLoader(GlobalLoader):
                  ctx.sreg("s_lds_wr_b_sg"), ctx.sreg("s_lds_db_step"),
                  comment="wr_b += db")
 
-    def emit_sync(self):
+    def emit_sync(self) -> None:
         # DTL writes to OTHER buffer; preamble reads from CURRENT.
         pass
 
@@ -122,7 +123,7 @@ class DTLLoader(GlobalLoader):
     def num_inflight(self) -> int:
         return self.num_loads_a + self.num_loads_b
 
-    def _emit_dtl_loads_a(self):
+    def _emit_dtl_loads_a(self) -> None:
         ctx, tile = self.ctx, self.tile
         elem = self.elem
         tpr = int(tile.unroll_k * elem) // 16
@@ -147,7 +148,7 @@ class DTLLoader(GlobalLoader):
                     ctx.inst("s_add_u32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
                              ctx.sreg("s_soffset_a"), comment="soffset += stride")
 
-    def _emit_dtl_loads_b(self):
+    def _emit_dtl_loads_b(self) -> None:
         ctx, tile = self.ctx, self.tile
         elem = self.elem
         tpr = int(tile.unroll_k * elem) // 16
@@ -180,17 +181,17 @@ class BufferLoader(GlobalLoader):
     via ds_write. Uses vmcnt for global loads, lgkmcnt for ds_writes.
     """
 
-    def emit_first_tile(self, extra_vmcnt: int = 0):
+    def emit_first_tile(self, extra_vmcnt: int = 0) -> None:
         self._emit_global_loads()
         self.ctx.s_waitcnt("vmcnt(0)", comment="wait global loads")
         self._emit_ds_writes()
         self.ctx.s_waitcnt("lgkmcnt(0)", comment="wait LDS writes")
         self.ctx.s_barrier(comment="sync first tile")
 
-    def emit_loads(self):
+    def emit_loads(self) -> None:
         self._emit_global_loads()
 
-    def advance(self):
+    def advance(self) -> None:
         ctx = self.ctx
         for addr in ["v_addr_a", "v_addr_b"]:
             ctx.inst("v_add_co_u32", ctx.vreg(addr, 0, 1), "vcc",
@@ -199,7 +200,7 @@ class BufferLoader(GlobalLoader):
             ctx.inst("v_addc_co_u32", ctx.vreg(addr, 1, 1), "vcc",
                      ctx.vreg(addr, 1, 1), "0", "vcc", comment="carry")
 
-    def toggle_write(self):
+    def toggle_write(self) -> None:
         ctx = self.ctx
         ctx.v_add(ctx.vreg("v_lds_wr_a"),
                   ctx.sreg("s_lds_db_step"), ctx.vreg("v_lds_wr_a"),
@@ -208,7 +209,7 @@ class BufferLoader(GlobalLoader):
                   ctx.sreg("s_lds_db_step"), ctx.vreg("v_lds_wr_b"),
                   comment="wr_b += db")
 
-    def emit_sync(self):
+    def emit_sync(self) -> None:
         ctx = self.ctx
         ctx.s_waitcnt("vmcnt(0)", comment="wait global loads")
         self._emit_ds_writes()
@@ -219,11 +220,11 @@ class BufferLoader(GlobalLoader):
     def num_inflight(self) -> int:
         return 0  # all loads drained by emit_sync
 
-    def _emit_global_loads(self):
+    def _emit_global_loads(self) -> None:
         from ..emit.phases import _emit_global_load_no_wait
         _emit_global_load_no_wait(self.ctx, self.problem, self.tile)
 
-    def _emit_ds_writes(self):
+    def _emit_ds_writes(self) -> None:
         ctx = self.ctx
         for name in ["a", "b"]:
             load = ctx.get(f"v_gload_{name}")

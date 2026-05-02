@@ -17,12 +17,12 @@ Phases access kernel state through ``ctx._metadata``:
 from __future__ import annotations
 
 import math
-from typing import Optional
+from typing import Callable
 
 from .context import AsmContext
 from .layouts import emit_affine, GemmLayouts
-from ..problem import GemmProblem, TileConfig
-from ..tile.tree import TileLevel, TilePhase, walk_tile_tree
+from ..problem import GemmProblem, MfmaConfig, TileConfig
+from ..tile.tree import TileLevel, TilePhase
 from ..tile.transforms import Embed, Dim
 
 __all__ = [
@@ -40,13 +40,13 @@ __all__ = [
 # Helpers: extract ctx._metadata
 # ===================================================================
 
-def _tile(ctx) -> TileConfig:
+def _tile(ctx: AsmContext) -> TileConfig:
     return ctx._metadata["tile"]
 
-def _problem(ctx) -> GemmProblem:
+def _problem(ctx: AsmContext) -> GemmProblem:
     return ctx._metadata["problem"]
 
-def _layouts(ctx) -> GemmLayouts:
+def _layouts(ctx: AsmContext) -> GemmLayouts:
     return ctx._metadata["layouts"]
 
 
@@ -54,7 +54,7 @@ def _layouts(ctx) -> GemmLayouts:
 # Prologue phases
 # ===================================================================
 
-def phase_load_kernargs(level, ctx):
+def phase_load_kernargs(level: TileLevel, ctx: AsmContext) -> None:
     """Load kernel arguments from TensileLite kernarg segment + WG decomposition."""
     import math as _math
     tile = ctx._metadata["tile"]
@@ -108,7 +108,7 @@ def phase_load_kernargs(level, ctx):
 
 
 
-def phase_thread_indexing(level, ctx):
+def phase_thread_indexing(level: TileLevel, ctx: AsmContext) -> None:
     """Compute wave_id, lane_id, wave_m, wave_n from thread ID."""
     tile = _tile(ctx)
     ctx.comment("Thread indexing")
@@ -131,7 +131,7 @@ def phase_thread_indexing(level, ctx):
     ctx.raw("")
 
 
-def phase_load_cluster_setup(level, ctx):
+def phase_load_cluster_setup(level: TileLevel, ctx: AsmContext) -> None:
     """Compute global-load thread cluster coordinates for A and B.
 
     For symmetric tiles (wg_m == wg_n), A and B use the same mapping.
@@ -141,7 +141,7 @@ def phase_load_cluster_setup(level, ctx):
     problem = _problem(ctx)
     elem = problem.element_bytes
 
-    def _emit_cluster(wg_dim, row_reg, col_reg, label):
+    def _emit_cluster(wg_dim: int, row_reg: str, col_reg: str, label: str) -> None:
         """Emit thread cluster coords for a tile of size wg_dim x unroll_k."""
         elems_per_thread = (wg_dim * tile.unroll_k) // tile.block_size
         contiguous_k = min(elems_per_thread, tile.unroll_k)
@@ -182,7 +182,7 @@ def phase_load_cluster_setup(level, ctx):
     ctx.raw("")
 
 
-def phase_lds_addrs(level, ctx):
+def phase_lds_addrs(level: TileLevel, ctx: AsmContext) -> None:
     """Compute LDS write AND read offsets using coordinate transforms."""
     tile = _tile(ctx)
     problem = _problem(ctx)
@@ -267,7 +267,7 @@ def phase_lds_addrs(level, ctx):
     ctx.raw("")
 
 
-def phase_init_acc(level, ctx):
+def phase_init_acc(level: TileLevel, ctx: AsmContext) -> None:
     """Zero-initialize accumulator registers."""
     tile = _tile(ctx)
     acc_total = tile.mfma_m_repeat * tile.mfma_n_repeat * tile.mfma.acc_vgprs
@@ -277,7 +277,7 @@ def phase_init_acc(level, ctx):
     ctx.raw("")
 
 
-def phase_global_addrs(level, ctx):
+def phase_global_addrs(level: TileLevel, ctx: AsmContext) -> None:
     """Compute 64-bit global addresses for A and B using transforms.
 
     Uses emit_affine() with dynamic_coefficients for the K dimension.
@@ -329,14 +329,14 @@ def phase_global_addrs(level, ctx):
 # K-loop phases
 # ===================================================================
 
-def phase_global_load(level, ctx):
+def phase_global_load(level: TileLevel, ctx: AsmContext) -> None:
     """Load A/B tiles from global memory into VGPRs."""
     problem = _problem(ctx)
     tile = _tile(ctx)
     _emit_global_load_impl(ctx, problem, tile)
 
 
-def _emit_global_load_impl(ctx, problem, tile):
+def _emit_global_load_impl(ctx: AsmContext, problem: GemmProblem, tile: TileConfig) -> None:
     """Shared implementation: emit global_load instructions for A and B."""
     for name, addr_name in [("A", "v_addr_a"), ("B", "v_addr_b")]:
         gload_name = f"v_gload_{name.lower()}"
@@ -355,7 +355,7 @@ def _emit_global_load_impl(ctx, problem, tile):
     ctx.raw("")
 
 
-def phase_lds_write(level, ctx):
+def phase_lds_write(level: TileLevel, ctx: AsmContext) -> None:
     """Write loaded A/B data from VGPRs into LDS + barrier."""
     tile = _tile(ctx)
     for name in ["a", "b"]:
@@ -373,7 +373,7 @@ def phase_lds_write(level, ctx):
     ctx.raw("")
 
 
-def phase_k_advance(level, ctx):
+def phase_k_advance(level: TileLevel, ctx: AsmContext) -> None:
     """Advance A/B global pointers by unroll_k + barrier."""
     tile = _tile(ctx)
     k_stride = tile.unroll_k * _problem(ctx).element_bytes
@@ -388,7 +388,7 @@ def phase_k_advance(level, ctx):
     ctx.s_barrier(comment="sync before next K-tile LDS write")
 
 
-def phase_k_loop_control(level, ctx):
+def phase_k_loop_control(level: TileLevel, ctx: AsmContext) -> None:
     """Decrement K-tile counter and branch."""
     ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
               comment="k_tiles--")
@@ -398,7 +398,7 @@ def phase_k_loop_control(level, ctx):
     ctx.raw("")
 
 
-def phase_k_loop_init(level, ctx):
+def phase_k_loop_init(level: TileLevel, ctx: AsmContext) -> None:
     """Compute K-tile loop counter."""
     tile = _tile(ctx)
     log2_uk = int(math.log2(tile.unroll_k))
@@ -407,7 +407,7 @@ def phase_k_loop_init(level, ctx):
     ctx.raw("")
 
 
-def phase_k_loop_label(level, ctx):
+def phase_k_loop_label(level: TileLevel, ctx: AsmContext) -> None:
     """Emit the K-loop label."""
     ctx.label("k_loop")
     ctx.raw("")
@@ -416,7 +416,7 @@ def phase_k_loop_label(level, ctx):
 # ===================================================================
 # Store epilogue (uses transforms for address computation)
 # ===================================================================
-def phase_store_d(level, ctx):
+def phase_store_d(level: TileLevel, ctx: AsmContext) -> None:
     """Store accumulators to D using buffer_store_short with a buffer SRD.
 
     Supports two layouts:
@@ -538,7 +538,7 @@ def phase_store_d(level, ctx):
 
 
 
-def _store_d_colmajor(ctx, tile, mfma, acc_per, elem_int, use_bf16):
+def _store_d_colmajor(ctx: AsmContext, tile: TileConfig, mfma: MfmaConfig, acc_per: int, elem_int: int, use_bf16: bool) -> None:
     """Column-major store for TensileLite ABI.
 
     Layout: D[m + n * M], stride along M = 1 element, stride along N = M.
@@ -605,7 +605,7 @@ def _store_d_colmajor(ctx, tile, mfma, acc_per, elem_int, use_bf16):
                                              f"store D m{mi}_n{ni}_a{ai}")
 
 
-def _store_d_scalar(ctx, tile, mfma, acc_per, elem_int):
+def _store_d_scalar(ctx: AsmContext, tile: TileConfig, mfma: MfmaConfig, acc_per: int, elem_int: int) -> None:
     """Emit buffer_store_short with individual v_cvt_f16_f32_e32 per element.
 
     Fallback for odd acc_per (uncommon).
@@ -636,7 +636,7 @@ def _store_d_scalar(ctx, tile, mfma, acc_per, elem_int):
                                          f"store D m{mi}_n{ni}_a{ai}")
 
 
-def _store_d_packed(ctx, tile, mfma, acc_per, elem_int):
+def _store_d_packed(ctx: AsmContext, tile: TileConfig, mfma: MfmaConfig, acc_per: int, elem_int: int) -> None:
     """Emit buffer_store_short with v_cvt_pk_f16_f32 for accumulator pairs.
 
     Processes ai in pairs (0,1), (2,3), etc.  For each pair:
@@ -702,7 +702,7 @@ def _store_d_packed(ctx, tile, mfma, acc_per, elem_int):
 
 
 
-def _emit_buffer_store_dword(ctx, vdata_name, soffset_name, imm_offset,
+def _emit_buffer_store_dword(ctx: AsmContext, vdata_name: str, soffset_name: str, imm_offset: int,
                               comment):
     """Emit one buffer_store_dword via the D matrix SRD.
 
@@ -729,7 +729,7 @@ def _emit_buffer_store_dword(ctx, vdata_name, soffset_name, imm_offset,
                  comment="restore soffset")
 
 
-def _emit_buffer_store_short(ctx, vdata_name, soffset_name, imm_offset,
+def _emit_buffer_store_short(ctx: AsmContext, vdata_name: str, soffset_name: str, imm_offset: int,
                               comment):
     """Emit one buffer_store_short via the D matrix SRD.
 
@@ -818,7 +818,7 @@ def default_mfma_visitor(level: TileLevel, ctx: AsmContext) -> None:
 # Pipelined K-loop (single phase, handles entire loop)
 # ===================================================================
 
-def _emit_wave_compute(ctx, wave, visitor):
+def _emit_wave_compute(ctx: AsmContext, wave: TileLevel, visitor: Callable) -> None:
     """Walk the wave level with proper mi/ni/ki iteration.
 
     Used by pipelined/optimized K-loops to correctly iterate over
@@ -835,7 +835,7 @@ def _emit_wave_compute(ctx, wave, visitor):
                 visitor(wave.inner, ctx)
 
 
-def phase_pipelined_k_loop(level, ctx):
+def phase_pipelined_k_loop(level: TileLevel, ctx: AsmContext) -> None:
     """Entire K-loop with software pipelining.
 
     Overlaps global_load(n+1) with compute(n).  Skips prefetch on
@@ -960,7 +960,7 @@ PIPELINED_PROLOGUE_PHASES = [
 # MFMA/LR + fine-grained waitcnt
 # ===================================================================
 
-def phase_optimized_k_loop(level, ctx):
+def phase_optimized_k_loop(level: TileLevel, ctx: AsmContext) -> None:
     """K-loop with fully interleaved instruction scheduling.
 
     All overhead (advance, global_load, LDS toggle, ds_write) is
@@ -1048,7 +1048,7 @@ def phase_optimized_k_loop(level, ctx):
     ctx.raw("")
 
 
-def _emit_lds_write_impl(ctx, tile):
+def _emit_lds_write_impl(ctx: AsmContext, tile: TileConfig) -> None:
     """Emit LDS write + waitcnt + barrier (shared by all K-loop variants)."""
     for name in ["a", "b"]:
         load = ctx.get(f"v_gload_{name}")
@@ -1063,7 +1063,7 @@ def _emit_lds_write_impl(ctx, tile):
     ctx.raw("")
 
 
-def _emit_global_load_no_wait(ctx, problem, tile):
+def _emit_global_load_no_wait(ctx: AsmContext, problem: GemmProblem, tile: TileConfig) -> None:
     """Issue global loads for A and B without waitcnt (async)."""
     for name, addr_name in [("A", "v_addr_a"), ("B", "v_addr_b")]:
         gload_name = f"v_gload_{name.lower()}"
@@ -1098,7 +1098,7 @@ OPTIMIZED_PROLOGUE_PHASES = [
 # Subtile-scheduled compute: group 4 MFMAs between reads
 # ===================================================================
 
-def _emit_subtile_compute_legacy(ctx, tile, problem):
+def _emit_subtile_compute_legacy(ctx: AsmContext, tile: TileConfig, problem: GemmProblem) -> None:
     """Subtile-scheduled MFMA with ds_read_b64 and merged ki.
 
     All B values for all (ni, ki) loaded upfront. A double-buffered
@@ -1133,10 +1133,10 @@ def _emit_subtile_compute_legacy(ctx, tile, problem):
                 ctx.alloc_vgpr_permanent(av, name)
             a_names[(buf, ki)] = name
 
-    def a_off(mi, ki):
+    def a_off(mi: int, ki: int) -> int:
         pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (mi * mfma.m * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
 
-    def b_off(ni, ki):
+    def b_off(ni: int, ki: int) -> int:
         pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (ni * mfma.n * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
 
     def read_a(mi, ki, buf):
@@ -1206,7 +1206,7 @@ def _emit_subtile_compute_legacy(ctx, tile, problem):
 # Automated subtile scheduler with preamble
 # ===================================================================
 
-def _emit_scheduled_compute(ctx, tile, problem):
+def _emit_scheduled_compute(ctx: AsmContext, tile: TileConfig, problem: GemmProblem) -> None:
     """Automated subtile scheduler with preamble + interleaved A prefetch.
 
     Structure:
@@ -1243,10 +1243,10 @@ def _emit_scheduled_compute(ctx, tile, problem):
                 ctx.alloc_vgpr_permanent(av, name)
             a_names[(buf, ki)] = name
 
-    def a_off(mi, ki):
+    def a_off(mi: int, ki: int) -> int:
         pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (mi * mfma.m * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
 
-    def b_off(ni, ki):
+    def b_off(ni: int, ki: int) -> int:
         pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (ni * mfma.n * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
 
     total = mr * nr * ki_count
@@ -1307,7 +1307,7 @@ def _emit_scheduled_compute(ctx, tile, problem):
 # Fully-interleaved K-loop: ALL overhead between MFMAs
 # ===================================================================
 
-def phase_fully_interleaved_k_loop(level, ctx):
+def phase_fully_interleaved_k_loop(level: TileLevel, ctx: AsmContext) -> None:
     """K-loop with ALL overhead instructions interleaved between MFMAs.
 
     sequential blocks, this version distributes every non-compute
@@ -1374,10 +1374,10 @@ def phase_fully_interleaved_k_loop(level, ctx):
                 ctx.alloc_vgpr_permanent(av, name)
             a_names[(buf, ki)] = name
 
-    def a_off(mi, ki):
+    def a_off(mi: int, ki: int) -> int:
         pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (mi * mfma.m * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
 
-    def b_off(ni, ki):
+    def b_off(ni: int, ki: int) -> int:
         pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (ni * mfma.n * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
 
     def read_a(mi, ki, buf):
@@ -1612,7 +1612,7 @@ INTERLEAVED_PROLOGUE_PHASES = [
 # PGR=2 K-loop: double-buffered global loads for latency hiding
 # ===================================================================
 
-def phase_pgr2_k_loop(level, ctx):
+def phase_pgr2_k_loop(level: TileLevel, ctx: AsmContext) -> None:
     """K-loop with PGR=2: global loads issued 2 iterations ahead.
 
     Two sets of global load buffers alternate. Each iteration:
@@ -1711,13 +1711,13 @@ def phase_pgr2_k_loop(level, ctx):
                 ctx.alloc_vgpr_permanent(av, name)
             a_names[(buf, ki)] = name
 
-    def a_off(mi, ki):
+    def a_off(mi: int, ki: int) -> int:
         pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (mi * mfma.m * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
 
-    def b_off(ni, ki):
+    def b_off(ni: int, ki: int) -> int:
         pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (ni * mfma.n * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
 
-    def emit_compute(ctx, mr, nr, ki_count, mfma, a_names, b_names, a_off, b_off, tile, elem, label=""):
+    def emit_compute(ctx: AsmContext, mr: int, nr: int, ki_count: int, mfma: MfmaConfig, a_names: dict, b_names: dict, a_off: object, b_off: object, tile: TileConfig, elem: float, label: str = "") -> None:
         """Emit preamble + compute (16 MFMAs with A prefetch)."""
         av = mfma.a_vgprs
         bv = mfma.b_vgprs
@@ -1769,7 +1769,7 @@ def phase_pgr2_k_loop(level, ctx):
                 cur_a = next_a
             ctx.raw("")
 
-    def emit_gload_to_buf(ctx, problem, tile, buf_suffix):
+    def emit_gload_to_buf(ctx: AsmContext, problem: GemmProblem, tile: TileConfig, buf_suffix: str) -> None:
         """Issue global loads into buffer buf_suffix ('', '2')."""
         for name, addr_name in [("A", "v_addr_a"), ("B", "v_addr_b")]:
             gload_name = f"v_gload{buf_suffix}_{name.lower()}"
@@ -1783,7 +1783,7 @@ def phase_pgr2_k_loop(level, ctx):
                 ctx.inst(f"global_load_{width}", dst, addr, off,
                          comment=f"gload {name}[{i}:{i+cnt}]")
 
-    def emit_lds_write_from_buf(ctx, tile, buf_suffix):
+    def emit_lds_write_from_buf(ctx: AsmContext, tile: TileConfig, buf_suffix: str) -> None:
         """Write global load buffer to LDS."""
         for name in ["a", "b"]:
             gload_name = f"v_gload{buf_suffix}_{name}"
@@ -1973,7 +1973,7 @@ PGR2_PROLOGUE_PHASES = [
 # DirectToLDS K-loop: buffer_load ... ,lds eliminates ds_write
 # ===================================================================
 
-def phase_dtl_setup(level, ctx):
+def phase_dtl_setup(level: TileLevel, ctx: AsmContext) -> None:
     """Set up SRDs, per-lane offsets, and LDS write bases for DTL."""
     tile = _tile(ctx)
     problem = _problem(ctx)
@@ -2168,7 +2168,7 @@ def phase_dtl_setup(level, ctx):
     ctx.raw("")
 
 
-def _emit_dtl_loads(ctx, tile, problem, label=""):
+def _emit_dtl_loads(ctx: AsmContext, tile: TileConfig, problem: GemmProblem, label: str = "") -> None:
     """Issue buffer_load_dwordx4 with ,lds for both A and B."""
     elem = problem.element_bytes
     threads_per_row = tile.unroll_k // 8
@@ -2201,7 +2201,7 @@ def _emit_dtl_loads(ctx, tile, problem, label=""):
     ctx.raw("")
 
 
-def phase_dtl_k_loop(level, ctx):
+def phase_dtl_k_loop(level: TileLevel, ctx: AsmContext) -> None:
     """K-loop with DirectToLDS: buffer_load_dwordx4 ... ,lds."""
     tile = _tile(ctx)
     problem = _problem(ctx)
@@ -2252,10 +2252,10 @@ def phase_dtl_k_loop(level, ctx):
                 ctx.alloc_vgpr_permanent(av, name)
             a_names[(buf, ki)] = name
 
-    def a_off(mi, ki):
+    def a_off(mi: int, ki: int) -> int:
         pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (mi * mfma.m * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
 
-    def b_off(ni, ki):
+    def b_off(ni: int, ki: int) -> int:
         pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (ni * mfma.n * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
 
     # K-loop
@@ -2375,7 +2375,7 @@ DTL_PROLOGUE_PHASES = [
 # and prefix ops (ptr advance, global loads) into early MFMAs.
 # ===================================================================
 
-def phase_interleaved_large_k_loop(level, ctx):
+def phase_interleaved_large_k_loop(level: TileLevel, ctx: AsmContext) -> None:
     """K-loop with suffix/prefix interleaved into MFMA gaps.
 
     Per ki phase (64 MFMAs): preamble (9 reads + wait), then 8 mi groups.
@@ -2427,10 +2427,10 @@ def phase_interleaved_large_k_loop(level, ctx):
                 ctx.alloc_vgpr_permanent(av, name)
             a_names[(buf, ki)] = name
 
-    def a_off(mi, ki):
+    def a_off(mi: int, ki: int) -> int:
         pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (mi * mfma.m * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
 
-    def b_off(ni, ki):
+    def b_off(ni: int, ki: int) -> int:
         pad_e_ = tile.lds_pad // elem if tile.lds_pad > 0 else 0; return (ni * mfma.n * (tile.unroll_k + pad_e_) + ki * mfma.k) * elem
 
     def do_mfma(mi, ni, ki, a_buf):

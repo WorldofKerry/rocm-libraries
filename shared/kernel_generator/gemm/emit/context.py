@@ -12,7 +12,6 @@ with the working assembly backend -- no stinkytofu dependency needed.
 """
 from __future__ import annotations
 
-import math
 from typing import List, Optional
 
 from ..tile.context import TileContext
@@ -113,16 +112,16 @@ class AsmContext(TileContext):
 
     # -- Convenience instruction emitters -----------------------------------
 
-    def v_mov(self, dst: str, src, comment: str = "") -> None:
+    def v_mov(self, dst: str, src: object, comment: str = "") -> None:
         self.inst("v_mov_b32", dst, str(src), comment=comment)
 
-    def v_add(self, dst: str, src0, src1, comment: str = "") -> None:
+    def v_add(self, dst: str, src0: object, src1: object, comment: str = "") -> None:
         self.inst("v_add_u32", dst, str(src0), str(src1), comment=comment)
 
-    def v_sub(self, dst: str, src0, src1, comment: str = "") -> None:
+    def v_sub(self, dst: str, src0: object, src1: object, comment: str = "") -> None:
         self.inst("v_sub_u32", dst, str(src0), str(src1), comment=comment)
 
-    def v_mul(self, dst: str, src0, src1, comment: str = "") -> None:
+    def v_mul(self, dst: str, src0: object, src1: object, comment: str = "") -> None:
         # Use shift for power-of-2 multipliers to avoid literal constant issues
         s0, s1 = str(src0), str(src1)
         try:
@@ -157,31 +156,31 @@ class AsmContext(TileContext):
             pass
         return val_str
 
-    def v_lshr(self, dst: str, src, shift: int, comment: str = "") -> None:
+    def v_lshr(self, dst: str, src: object, shift: int, comment: str = "") -> None:
         self.inst("v_lshrrev_b32", dst, str(shift), str(src), comment=comment)
 
-    def v_lshl(self, dst: str, src, shift: int, comment: str = "") -> None:
+    def v_lshl(self, dst: str, src: object, shift: int, comment: str = "") -> None:
         self.inst("v_lshlrev_b32", dst, str(shift), str(src), comment=comment)
 
-    def v_and(self, dst: str, src, mask: int, comment: str = "") -> None:
+    def v_and(self, dst: str, src: object, mask: int, comment: str = "") -> None:
         self.inst("v_and_b32", dst, str(mask), str(src), comment=comment)
 
-    def s_mov(self, dst: str, src, comment: str = "") -> None:
+    def s_mov(self, dst: str, src: object, comment: str = "") -> None:
         self.inst("s_mov_b32", dst, str(src), comment=comment)
 
-    def s_add(self, dst: str, src0, src1, comment: str = "") -> None:
+    def s_add(self, dst: str, src0: object, src1: object, comment: str = "") -> None:
         self.inst("s_add_u32", dst, str(src0), str(src1), comment=comment)
 
-    def s_sub(self, dst: str, src0, src1, comment: str = "") -> None:
+    def s_sub(self, dst: str, src0: object, src1: object, comment: str = "") -> None:
         self.inst("s_sub_u32", dst, str(src0), str(src1), comment=comment)
 
-    def s_mul(self, dst: str, src0, src1, comment: str = "") -> None:
+    def s_mul(self, dst: str, src0: object, src1: object, comment: str = "") -> None:
         self.inst("s_mul_i32", dst, str(src0), str(src1), comment=comment)
 
-    def s_lshr(self, dst: str, src, shift: int, comment: str = "") -> None:
+    def s_lshr(self, dst: str, src: object, shift: int, comment: str = "") -> None:
         self.inst("s_lshr_b32", dst, str(src), str(shift), comment=comment)
 
-    def s_lshl(self, dst: str, src, shift: int, comment: str = "") -> None:
+    def s_lshl(self, dst: str, src: object, shift: int, comment: str = "") -> None:
         self.inst("s_lshl_b32", dst, str(src), str(shift), comment=comment)
 
     def s_waitcnt(self, what: str, comment: str = "") -> None:

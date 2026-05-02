@@ -3,10 +3,9 @@
 """Tests for the GemmKernel pipeline with tree-driven phases."""
 import pytest
 from kernel_generator.gemm.kernel import (
-    GemmKernel, MemoryView, default_mfma_visitor,
+    GemmKernel, default_mfma_visitor,
 )
-from kernel_generator.gemm.tile.tree import TilePhase
-from kernel_generator.gemm.problem import GemmProblem, TileConfig, MfmaConfig
+from kernel_generator.gemm.problem import GemmProblem, TileConfig
 
 
 class TestGemmKernelBuild:

@@ -18,9 +18,9 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
-from .tile.transforms import Dim, Tile, Flatten, TileDescriptor, tile_hierarchy
+from .tile.transforms import Dim, Tile, TileDescriptor
 
 __all__ = [
     "DataType", "GemmProblem", "MfmaConfig", "SubTileConfig",

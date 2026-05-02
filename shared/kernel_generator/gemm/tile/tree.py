@@ -46,7 +46,7 @@ __all__ = [
 ]
 
 # Defer import to avoid circular dependency; context.py is standalone
-def _import_context():
+def _import_context() -> type:
     from .context import TileContext
     return TileContext
 
@@ -181,7 +181,7 @@ class ScopedAllocator:
     # -- scope context manager ----------------------------------------------
 
     @contextmanager
-    def scope(self, level_name: str):
+    def scope(self, level_name: str) -> Iterator[ScopedAllocator]:
         """Enter a tile-level scope.  SCOPED allocations are auto-freed on exit."""
         self._scope_stack.append(level_name)
         try:
@@ -191,7 +191,7 @@ class ScopedAllocator:
             self._free_scoped(level_name)
 
     @contextmanager
-    def hold_registers(self):
+    def hold_registers(self) -> Iterator[ScopedAllocator]:
         """Temporarily switch default lifetime to HELD.
 
         Use within a scope to keep registers live past the scope boundary
@@ -479,7 +479,7 @@ class TileLevel:
 
         Searches this level's phases first, then recursively into inner.
         """
-        def _replace_in_list(phases):
+        def _replace_in_list(phases: list) -> tuple:
             found = False
             result = []
             for p in phases:
@@ -632,8 +632,8 @@ def build_gemm_tile_tree(
 
 def walk_tile_tree(
     root: TileLevel,
-    ctx,
-    visitor: Callable = None,
+    ctx: Any,
+    visitor: Optional[Callable] = None,
 ) -> None:
     """Walk the tile tree, calling phases and *visitor* at each level.
 
@@ -691,7 +691,7 @@ def walk_tile_tree(
         ctx.validate_provides(root.provides, root.name)
 
 
-def _walk_flat(root, ctx, visitor):
+def _walk_flat(root: TileLevel, ctx: Any, visitor: Optional[Callable]) -> None:
     """Default: iterate over all inner tiles sequentially."""
     for mi in range(root.repeats_m):
         for ni in range(root.repeats_n):
@@ -702,7 +702,7 @@ def _walk_flat(root, ctx, visitor):
                 walk_tile_tree(root.inner, ctx, visitor)
 
 
-def _walk_partitioned(root, ctx, visitor):
+def _walk_partitioned(root: TileLevel, ctx: Any, visitor: Optional[Callable]) -> None:
     """Partition-ordered: groups of inner tiles, VGPR reuse between groups."""
     pm, pn = root.partition_m, root.partition_n
     parts_m = root.repeats_m // pm

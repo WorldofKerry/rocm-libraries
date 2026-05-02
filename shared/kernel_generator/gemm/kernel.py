@@ -22,7 +22,7 @@ Usage::
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional
+from typing import Callable, Optional
 
 from .emit.context import AsmContext
 from .emit.emitter import alloc_registers, alloc_registers_dtl, emit_header, emit_descriptor, assemble_kernel
@@ -30,8 +30,8 @@ from .emit.layouts import emit_affine, GemmLayouts
 from .emit.phases import default_mfma_visitor
 from .problem import GemmProblem, TileConfig
 from .tiling import GemmTiling
-from .tile.tree import TileLevel, TilePhase, walk_tile_tree
-from .tile.transforms import Embed, Dim
+from .tile.tree import TileLevel, walk_tile_tree
+from .tile.transforms import Embed
 
 __all__ = ["MemoryView", "GemmKernel", "AsmKernel", "default_mfma_visitor"]
 
@@ -46,7 +46,7 @@ class MemoryView:
     base_reg: Optional[str] = None
     base_offset: int = 0
 
-    def emit_offset(self, ctx, bindings, result_reg):
+    def emit_offset(self, ctx: AsmContext, bindings: dict, result_reg: str) -> None:
         emit_affine(ctx, self.layout, bindings, result_reg,
                     scale=self.elem_bytes,
                     base=str(self.base_offset) if self.base_offset else None,
@@ -57,12 +57,12 @@ class MemoryView:
 
 
 # Monkey-patch MemoryView registry onto AsmContext
-def _register_view(ctx, view):
+def _register_view(ctx: AsmContext, view: MemoryView) -> None:
     if not hasattr(ctx, '_views'):
         ctx._views = {}
     ctx._views[view.name] = view
 
-def _get_view(ctx, name):
+def _get_view(ctx: AsmContext, name: str) -> MemoryView:
     if not hasattr(ctx, '_views') or name not in ctx._views:
         available = list(getattr(ctx, '_views', {}).keys())
         raise KeyError(f"No MemoryView '{name}'. Available: {available}")
@@ -83,18 +83,18 @@ class AsmKernel:
     lds_bytes: int
 
     @property
-    def vgpr_count(self): return self.ctx._next["v"]
+    def vgpr_count(self) -> int: return self.ctx._next["v"]
     @property
-    def sgpr_count(self): return self.ctx._next["s"]
+    def sgpr_count(self) -> int: return self.ctx._next["s"]
     @property
-    def acc_count(self): return self.ctx._next["acc"]
+    def acc_count(self) -> int: return self.ctx._next["acc"]
 
-    def save(self, path):
+    def save(self, path: str) -> str:
         with open(path, "w") as f:
             f.write(self.asm_text)
         return path
 
-    def assemble(self, gpu_arch="gfx950", output_path=None):
+    def assemble(self, gpu_arch: str = "gfx950", output_path: Optional[str] = None) -> str:
         return assemble_kernel(self.asm_text, gpu_arch, output_path)
 
 

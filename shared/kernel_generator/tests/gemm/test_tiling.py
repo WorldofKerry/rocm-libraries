@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 """Tests for TileDim, ScheduleKind, GemmTiling."""
 import pytest
-from kernel_generator.gemm.tiling import TileDim, GemmTiling, ScheduleKind, S
+from kernel_generator.gemm.tiling import TileDim, GemmTiling, S
 from kernel_generator.gemm.problem import MfmaConfig, TileConfig
 
 P, SEQ, H = S.PARALLEL, S.SEQUENTIAL, S.HARDWARE
