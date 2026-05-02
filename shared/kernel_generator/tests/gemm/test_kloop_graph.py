@@ -1,5 +1,6 @@
-"""Tests for KLoopGraph: validate dependency-driven scheduling
-matches the manual ComposableKLoop output."""
+"""Tests for KLoopGraph and KLoopScheduler.
+
+Validates dependency-driven scheduling matches manual ComposableKLoop."""
 from __future__ import annotations
 
 import pytest
@@ -11,6 +12,9 @@ from kernel_generator.gemm.tiling import GemmTiling
 from kernel_generator.gemm.schedule.kloop_graph import (
     OpKind, DepKind, KLoopOp, Dep, KLoopGraph,
     MFMABlock, DSReadBlock, GlobalLoadBlock,
+)
+from kernel_generator.gemm.schedule.kloop_scheduler import (
+    KLoopScheduler, ScheduledKLoop,
 )
 
 
@@ -345,3 +349,217 @@ class TestGraphStructuralComparison:
         assert graph_m == manual_m
         assert graph_a == manual_a
         assert graph_b == manual_b
+
+
+# ===================================================================
+# Scheduler tests
+# ===================================================================
+
+class TestKLoopSchedulerBasic:
+    """Test that KLoopScheduler produces valid schedules."""
+
+    def _build_graph(self, wg_m=256, wg_n=256, unroll_k=64):
+        tiling = GemmTiling.high_perf(wg_m=wg_m, wg_n=wg_n,
+                                       unroll_k=unroll_k)
+        tile = tiling.to_tile_config()
+        problem = GemmProblem(wg_m, wg_n, unroll_k)
+        g = KLoopGraph(tile, problem)
+
+        class FakeLoader:
+            def advance(self): pass
+            def toggle_write(self): pass
+            def emit_loads(self): pass
+            def emit_sync(self): pass
+
+        class FakeReader:
+            def emit_read_a(self, mi, ki, buf): pass
+            def emit_read_b(self, ni, ki): pass
+
+        GlobalLoadBlock(FakeLoader()).register(g)
+        DSReadBlock(FakeReader()).register(g)
+
+        from kernel_generator.gemm.emit.context import AsmContext
+        ctx = AsmContext()
+        ctx._metadata = {"tile": tile, "problem": problem}
+        MFMABlock(ctx, tile).register(g)
+        g.validate()
+        return g, tile
+
+    def test_mfma_order_matches_manual(self):
+        """Scheduled MFMA order must match manual mi,ki,ni traversal."""
+        g, tile = self._build_graph()
+        scheduler = KLoopScheduler(g)
+        result = scheduler.schedule()
+
+        mr = tile.mfma_m_repeat
+        nr = tile.mfma_n_repeat
+        ki_count = tile.k_iterations
+
+        expected = []
+        for mi in range(mr):
+            for ki in range(ki_count):
+                for ni in range(nr):
+                    expected.append(f"mfma_m{mi}_n{ni}_k{ki}")
+
+        actual = [op.name for op in result.mfma_order]
+        assert actual == expected
+
+    def test_pre_body_has_b_reads_ki0(self):
+        """B reads for ki=0 should be in pre-body (before barrier)."""
+        g, tile = self._build_graph()
+        result = KLoopScheduler(g).schedule()
+
+        nr = tile.mfma_n_repeat
+        pre_body_names = {op.name for op in result.pre_body_ops}
+        for ni in range(nr):
+            assert f"read_b_n{ni}_k0" in pre_body_names
+
+    def test_preamble_has_a_m0_reads(self):
+        """Preamble should contain A reads for m0 and B reads for ki=1."""
+        g, tile = self._build_graph()
+        result = KLoopScheduler(g).schedule()
+
+        preamble_names = [op.name for op in result.preamble_ops]
+        assert "read_a_m0_k0_buf0" in preamble_names
+        if tile.k_iterations > 1:
+            assert "read_a_m0_k1_buf0" in preamble_names
+
+    def test_a_prefetch_respects_war_deps(self):
+        """A reads for mi+2 must be placed after mi's last MFMA."""
+        g, tile = self._build_graph()
+        result = KLoopScheduler(g).schedule()
+
+        mr = tile.mfma_m_repeat
+        nr = tile.mfma_n_repeat
+        ki_count = tile.k_iterations
+        mfma_positions = {op.name: i for i, op in enumerate(result.mfma_order)}
+
+        # Build read positions from side_ops
+        read_mfma_pos = {}
+        for i, ops in enumerate(result.side_ops):
+            for op in ops:
+                if op.kind == OpKind.DS_READ:
+                    read_mfma_pos[op.name] = i
+
+        # For mi >= 2, read_a should be placed after prior mi's last MFMA
+        for mi in range(2, mr):
+            prior_mi = mi - 2
+            last_mfma_pos = mfma_positions[
+                f"mfma_m{prior_mi}_n{nr-1}_k{ki_count-1}"]
+
+            for ki in range(ki_count):
+                buf = mi % 2
+                read_name = f"read_a_m{mi}_k{ki}_buf{buf}"
+                if read_name in read_mfma_pos:
+                    assert read_mfma_pos[read_name] > last_mfma_pos, \
+                        f"{read_name} at {read_mfma_pos[read_name]} " \
+                        f"but must be after MFMA pos {last_mfma_pos}"
+
+    def test_reads_before_consuming_mfma(self):
+        """Every ds_read must be placed before its consuming MFMA."""
+        g, tile = self._build_graph()
+        result = KLoopScheduler(g).schedule()
+
+        mfma_positions = {op.name: i for i, op in enumerate(result.mfma_order)}
+
+        # Collect read positions
+        read_positions = {}
+        for op in result.pre_body_ops:
+            read_positions[op.name] = -2
+        for op in result.preamble_ops:
+            read_positions[op.name] = -1
+        for i, ops in enumerate(result.side_ops):
+            for op in ops:
+                if op.kind == OpKind.DS_READ:
+                    read_positions[op.name] = i
+
+        # Check: every RAW dep from ds_read to MFMA is satisfied
+        for dep in g.deps:
+            if dep.kind != DepKind.RAW:
+                continue
+            prod = g.ops.get(dep.producer)
+            cons = g.ops.get(dep.consumer)
+            if (prod and prod.kind == OpKind.DS_READ
+                    and cons and cons.kind == OpKind.MFMA):
+                read_pos = read_positions.get(dep.producer)
+                mfma_pos = mfma_positions.get(dep.consumer)
+                if read_pos is not None and mfma_pos is not None:
+                    assert read_pos < mfma_pos, \
+                        f"{dep.producer} at {read_pos} but " \
+                        f"{dep.consumer} at {mfma_pos}"
+
+    def test_no_unplaced_reads(self):
+        """Every ds_read must be placed somewhere."""
+        g, tile = self._build_graph()
+        result = KLoopScheduler(g).schedule()
+
+        all_reads = {op.name for op in g.ds_read_ops()}
+        placed = set()
+        for op in result.pre_body_ops:
+            placed.add(op.name)
+        for op in result.preamble_ops:
+            placed.add(op.name)
+        for ops in result.side_ops:
+            for op in ops:
+                if op.kind == OpKind.DS_READ:
+                    placed.add(op.name)
+
+        missing = all_reads - placed
+        assert not missing, f"Unplaced reads: {missing}"
+
+    def test_prefetch_ops_extracted(self):
+        """Iteration=1 ops should be in prefetch_ops."""
+        g, tile = self._build_graph()
+        result = KLoopScheduler(g).schedule()
+
+        prefetch_names = {op.name for op in result.prefetch_ops}
+        assert "advance" in prefetch_names
+        assert "toggle" in prefetch_names
+        assert "global_load_next" in prefetch_names
+
+    def test_mxfp4_schedule_valid(self):
+        """MXFP4 config also produces valid schedule."""
+        mx = MfmaConfig.mxfp4_16x16x128()
+        tiling = GemmTiling.high_perf(
+            wg_m=256, wg_n=256, unroll_k=256, mfma=mx)
+        tile = tiling.to_tile_config()
+        problem = GemmProblem(256, 256, 256, dtype=DataType.MXFP4)
+
+        g = KLoopGraph(tile, problem)
+
+        class FakeLoader:
+            def advance(self): pass
+            def toggle_write(self): pass
+            def emit_loads(self): pass
+            def emit_sync(self): pass
+
+        class FakeReader:
+            def emit_read_a(self, mi, ki, buf): pass
+            def emit_read_b(self, ni, ki): pass
+
+        GlobalLoadBlock(FakeLoader()).register(g)
+        DSReadBlock(FakeReader()).register(g)
+
+        from kernel_generator.gemm.emit.context import AsmContext
+        ctx = AsmContext()
+        ctx._metadata = {"tile": tile, "problem": problem}
+        MFMABlock(ctx, tile).register(g)
+        g.validate()
+
+        result = KLoopScheduler(g).schedule()
+
+        # All MFMAs present
+        assert len(result.mfma_order) == tile.mfma_m_repeat * tile.mfma_n_repeat * tile.k_iterations
+
+        # All reads placed
+        all_reads = {op.name for op in g.ds_read_ops()}
+        placed = set()
+        for op in result.pre_body_ops:
+            placed.add(op.name)
+        for op in result.preamble_ops:
+            placed.add(op.name)
+        for ops in result.side_ops:
+            for op in ops:
+                if op.kind == OpKind.DS_READ:
+                    placed.add(op.name)
+        assert all_reads == placed
