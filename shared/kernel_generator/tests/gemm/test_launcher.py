@@ -160,3 +160,63 @@ class TestPerformance:
 # ===========================================================================
 # Assembly pipeline tests
 # ===========================================================================
+
+
+# ===========================================================================
+# WorkGroupMappingXCC / 1D grid tests
+# ===========================================================================
+
+class TestUse1dGrid:
+    """Tests for the use_1d_grid (WorkGroupMappingXCC) launcher support."""
+
+    def test_run_asm_kernel_accepts_use_1d_grid(self):
+        """run_asm_kernel signature includes use_1d_grid parameter."""
+        import inspect
+        sig = inspect.signature(GemmLauncher.run_asm_kernel)
+        assert "use_1d_grid" in sig.parameters
+        assert sig.parameters["use_1d_grid"].default is False
+
+    def test_1d_grid_dimensions(self):
+        """1D grid flattens grid_m * grid_n into a single dimension."""
+        p = GemmProblem(m=256, n=256, k=64)
+        tile = TileConfig(wg_m=128, wg_n=128)
+        grid_m, grid_n = p.grid_dims(tile)
+        total_wgs = grid_m * grid_n
+
+        assert grid_m == 2
+        assert grid_n == 2
+        assert total_wgs == 4
+
+    def test_1d_grid_non_square(self):
+        """Non-square problem produces correct 1D flattening."""
+        p = GemmProblem(m=512, n=128, k=64)
+        tile = TileConfig(wg_m=128, wg_n=128)
+        grid_m, grid_n = p.grid_dims(tile)
+        total_wgs = grid_m * grid_n
+
+        assert grid_m == 4
+        assert grid_n == 1
+        assert total_wgs == 4
+
+    def test_1d_grid_ceil_division(self):
+        """Non-tile-aligned problem sizes round up correctly."""
+        p = GemmProblem(m=300, n=200, k=64)
+        tile = TileConfig(wg_m=128, wg_n=128)
+        grid_m, grid_n = p.grid_dims(tile)
+        total_wgs = grid_m * grid_n
+
+        # ceil(300/128)=3, ceil(200/128)=2
+        assert grid_m == 3
+        assert grid_n == 2
+        assert total_wgs == 6
+
+    def test_1d_grid_large_problem(self):
+        """Larger problem matching MI355X multi-XCC scenario."""
+        p = GemmProblem(m=4096, n=4096, k=4096)
+        tile = TileConfig(wg_m=128, wg_n=128)
+        grid_m, grid_n = p.grid_dims(tile)
+        total_wgs = grid_m * grid_n
+
+        assert grid_m == 32
+        assert grid_n == 32
+        assert total_wgs == 1024

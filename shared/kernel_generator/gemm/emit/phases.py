@@ -621,16 +621,16 @@ def _emit_buffer_store_dword(ctx: AsmContext, vdata_name: str, soffset_name: str
 
     if imm_offset == 0:
         ctx.inst("buffer_store_dword", vdata, voffset, srd,
-                 soffset, "offen", comment=comment)
+                 soffset, "offen nt", comment=comment)
     elif imm_offset < 4096:
         ctx.inst("buffer_store_dword", vdata, voffset, srd,
-                 soffset, f"offen offset:{imm_offset}",
+                 soffset, f"offen offset:{imm_offset} nt",
                  comment=comment)
     else:
         ctx.inst("s_add_u32", soffset, soffset, str(imm_offset),
                  comment=f"fold imm {imm_offset} into soffset")
         ctx.inst("buffer_store_dword", vdata, voffset, srd,
-                 soffset, "offen", comment=comment)
+                 soffset, "offen nt", comment=comment)
         ctx.inst("s_sub_u32", soffset, soffset, str(imm_offset),
                  comment="restore soffset")
 

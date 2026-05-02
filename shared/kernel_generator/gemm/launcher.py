@@ -426,6 +426,7 @@ class GemmLauncher:
         num_warmup: int = 3,
         num_iters: int = 10,
         lds_bytes: int = 0,
+        use_1d_grid: bool = False,
     ) -> GemmResult:
         """Launch the generated GEMM assembly kernel on the GPU.
 
@@ -434,8 +435,14 @@ class GemmLauncher:
           offset 16: M, 20: N, 24: batch, 28: K
           offset 32: D, 40: C, 48: A, [56: MXSA], 64: B, [72: MXSB]
           offset 80+: strides, alpha, beta
-        Grid: flattened 1D (total_wgs, 1, 1)
-        Block: block_size threads
+        Grid: 1D (total_wgs, 1, 1) when use_1d_grid=True,
+              2D (grid_m, grid_n, 1) otherwise.
+        Block: block_size threads.
+
+        Args:
+            use_1d_grid: When True, launch with a 1D grid
+                ``(grid_m * grid_n, 1, 1)`` for WorkGroupMappingXCC
+                L2 locality across XCCs.
         """
         import struct
 
@@ -607,11 +614,20 @@ class GemmLauncher:
         for i, v in enumerate(_all_args):
             args[i] = ctypes.cast(ctypes.pointer(v), ctypes.c_void_p)
 
-        # Dispatch grid: 2D (grid_m x grid_n) for standalone kernels
+        # Dispatch grid dimensions
+        if use_1d_grid:
+            # 1D grid for WorkGroupMappingXCC: kernel decomposes the
+            # flat WG index back into (tile_m, tile_n) in its setup phase.
+            launch_grid_x = total_wgs
+            launch_grid_y = 1
+        else:
+            launch_grid_x = grid_m
+            launch_grid_y = grid_n
+
         for _ in range(num_warmup):
             _check(hip.hipModuleLaunchKernel(
                 func,
-                grid_m, grid_n, 1,
+                launch_grid_x, launch_grid_y, 1,
                 block_size, 1, 1,
                 lds_size, None,
                 args, None,
@@ -628,7 +644,7 @@ class GemmLauncher:
         for _ in range(num_iters):
             _check(hip.hipModuleLaunchKernel(
                 func,
-                grid_m, grid_n, 1,
+                launch_grid_x, launch_grid_y, 1,
                 block_size, 1, 1,
                 lds_size, None,
                 args, None,
