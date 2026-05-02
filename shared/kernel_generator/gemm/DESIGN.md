@@ -132,7 +132,7 @@ from kernel_generator.gemm.kernel import GemmKernel
 
 # FP16
 p = GemmProblem(4096, 4096, 4096)
-k = GemmKernel.build(p, scheduled=True)
+k = GemmKernel.build(p)
 asm = k.emit()
 co = asm.assemble()
 
@@ -140,7 +140,7 @@ co = asm.assemble()
 mx = MfmaConfig.mxfp4_16x16x128()
 t = GemmTiling.high_perf(wg_m=256, wg_n=256, unroll_k=256, mfma=mx)
 p = GemmProblem(4096, 4096, 4096, dtype=DataType.MXFP4)
-k = GemmKernel.build(p, tiling=t, scheduled=True)
+k = GemmKernel.build(p, tiling=t)
 asm = k.emit()
 co = asm.assemble()
 ```

@@ -12,7 +12,6 @@ from .kernel import GemmKernel
 
 def generate_custom_kernel(
     wg_m: int = 256, wg_n: int = 256, unroll_k: int = 256,
-    scheduled: bool = True,
     kernel_name: str = None,
 ) -> str:
     """Generate a TensileLite custom kernel .s file contents.
@@ -26,10 +25,7 @@ def generate_custom_kernel(
     # Use a large problem for codegen (actual size comes from TensileLite at runtime)
     p = GemmProblem(4096, 4096, 4096, dtype=DataType.MXFP4)
 
-    if scheduled:
-        k = GemmKernel.build(p, tiling=t, scheduled=True)
-    else:
-        k = GemmKernel.build(p, tiling=t, scheduled=True)
+    k = GemmKernel.build(p, tiling=t)
 
     # Force 1D grid + column-major store for TensileLite compatibility
     k.use_1d_grid = True

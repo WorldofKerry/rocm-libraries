@@ -28,7 +28,7 @@ from ..problem import GemmProblem, MfmaConfig, TileConfig
 from ..tile.tree import TileLevel, TilePhase
 
 __all__ = ["phase_mx_scale_setup", "phase_dtl_interleaved_setup",
-           "phase_wave_abi_setup", "WAVE_ABI_PROLOGUE_PHASES"]
+           "phase_wave_abi_setup"]
 
 
 def _tile(ctx: AsmContext) -> TileConfig: return ctx._metadata["tile"]
@@ -734,25 +734,7 @@ def _emit_dtl_loads_b(ctx: AsmContext, tile: TileConfig, problem: GemmProblem, n
 # MX scale setup (moved from partitioned.py)
 # ---------------------------------------------------------------------------
 
-def _scale_lds_offset_a(tile: TileConfig) -> int:
-    """LDS byte offset where ScaleA region starts (within one half-buffer)."""
-    elem = tile.mfma.element_bytes
-    data_a = int(tile.wg_m * tile.unroll_k * elem)
-    data_b = int(tile.wg_n * tile.unroll_k * elem)
-    return data_a + data_b
 
-
-def _scale_lds_offset_b(tile: TileConfig) -> int:
-    """LDS byte offset where ScaleB region starts (within one half-buffer)."""
-    mx_block = tile.mfma.mx_block
-    scale_a_bytes = tile.wg_m * (tile.unroll_k // mx_block)
-    return _scale_lds_offset_a(tile) + scale_a_bytes
-
-
-def _scale_region_bytes(tile: TileConfig, dim_size: int) -> int:
-    """Bytes for one scale tensor region (e.g. ScaleA or ScaleB) per half."""
-    mx_block = tile.mfma.mx_block
-    return dim_size * (tile.unroll_k // mx_block)
 
 
 def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
@@ -910,6 +892,3 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
         ctx.raw("")
 
 
-WAVE_ABI_PROLOGUE_PHASES = [
-    TilePhase("wave_abi_setup", phase_wave_abi_setup),
-]

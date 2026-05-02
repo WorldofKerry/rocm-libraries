@@ -17,21 +17,14 @@ Three concrete strategies:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Dict, List
+from typing import Dict
 
-from ..schedule.slot_placer import PlacedOp, Path, SlotPlacer
 from ..emit.context import AsmContext
 from ..problem import TileConfig, MfmaConfig
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .global_loader import GlobalLoader
-from ..schedule.data_stream import (
-    PrefetchOp,
-    build_prefetch_path,
-    compute_register_last_use,
-    place_prefetch_path,
-)
 
 __all__ = [
     "ScaleLoader",
@@ -67,14 +60,6 @@ class ScaleLoader(ABC):
     def advance(self) -> None:
         """Advance scale SRDs by one K-step."""
 
-    @abstractmethod
-    def make_prefetch_ops(self, all_mfma_ops: list, partition_m: int, nr: int) -> tuple:
-        """Return list of ``PlacedOp`` s for cross-iteration scale prefetch."""
-
-    @abstractmethod
-    def make_subtile_prefetch_paths(self, partition_m: int, num_subtiles: int) -> List[Path]:
-        """Return list of ``Path`` s for subtile-level scale_a prefetch."""
-
     @property
     @abstractmethod
     def scale_names_a(self) -> dict:
@@ -107,12 +92,6 @@ class NullScaleLoader(ScaleLoader):
 
     def advance(self) -> None:
         pass
-
-    def make_prefetch_ops(self, all_mfma_ops: list, partition_m: int, nr: int) -> list:
-        return []
-
-    def make_subtile_prefetch_paths(self, partition_m: int, num_subtiles: int) -> list:
-        return []
 
     @property
     def scale_names_a(self) -> dict:
@@ -149,11 +128,6 @@ class NullScaleLoader(ScaleLoader):
 
     def emit_mfma(self, ctx: AsmContext, mfma: MfmaConfig, acc: str, a_reg: str, b_reg: str, mi: int, ni: int, ki: int) -> None:
         pass
-
-    def place_cross_iter_prefetch(self, placer: SlotPlacer, all_mfma_ops: list,
-                                  partition_m: int, nr: int) -> None:
-        pass
-
 
 # VMEM (buffer_load_dword) implementation
 # ---------------------------------------------------------------------------
@@ -400,141 +374,6 @@ class VMEMScaleLoader(ScaleLoader):
             ctx.inst("s_addc_u32", ctx.sreg(srd_name, 1, 1),
                      ctx.sreg(srd_name, 1, 1), "0", comment="carry")
 
-    # -- cross-iteration prefetch -------------------------------------------
-
-    def make_prefetch_ops(self, all_mfma_ops: list, partition_m: int, nr: int) -> tuple:
-        """Build ``PrefetchOp`` list and a ``Path`` for cross-iteration prefetch.
-
-        Linear mode only.  After each scale register's last MFMA consumer
-        in the current iteration, we issue a ``buffer_load_dword`` that
-        loads the *next* iteration's scale into the same VGPR.  The SRD
-        advance is bundled as the first op in the returned path.
-
-        Returns:
-            Tuple ``(prefetch_loads, path)`` where *prefetch_loads* is a
-            list of ``PrefetchOp`` and *path* is a ``Path`` ready for
-            ``place_prefetch_path``.  Returns ``([], None)`` for swizzled
-            mode.
-        """
-        if self._swizzled:
-            return ([], None)
-
-        ctx = self._ctx
-
-        ki_count = self._ki_count
-        ki_bytes = self._mfma.k // self._mx_block
-
-        # Determine last-use slot for each scale register
-        scale_reg_names: List[str] = []
-        for mi_ in range(partition_m):
-            for ki_ in range(ki_count):
-                scale_reg_names.append(f"v_scale_a_m{mi_}k{ki_}")
-        for ni_ in range(nr):
-            for ki_ in range(ki_count):
-                scale_reg_names.append(f"v_scale_b_n{ni_}k{ki_}")
-
-        last_use = compute_register_last_use(all_mfma_ops, scale_reg_names)
-
-        prefetch_loads: List[PrefetchOp] = []
-
-        for mi_ in range(partition_m):
-            for ki_ in range(ki_count):
-                reg = f"v_scale_a_m{mi_}k{ki_}"
-                off = ki_ * ki_bytes
-                off_str = f" offset:{off}" if off > 0 else ""
-
-                def _mk_pf_a(m: int = mi_, k: int = ki_, o: str = off_str) -> object:
-                    def emit() -> None:
-                        soff = "0" if m == 0 else ctx.sreg(f"s_soff_sa_{m}")
-                        ctx.inst("buffer_load_dword",
-                                 ctx.vreg(f"v_scale_a_m{m}k{k}"),
-                                 ctx.vreg("v_dtl_off_scale_a"),
-                                 ctx.sreg("s_srd_scale_a", 0, 4),
-                                 soff, f"offen{o}",
-                                 comment=f"scale A mi={m} ki={k} (next K)")
-                    return emit
-
-                prefetch_loads.append(PrefetchOp(
-                    reg_name=reg, emit_fn=_mk_pf_a(),
-                    earliest_slot=last_use.get(reg, 0)))
-
-        for ni_ in range(nr):
-            for ki_ in range(ki_count):
-                reg = f"v_scale_b_n{ni_}k{ki_}"
-                off = ki_ * ki_bytes
-                off_str = f" offset:{off}" if off > 0 else ""
-
-                def _mk_pf_b(n: int = ni_, k: int = ki_, o: str = off_str) -> object:
-                    def emit() -> None:
-                        soff = "0" if n == 0 else ctx.sreg(f"s_soff_sb_{n}")
-                        ctx.inst("buffer_load_dword",
-                                 ctx.vreg(f"v_scale_b_n{n}k{k}"),
-                                 ctx.vreg("v_dtl_off_scale_b"),
-                                 ctx.sreg("s_srd_scale_b", 0, 4),
-                                 soff, f"offen{o}",
-                                 comment=f"scale B ni={n} ki={k} (next K)")
-                    return emit
-
-                prefetch_loads.append(PrefetchOp(
-                    reg_name=reg, emit_fn=_mk_pf_b(),
-                    earliest_slot=last_use.get(reg, 0)))
-
-        pf_path = build_prefetch_path(
-            all_mfma_ops, prefetch_loads,
-            srd_advance_fn=self.advance)
-
-        return (prefetch_loads, pf_path)
-
-    # -- subtile prefetch paths ---------------------------------------------
-
-    def make_subtile_prefetch_paths(self, partition_m: int, num_subtiles: int) -> List[Path]:
-        """Build ``Path`` list for subtile-level scale_a prefetch.
-
-        During subtile *N* 's MFMAs we issue ``buffer_load_dword`` for
-        subtile *N+1* 's scale_a values.  This hides the global memory
-        latency behind compute.
-
-        Returns:
-            List of ``Path`` objects, one per prefetch window (length =
-            ``num_subtiles - 1``).  Empty list for swizzled mode.
-        """
-        if self._swizzled:
-            return []
-
-        ctx = self._ctx
-        paths: List[Path] = []
-
-        ki_count = self._ki_count
-        ki_bytes = self._mfma.k // self._mx_block
-
-        for st in range(num_subtiles - 1):
-            path_ops: List[PlacedOp] = []
-            for mi_in_st in range(partition_m):
-                target_mi = (st + 1) * partition_m + mi_in_st
-                for ki_ in range(ki_count):
-                    off = ki_ * ki_bytes
-                    off_str = f" offset:{off}" if off > 0 else ""
-
-                    def _mk_scale_load(mi_: int = target_mi, k: int = ki_, o: str = off_str) -> object:
-                        def emit() -> None:
-                            soff = ("0" if mi_ == 0
-                                    else ctx.sreg(f"s_soff_sa_{mi_}"))
-                            ctx.inst("buffer_load_dword",
-                                     ctx.vreg(f"v_scale_a_m{mi_}k{k}"),
-                                     ctx.vreg("v_dtl_off_scale_a"),
-                                     ctx.sreg("s_srd_scale_a", 0, 4),
-                                     soff, f"offen{o}",
-                                     comment=f"scale A mi={mi_} ki={k} (pf)")
-                        return emit
-
-                    path_ops.append(PlacedOp(
-                        emit_fn=_mk_scale_load(), op_type="buffer_load",
-                        comment=f"scale_a m{target_mi}k{ki_}"))
-            paths.append(Path(ops=path_ops, reverse=False,
-                              module_id=100 + st))
-
-        return paths
-
     # -- composable K-loop integration -------------------------------------
 
     @property
@@ -614,15 +453,3 @@ class VMEMScaleLoader(ScaleLoader):
                      ctx.vreg(sa_name), ctx.vreg(sb_name),
                      f"cbsz:{mfma.cbsz} blgp:{mfma.blgp}",
                      comment=f"MFMA m{mi}_n{ni}_k{ki}")
-
-    def place_cross_iter_prefetch(self, placer: SlotPlacer, all_mfma_ops: list,
-                                  partition_m: int, nr: int) -> None:
-        """Place cross-iteration prefetch ops into the SlotPlacer schedule."""
-        if self._swizzled:
-            return
-
-        prefetch_loads, pf_path = self.make_prefetch_ops(
-            all_mfma_ops, partition_m, nr)
-        if pf_path is not None:
-            place_prefetch_path(placer, pf_path, all_mfma_ops,
-                                prefetch_loads)

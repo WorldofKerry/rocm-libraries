@@ -342,9 +342,7 @@ class GemmTiling:
             lds_pad=self.lds_pad, lds_swizzle=self.lds_swizzle, swizzle=self.swizzle,
         )
 
-    def build_tile_tree(self, wave_abi: bool = False,
-                       composable: bool = False,
-                       scheduled: bool = False) -> TileLevel:
+    def build_tile_tree(self, wave_abi: bool = False) -> TileLevel:
         """Build the full tile tree with phases from TileDim chains.
 
         The chain structure determines the tree levels:
@@ -375,21 +373,18 @@ class GemmTiling:
             emit=_noop_wave_emit)
 
         # Workgroup: setup + K-loop structure + store
+        from .schedule.kloop_scheduler import scheduled_kloop_phase
+        from .tile.tree import TilePhase
+
         if wave_abi:
-            from .kloop.setup import WAVE_ABI_PROLOGUE_PHASES, phase_mx_scale_setup
-            from .schedule.kloop_scheduler import scheduled_kloop_phase
-            from .tile.tree import TilePhase
+            from .kloop.setup import phase_wave_abi_setup, phase_mx_scale_setup
             wg_pro = [
-                TilePhase("wave_abi_setup", WAVE_ABI_PROLOGUE_PHASES[0].emit),
+                TilePhase("wave_abi_setup", phase_wave_abi_setup),
                 TilePhase("mx_scale_setup", phase_mx_scale_setup),
                 TilePhase("scheduled_k_loop", scheduled_kloop_phase),
             ]
-
         else:
-            # Default / scheduled / composable: use scheduled K-loop
             from .kloop.setup import phase_dtl_interleaved_setup, phase_mx_scale_setup
-            from .schedule.kloop_scheduler import scheduled_kloop_phase
-            from .tile.tree import TilePhase
             wg_pro = [
                 TilePhase("dtl_setup", phase_dtl_interleaved_setup),
                 TilePhase("mx_scale_setup", phase_mx_scale_setup),

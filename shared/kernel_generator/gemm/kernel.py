@@ -13,7 +13,7 @@ Usage::
     co = result.assemble()
 
     # Scheduled K-loop (default, production path)
-    kernel = GemmKernel.build(problem, scheduled=True)
+    kernel = GemmKernel.build(problem)
 """
 from __future__ import annotations
 
@@ -122,8 +122,6 @@ class GemmKernel:
               tile_tree: Optional[TileLevel] = None,
               tiling: Optional[GemmTiling] = None,
               wave_abi: bool = False,
-              composable: bool = False,
-              scheduled: bool = True,
               use_dtl: bool = True) -> GemmKernel:
         """Build a GemmKernel.  GemmTiling is the source of truth.
 
@@ -139,7 +137,7 @@ class GemmKernel:
             if tile is not None:
                 tiling = GemmTiling.from_tile_config(tile)
             else:
-                if (wave_abi or composable or scheduled) and use_dtl:
+                if use_dtl:
                     tiling = GemmTiling.high_perf(
                         wg_m=256, wg_n=256, unroll_k=64)
                 else:
@@ -154,9 +152,7 @@ class GemmKernel:
         # Tree comes from tiling (unless explicitly overridden)
         if tile_tree is None:
             tile_tree = tiling.build_tile_tree(
-                wave_abi=wave_abi,
-                composable=composable,
-                scheduled=scheduled or composable)
+                wave_abi=wave_abi)
 
         tile_tree.validate()
 

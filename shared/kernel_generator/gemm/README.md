@@ -20,7 +20,7 @@ PYTHONPATH=shared python3 -c "
 from kernel_generator.gemm.problem import GemmProblem
 from kernel_generator.gemm.kernel import GemmKernel
 
-k = GemmKernel.build(GemmProblem(4096, 4096, 4096), scheduled=True)
+k = GemmKernel.build(GemmProblem(4096, 4096, 4096))
 result = k.emit()
 co = result.assemble()
 print(f'Code object: {co}')
@@ -35,7 +35,7 @@ from kernel_generator.gemm.kernel import GemmKernel
 from kernel_generator.gemm.launcher import GemmLauncher
 
 p = GemmProblem(4096, 4096, 4096)
-k = GemmKernel.build(p, scheduled=True)
+k = GemmKernel.build(p)
 co = k.emit().assemble()
 
 launcher = GemmLauncher(p, k.tile, seed=42)
@@ -56,7 +56,7 @@ mx = MfmaConfig.mxfp4_16x16x128()
 t = GemmTiling.high_perf(wg_m=256, wg_n=256, unroll_k=256, mfma=mx,
                           lds_swizzle=True)
 p = GemmProblem(4096, 4096, 4096, dtype=DataType.MXFP4)
-k = GemmKernel.build(p, tiling=t, scheduled=True)
+k = GemmKernel.build(p, tiling=t)
 co = k.emit().assemble()
 ```
 

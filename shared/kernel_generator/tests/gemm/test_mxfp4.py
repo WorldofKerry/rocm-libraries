@@ -95,7 +95,7 @@ class TestMXFP4Kernel:
         tiling = GemmTiling.mxfp4_standard()
         problem = GemmProblem(128, 128, 256, dtype=DataType.MXFP4)
         return GemmKernel.build(
-            problem, tiling=tiling, composable=True)
+            problem, tiling=tiling)
 
     def test_kernel_builds(self):
         kernel = self._build_mxfp4_kernel()
@@ -172,8 +172,7 @@ class TestMXFP4Kernel:
         """Existing fp16 composable path still works."""
         tiling = GemmTiling.high_perf(wg_m=128, wg_n=128, unroll_k=64)
         problem = GemmProblem(128, 128, 64)
-        kernel = GemmKernel.build(problem, tiling=tiling,
-                                  composable=True)
+        kernel = GemmKernel.build(problem, tiling=tiling)
         result = kernel.emit()
         mfma_lines = [l for l in result.ctx.lines
                       if 'v_mfma_f32_16x16x32_f16' in l]
@@ -239,8 +238,7 @@ class TestMXFP4GPU:
         """Build an MXFP4 kernel, emit assembly, assemble to code object."""
         tiling = GemmTiling.mxfp4_standard()
         problem = GemmProblem(m, n, k, dtype=DataType.MXFP4)
-        kernel = GemmKernel.build(problem, tiling=tiling,
-                                  composable=True)
+        kernel = GemmKernel.build(problem, tiling=tiling)
         result = kernel.emit()
         co_path = result.assemble(output_path=output_path)
         return kernel, co_path
@@ -398,9 +396,7 @@ class TestMXFP4RealScales:
     def _build_real_scales(m, n, k, output_path):
         tiling = GemmTiling.mxfp4_standard()
         problem = GemmProblem(m, n, k, dtype=DataType.MXFP4)
-        kernel = GemmKernel.build(problem, tiling=tiling,
-                                  composable=True,
-                                  )
+        kernel = GemmKernel.build(problem, tiling=tiling)
         result = kernel.emit()
         co_path = result.assemble(output_path=output_path)
         return kernel, co_path
@@ -539,7 +535,7 @@ class TestScheduledMXFP4Kernel:
         tiling = GemmTiling.mxfp4_standard()
         problem = GemmProblem(128, 128, 256, dtype=DataType.MXFP4)
         return GemmKernel.build(
-            problem, tiling=tiling, scheduled=True)
+            problem, tiling=tiling)
 
     def test_kernel_builds(self):
         kernel = self._build_mxfp4_kernel()
@@ -563,10 +559,10 @@ class TestScheduledMXFP4Kernel:
         tiling = GemmTiling.mxfp4_standard()
         problem = GemmProblem(128, 128, 256, dtype=DataType.MXFP4)
 
-        k_man = GemmKernel.build(problem, tiling=tiling, composable=True)
+        k_man = GemmKernel.build(problem, tiling=tiling)
         r_man = k_man.emit()
 
-        k_sch = GemmKernel.build(problem, tiling=tiling, scheduled=True)
+        k_sch = GemmKernel.build(problem, tiling=tiling)
         r_sch = k_sch.emit()
 
         def count_mfma(r):

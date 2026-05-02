@@ -155,12 +155,12 @@ class TestGPUCorrectness:
         (1024, 1024, 1024),
     ])
     def test_square(self, M, N, K):
-        D_gpu, D_ref = _run_variant(M, N, K, scheduled=True)
+        D_gpu, D_ref = _run_variant(M, N, K)
         assert np.allclose(D_gpu, D_ref, atol=1.0, rtol=0.05), \
             f"Max error: {np.max(np.abs(D_gpu.astype(np.float32) - D_ref.astype(np.float32)))}"
 
     def test_large(self):
-        D_gpu, D_ref = _run_variant(4096, 4096, 4096, scheduled=True)
+        D_gpu, D_ref = _run_variant(4096, 4096, 4096)
         assert np.allclose(D_gpu, D_ref, atol=1.0, rtol=0.05)
 
     def test_identity(self):
@@ -305,7 +305,7 @@ class TestScheduledKernelGPU:
         (1024, 1024, 1024),
     ])
     def test_scheduled_correct(self, M, N, K):
-        D_gpu, D_ref = _run_variant(M, N, K, scheduled=True)
+        D_gpu, D_ref = _run_variant(M, N, K)
         max_err = np.max(np.abs(D_gpu.astype(np.float32) - D_ref.astype(np.float32)))
         assert max_err < 1.0, \
             f"scheduled {M}x{N}x{K}: max_err={max_err}"
@@ -377,7 +377,7 @@ class TestBaselineKernel:
         (512, 512, 512),
     ])
     def test_correct(self, M, N, K):
-        D_gpu, D_ref = _run_variant(M, N, K, scheduled=True)
+        D_gpu, D_ref = _run_variant(M, N, K)
         max_err = np.max(np.abs(D_gpu.astype(np.float32)
                                 - D_ref.astype(np.float32)))
         assert max_err < 1.0, f"Scheduled {M}x{N}x{K}: max_err={max_err}"
@@ -394,7 +394,7 @@ class TestComposablePartitionedKernel:
         (4096, 4096, 4096),
     ])
     def test_correct(self, M, N, K):
-        D_gpu, D_ref = _run_variant(M, N, K, composable=True)
+        D_gpu, D_ref = _run_variant(M, N, K)
         max_err = np.max(np.abs(D_gpu.astype(np.float32)
                                 - D_ref.astype(np.float32)))
         assert max_err < 0.001, \
@@ -403,7 +403,7 @@ class TestComposablePartitionedKernel:
     def test_emit_structure(self):
         """Verify the kernel uses the expected tile config."""
         problem = GemmProblem(m=4096, n=4096, k=4096)
-        kernel = GemmKernel.build(problem, composable=True)
+        kernel = GemmKernel.build(problem)
         assert kernel.tile.wg_m == 256
         assert kernel.tile.wg_n == 256
         assert kernel.tile.unroll_k == 64
@@ -418,7 +418,7 @@ class TestSmallBaseline:
     """Scheduled kernel at the smallest valid tile size (256x256x64)."""
 
     def test_correct(self):
-        D_gpu, D_ref = _run_variant(256, 256, 64, scheduled=True)
+        D_gpu, D_ref = _run_variant(256, 256, 64)
         max_err = np.max(np.abs(D_gpu.astype(np.float32)
                                 - D_ref.astype(np.float32)))
         assert max_err < 1.0, f"Small scheduled: max_err={max_err}"
@@ -433,7 +433,7 @@ class TestComposableKernel:
         (256, 256, 128),
     ])
     def test_correct(self, M, N, K):
-        D_gpu, D_ref = _run_variant(M, N, K, composable=True)
+        D_gpu, D_ref = _run_variant(M, N, K)
         max_err = np.max(np.abs(D_gpu.astype(np.float32)
                                 - D_ref.astype(np.float32)))
         assert max_err < 0.001, \
@@ -451,7 +451,7 @@ class TestScheduledKernel:
         (4096, 4096, 4096),
     ])
     def test_correct(self, M, N, K):
-        D_gpu, D_ref = _run_variant(M, N, K, scheduled=True)
+        D_gpu, D_ref = _run_variant(M, N, K)
         max_err = np.max(np.abs(D_gpu.astype(np.float32)
                                 - D_ref.astype(np.float32)))
         assert max_err < 0.001, \
@@ -460,7 +460,7 @@ class TestScheduledKernel:
     def test_emit_structure(self):
         """Verify the kernel uses the expected tile config."""
         problem = GemmProblem(m=4096, n=4096, k=4096)
-        kernel = GemmKernel.build(problem, scheduled=True)
+        kernel = GemmKernel.build(problem)
         assert kernel.tile.wg_m == 256
         assert kernel.tile.wg_n == 256
         assert kernel.tile.unroll_k == 64

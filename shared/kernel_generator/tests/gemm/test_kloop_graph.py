@@ -574,10 +574,10 @@ class TestScheduledVsManual:
 
         problem = kwargs.pop("problem", GemmProblem(256, 256, 64))
 
-        k_manual = GemmKernel.build(problem, composable=True, **kwargs)
+        k_manual = GemmKernel.build(problem, **kwargs)
         r_manual = k_manual.emit()
 
-        k_sched = GemmKernel.build(problem, scheduled=True, **kwargs)
+        k_sched = GemmKernel.build(problem, **kwargs)
         r_sched = k_sched.emit()
 
         return r_manual, r_sched
@@ -640,7 +640,7 @@ class TestScheduledVsManual:
         import os, tempfile
         from kernel_generator.gemm.kernel import GemmKernel
         problem = GemmProblem(256, 256, 64)
-        k = GemmKernel.build(problem, scheduled=True)
+        k = GemmKernel.build(problem)
         result = k.emit()
         with tempfile.TemporaryDirectory() as d:
             co = result.assemble(output_path=os.path.join(d, "test.co"))
@@ -658,7 +658,7 @@ class TestScheduledMXFP4:
         tiling = GemmTiling.high_perf(
             wg_m=256, wg_n=256, unroll_k=256, mfma=mx)
         problem = GemmProblem(256, 256, 256, dtype=DataType.MXFP4)
-        k = GemmKernel.build(problem, tiling=tiling, scheduled=True)
+        k = GemmKernel.build(problem, tiling=tiling)
         result = k.emit()
         # Should have MFMAs
         mfma_count = sum(1 for l in result.ctx.lines
@@ -676,10 +676,10 @@ class TestScheduledMXFP4:
             wg_m=256, wg_n=256, unroll_k=256, mfma=mx)
         problem = GemmProblem(256, 256, 256, dtype=DataType.MXFP4)
 
-        k_man = GemmKernel.build(problem, tiling=tiling, composable=True)
+        k_man = GemmKernel.build(problem, tiling=tiling)
         r_man = k_man.emit()
 
-        k_sch = GemmKernel.build(problem, tiling=tiling, scheduled=True)
+        k_sch = GemmKernel.build(problem, tiling=tiling)
         r_sch = k_sch.emit()
 
         def count(r, pat):
@@ -695,7 +695,7 @@ class TestScheduledMXFP4:
         tiling = GemmTiling.high_perf(
             wg_m=256, wg_n=256, unroll_k=256, mfma=mx)
         problem = GemmProblem(256, 256, 256, dtype=DataType.MXFP4)
-        k = GemmKernel.build(problem, tiling=tiling, scheduled=True)
+        k = GemmKernel.build(problem, tiling=tiling)
         result = k.emit()
         with tempfile.TemporaryDirectory() as d:
             co = result.assemble(output_path=os.path.join(d, "mxfp4.co"))

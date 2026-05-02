@@ -6,7 +6,6 @@ and ping-pong A buffer management.
 """
 from __future__ import annotations
 
-from ..schedule.slot_placer import PlacedOp
 from ..emit.context import AsmContext
 from ..problem import GemmProblem, MfmaConfig, TileConfig
 
@@ -186,41 +185,6 @@ class LDSReader:
                              ctx.vreg(f"v_lds_rd_{matrix}_k{ki}"),
                              ctx.vreg(base_name), str(xor_bytes),
                              comment=f"rd_{matrix}_k{ki} = rd_{matrix} ^ {xor_bytes}")
-
-    def make_lr_ops(self, mi: int) -> list:
-        """Return PlacedOps for A-prefetch reads for mi+1.
-
-        These are ds_reads that load the NEXT mi's A data into the
-        alternate ping-pong buffer while the current mi computes.
-        """
-        if mi >= self.mr - 1:
-            return []
-        next_buf = (mi + 1) % 2
-        ops = []
-        for ki in range(self.ki_count):
-            def _mk(mi_: int = mi + 1, ki_: int = ki, buf_: int = next_buf) -> object:
-                def emit() -> None:
-                    self.emit_read_a(mi_, ki_, buf_)
-                return emit
-            ops.append(PlacedOp(
-                emit_fn=_mk(), op_type="ds_read",
-                comment=f"A m{mi+1}k{ki}"))
-        return ops
-
-    def make_suffix_ops(self) -> list:
-        """Return PlacedOps for LDS toggle at end of iteration."""
-        ops = [
-            PlacedOp(
-                emit_fn=lambda: self.toggle_read(),
-                op_type="salu", comment="toggle_rd_a_b"),
-            PlacedOp(
-                emit_fn=lambda: self.ctx.inst(
-                    "s_sub_u32", self.ctx.sreg("s_lds_db_step"),
-                    "0", self.ctx.sreg("s_lds_db_step"),
-                    comment="negate db"),
-                op_type="salu", comment="negate_db"),
-        ]
-        return ops
 
     def _emit_swizzled_ds_read(self, dst: str, base_reg: str, offset: int, ki: int, width: int, comment: str) -> None:
         """Emit ds_read using per-ki base VGPR when swizzle is active."""
