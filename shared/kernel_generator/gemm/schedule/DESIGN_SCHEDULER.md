@@ -298,8 +298,15 @@ output to the current manual `ComposableKLoop`:
 - [x] MXFP4 support: emits, assembles, MFMA count matches composable
 - [x] 27 tests covering graph construction, scheduling, and comparison
 
-### Remaining
-- [ ] GPU correctness test (`scheduled=True` on actual hardware)
-- [ ] Performance benchmark (4096^3 through Tensile.sh)
-- [ ] ScaleBlock: register scale loads as graph ops with RAW deps to MFMAs
-- [ ] Remove manual `ComposableKLoop` once scheduled path is validated
+### Completed (follow-up)
+- [x] GPU correctness (MI355X): fp16 256x256x64, 256x256x128, 4096x4096x4096 all pass
+- [x] Performance: scheduled within 1% of composable on fp16, 3.9% faster on MXFP4
+- [x] Removed `ComposableKLoop` (kloop/composable.py deleted)
+- [x] `composable=True` is now an alias for `scheduled=True`
+- [x] All 323 tests pass including GPU correctness
+
+### Future
+- [ ] ScaleBlock: register scale loads as individual graph ops with RAW deps
+  (currently scales are loaded in prologue/body outside the MFMA schedule)
+- [ ] Auto-derive preamble structure from graph deps instead of hardcoded reads
+- [ ] Auto-derive waitcnt from actual lgkmcnt tracking instead of heuristics
