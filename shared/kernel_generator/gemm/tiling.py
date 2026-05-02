@@ -373,7 +373,7 @@ class GemmTiling:
             emit=_noop_wave_emit)
 
         # Workgroup: setup + K-loop structure + store
-        from .schedule.kloop_scheduler import scheduled_kloop_phase
+        from .schedule.pipeline import pipeline_kloop_phase
         from .tile.tree import TilePhase
 
         if wave_abi:
@@ -381,14 +381,14 @@ class GemmTiling:
             wg_pro = [
                 TilePhase("wave_abi_setup", phase_wave_abi_setup),
                 TilePhase("mx_scale_setup", phase_mx_scale_setup),
-                TilePhase("scheduled_k_loop", scheduled_kloop_phase),
+                TilePhase("scheduled_k_loop", pipeline_kloop_phase),
             ]
         else:
             from .kloop.setup import phase_dtl_interleaved_setup, phase_mx_scale_setup
             wg_pro = [
                 TilePhase("dtl_setup", phase_dtl_interleaved_setup),
                 TilePhase("mx_scale_setup", phase_mx_scale_setup),
-                TilePhase("scheduled_k_loop", scheduled_kloop_phase),
+                TilePhase("scheduled_k_loop", pipeline_kloop_phase),
             ]
 
         workgroup_level = TileLevel(
