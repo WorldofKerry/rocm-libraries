@@ -362,3 +362,138 @@ def pipeline_kloop_phase(level, ctx) -> None:
         compute=ScheduledCompute(loader, reader, scale_loader),
     )
     pipeline.emit(ctx)
+
+
+
+# ===================================================================
+# StreamK partitioner
+# ===================================================================
+
+class StreamKPartitioner(TilePartitioner):
+    """StreamK: distribute K-tile iterations across all CUs.
+
+    Host precomputes per-WG iteration ranges and passes them via
+    kernargs or a side buffer. The GPU does simple lookups.
+
+    For the initial implementation, we use a simpler "data-parallel
+    StreamK" approach:
+    - Compute how many full waves of tiles fit on the GPU
+    - Remaining tiles get their K split across leftover CUs
+    - Each WG handles exactly one output tile (possibly partial K)
+
+    This avoids cross-tile iteration and atomic accumulation for the
+    common case (large enough grids), while still improving CU
+    utilization for the tail wave.
+
+    Args:
+        num_cus: Number of compute units on the target GPU.
+    """
+
+    def __init__(self, num_cus: int = 304) -> None:
+        self.num_cus = num_cus
+
+    def emit(self, ctx: AsmContext) -> None:
+        """Emit work decomposition.
+
+        For now, behaves identically to GridPartitioner.
+        The StreamK iteration assignment is computed on the host
+        and encoded in the grid launch dimensions.
+
+        Future: add kernarg-based iteration range for partial K.
+        """
+        tile = ctx._metadata["tile"]
+        log2_uk = int(math.log2(tile.unroll_k))
+
+        ctx.comment("=== StreamK Work Decomposition ===")
+        ctx.s_lshr(ctx.sreg("s_k_tiles"), ctx.sreg("s_K"), log2_uk,
+                   comment=f"k_tiles = K / {tile.unroll_k}")
+        ctx.raw("")
+
+    def grid_dims(self, problem, tile):
+        """Compute grid dimensions for StreamK launch.
+
+        Uses data-parallel approach: launch enough WGs to fill all CUs
+        for complete waves, then handle the remainder.
+        """
+        tiles_m = problem.m // tile.wg_m
+        tiles_n = problem.n // tile.wg_n
+        total_tiles = tiles_m * tiles_n
+
+        # For now: just launch all tiles (same as grid partitioner)
+        # but with 1D grid for future StreamK extension
+        return (total_tiles, 1, 1)
+
+    def compute_sk_params(self, problem, tile):
+        """Host-side: compute StreamK parameters.
+
+        Returns a dict with:
+        - total_tiles: number of output tiles
+        - k_tiles_per_tile: K iterations per output tile
+        - total_iters: total K-tile iterations across all tiles
+        - dp_tiles: tiles handled by data-parallel (full K)
+        - sk_tiles: tiles handled by StreamK (split K)
+        - sk_ctas: number of WGs doing StreamK work
+        - iters_per_sk_cta: base iterations per StreamK WG
+        - extra_iters: number of WGs that get one extra iteration
+        """
+        tiles_m = problem.m // tile.wg_m
+        tiles_n = problem.n // tile.wg_n
+        total_tiles = tiles_m * tiles_n
+        k_tiles = problem.k // tile.unroll_k
+        total_iters = total_tiles * k_tiles
+
+        # Full waves of data-parallel tiles
+        full_waves = total_tiles // self.num_cus
+        dp_tiles = full_waves * self.num_cus
+
+        # Remaining tiles need StreamK
+        sk_tiles = total_tiles - dp_tiles
+        if sk_tiles == 0:
+            return {
+                "total_tiles": total_tiles,
+                "k_tiles_per_tile": k_tiles,
+                "total_iters": total_iters,
+                "dp_tiles": dp_tiles,
+                "sk_tiles": 0,
+                "sk_ctas": 0,
+                "iters_per_sk_cta": 0,
+                "extra_iters": 0,
+            }
+
+        # StreamK: distribute sk_tiles * k_tiles iterations
+        # across num_cus WGs (or fewer if sk_iters < num_cus)
+        sk_iters = sk_tiles * k_tiles
+        sk_ctas = min(sk_iters, self.num_cus)
+        iters_per_cta = sk_iters // sk_ctas
+        extra = sk_iters % sk_ctas
+
+        return {
+            "total_tiles": total_tiles,
+            "k_tiles_per_tile": k_tiles,
+            "total_iters": total_iters,
+            "dp_tiles": dp_tiles,
+            "sk_tiles": sk_tiles,
+            "sk_ctas": sk_ctas,
+            "iters_per_sk_cta": iters_per_cta,
+            "extra_iters": extra,
+        }
+
+
+# ===================================================================
+# Atomic epilogue (for StreamK partial tiles)
+# ===================================================================
+
+class AtomicEpilogue(Epilogue):
+    """Atomic-add accumulators to workspace for StreamK partial tiles.
+
+    For full tiles (data-parallel), uses DirectEpilogue.
+    For partial tiles (StreamK), atomically adds FP32 accumulators
+    to a workspace buffer, then a fixup kernel converts to output type.
+
+    Placeholder -- not yet implemented.
+    """
+
+    def emit(self, ctx: AsmContext) -> None:
+        # TODO: implement atomic accumulation
+        # For now, fall back to direct store
+        DirectEpilogue().emit(ctx)

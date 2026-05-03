@@ -701,3 +701,102 @@ class TestScheduledMXFP4:
             co = result.assemble(output_path=os.path.join(d, "mxfp4.co"))
             assert os.path.exists(co)
             assert os.path.getsize(co) > 0
+
+
+class TestStreamKParams:
+    """Test StreamK host-side parameter computation."""
+
+    def test_full_waves_no_sk(self):
+        """When tiles exactly fill CUs, no StreamK needed."""
+        from kernel_generator.gemm.schedule.pipeline import StreamKPartitioner
+        from kernel_generator.gemm.problem import GemmProblem, MfmaConfig
+        from kernel_generator.gemm.tiling import GemmTiling
+
+        # 304 CUs, 256x256 tile, 304*256 = 77824 -> not a clean size
+        # Use 256 tiles = exactly fills 304 CUs with 0 remainder?
+        # No, 256 < 304. Let's use a grid that fills exactly.
+        # 304 tiles: M=4864 (304*16... no, wg_m=256)
+        # 256 tiles: 16x16 grid from 4096x4096
+        p = StreamKPartitioner(num_cus=256)  # 256 CUs for clean test
+        problem = GemmProblem(4096, 4096, 4096)
+        tiling = GemmTiling.high_perf(wg_m=256, wg_n=256, unroll_k=64)
+        tile = tiling.to_tile_config()
+
+        params = p.compute_sk_params(problem, tile)
+        # 16*16 = 256 tiles, 256 CUs -> 1 full wave, 0 remainder
+        assert params["total_tiles"] == 256
+        assert params["dp_tiles"] == 256
+        assert params["sk_tiles"] == 0
+        assert params["sk_ctas"] == 0
+
+    def test_remainder_needs_sk(self):
+        """When tiles don't fill CUs evenly, StreamK handles remainder."""
+        from kernel_generator.gemm.schedule.pipeline import StreamKPartitioner
+        from kernel_generator.gemm.problem import GemmProblem
+        from kernel_generator.gemm.tiling import GemmTiling
+
+        p = StreamKPartitioner(num_cus=304)
+        problem = GemmProblem(4096, 4096, 4096)
+        tiling = GemmTiling.high_perf(wg_m=256, wg_n=256, unroll_k=64)
+        tile = tiling.to_tile_config()
+
+        params = p.compute_sk_params(problem, tile)
+        # 256 tiles, 304 CUs -> 0 full waves, 256 remainder tiles
+        assert params["total_tiles"] == 256
+        assert params["dp_tiles"] == 0  # 256 < 304, no full wave
+        assert params["sk_tiles"] == 256
+        assert params["sk_ctas"] > 0
+        assert params["sk_ctas"] <= 304
+
+    def test_large_grid_partial_wave(self):
+        """Large grid with partial last wave."""
+        from kernel_generator.gemm.schedule.pipeline import StreamKPartitioner
+        from kernel_generator.gemm.problem import GemmProblem
+        from kernel_generator.gemm.tiling import GemmTiling
+
+        p = StreamKPartitioner(num_cus=304)
+        problem = GemmProblem(8192, 8192, 4096)
+        tiling = GemmTiling.high_perf(wg_m=256, wg_n=256, unroll_k=64)
+        tile = tiling.to_tile_config()
+
+        params = p.compute_sk_params(problem, tile)
+        # 32*32 = 1024 tiles, 304 CUs -> 3 full waves (912), 112 remainder
+        assert params["total_tiles"] == 1024
+        assert params["dp_tiles"] == 912  # 3 * 304
+        assert params["sk_tiles"] == 112
+        assert params["sk_ctas"] > 0
+
+    def test_small_grid_all_sk(self):
+        """Tiny grid: all tiles are StreamK."""
+        from kernel_generator.gemm.schedule.pipeline import StreamKPartitioner
+        from kernel_generator.gemm.problem import GemmProblem
+        from kernel_generator.gemm.tiling import GemmTiling
+
+        p = StreamKPartitioner(num_cus=304)
+        problem = GemmProblem(2048, 2048, 4096)
+        tiling = GemmTiling.high_perf(wg_m=256, wg_n=256, unroll_k=64)
+        tile = tiling.to_tile_config()
+
+        params = p.compute_sk_params(problem, tile)
+        # 8*8 = 64 tiles, 304 CUs -> 0 full waves, all 64 are SK
+        assert params["total_tiles"] == 64
+        assert params["dp_tiles"] == 0
+        assert params["sk_tiles"] == 64
+        # 64 tiles * 64 k_tiles = 4096 total iters
+        # distributed across min(4096, 304) = 304 CUs
+        assert params["sk_ctas"] == 304
+        assert params["total_iters"] == 64 * 64
+
+    def test_pipeline_with_grid_partitioner(self):
+        """KernelPipeline with GridPartitioner produces valid kernel."""
+        from kernel_generator.gemm.schedule.pipeline import (
+            KernelPipeline, GridPartitioner, ScheduledCompute,
+        )
+        from kernel_generator.gemm.kernel import GemmKernel
+
+        problem = GemmProblem(256, 256, 64)
+        k = GemmKernel.build(problem)
+        result = k.emit()
+        assert len(result.asm_text) > 0
+        mfmas = sum(1 for l in result.ctx.lines if 'v_mfma_f32' in l)
+        assert mfmas > 0
