@@ -268,13 +268,23 @@ class TileConfig:
         """Return the active Swizzle instance, or None.
         
         If self.swizzle is set, use it directly.
-        If self.lds_swizzle is True, auto-create a RotationSwizzle (2-way optimal).
+        If self.lds_swizzle is True, auto-derive optimal swizzle from tile geometry.
         """
         if self.swizzle is not None:
             return self.swizzle
         if self.lds_swizzle:
-            from .memory.swizzle import RotationSwizzle
-            return RotationSwizzle(use_cross_lane=True)
+            from .memory.swizzle import (
+                DataLayout, LDS_GFX950, auto_swizzle,
+            )
+            eb = elem_bytes if elem_bytes is not None else self.mfma.element_bytes
+            layout = DataLayout(
+                row_stride_bytes=int(self.unroll_k * eb),
+                mfma_k=self.mfma.k,
+                mfma_m=self.mfma.m,
+                elem_bytes=eb,
+                wave_size=self.wave_size,
+            )
+            return auto_swizzle(layout, LDS_GFX950)
         return None
 
     # -- subtile-derived quantities -----------------------------------------
