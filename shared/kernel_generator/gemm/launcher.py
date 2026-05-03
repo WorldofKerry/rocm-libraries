@@ -741,7 +741,6 @@ class GemmLauncher:
         For k_split=1, this is equivalent to run_asm_kernel.
         """
         import struct
-        import time
         hip = _load_hip()
         p = self.problem
         tile = self.tile
@@ -796,13 +795,19 @@ class GemmLauncher:
         # - Modified K: k_per_split
         # - D ptr pointing to workspace slice
 
-        # Warmup + timing
+        # Warmup + timing with HIP events for accurate GPU measurement
         for iteration in range(num_warmup + num_iters):
+            # After warmup, record GPU start event
             if iteration == num_warmup:
                 hip.hipDeviceSynchronize()
-                t0 = time.perf_counter()
+                ev_start = ctypes.c_void_p()
+                ev_stop = ctypes.c_void_p()
+                _check(hip.hipEventCreate(ctypes.byref(ev_start)), "hipEventCreate")
+                _check(hip.hipEventCreate(ctypes.byref(ev_stop)), "hipEventCreate")
+                _check(hip.hipEventRecord(ev_start, None), "hipEventRecord start")
 
             hip.hipMemset(d_workspace, 0, ws_size)
+            hip.hipDeviceSynchronize()
 
             for s in range(k_split):
                 k_offset = s * k_per_split
@@ -810,15 +815,7 @@ class GemmLauncher:
                 b_ptr = d_B.value + k_offset * elem
                 ws_slice = d_workspace.value + s * p.m * p.n * 4
 
-                # Build kernargs for this split
-                # Use the TensileLite FP16 layout but with K=k_per_split
-                # and D ptr = workspace slice (FP32, but kernel writes fp16)
-                # Actually, we can't write FP32 from the fp16 store epilogue.
-                # We need the kernel to write fp16 to the workspace slice,
-                # then sum fp16 values on the host.
-
-                # Simpler approach: just launch k_split times and
-                # accumulate on the host in fp32
+                # Launch k_split times per iteration, accumulate on host
                 kernarg = struct.pack(
                     "<IIII" "IIII" "QQ" "QQ" "IIIIIIII" "ff",
                     0, 0, 0, total_wgs,
@@ -844,9 +841,15 @@ class GemmLauncher:
                     ctypes.cast(launch_params, ctypes.POINTER(ctypes.c_void_p)),
                     ctypes.c_void_p(0), ctypes.c_void_p(0))
 
-        hip.hipDeviceSynchronize()
-        elapsed = time.perf_counter() - t0
-        avg_time = elapsed / num_iters
+        # Record stop event and compute accurate GPU elapsed time
+        _check(hip.hipEventRecord(ev_stop, None), "hipEventRecord stop")
+        _check(hip.hipEventSynchronize(ev_stop), "hipEventSynchronize")
+        elapsed_ms = ctypes.c_float()
+        _check(hip.hipEventElapsedTime(ctypes.byref(elapsed_ms), ev_start, ev_stop),
+               "hipEventElapsedTime")
+        avg_time = elapsed_ms.value / 1000.0 / num_iters
+        hip.hipEventDestroy(ev_start)
+        hip.hipEventDestroy(ev_stop)
 
         # Read workspace slices and sum on host
         ws_data = np.zeros((k_split, p.m, p.n), dtype=np.float16)
