@@ -579,3 +579,73 @@ def auto_swizzle_from_tile(tile: 'TileConfig', mem: BankedMemoryConfig = LDS_GFX
     """Convenience: derive swizzle from TileConfig."""
     layout = DataLayout.from_tile(tile, tile.mfma, tile.mfma.element_bytes)
     return auto_swizzle(layout, mem)
+
+
+# ---------------------------------------------------------------------------
+# Paired-row layout for zero bank conflicts
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class PairedRowLayout:
+    """LDS layout that packs multiple M-rows per LDS row for zero conflicts.
+
+    With 64 banks, we need >= 16 columns (256B LDS rows) so that row
+    rotation maps all 16 lanes to unique bank groups. When the natural
+    row_stride is < 256B, we pack ``pair_factor`` consecutive M-rows
+    side-by-side into one wider LDS row.
+
+    This is data-type-independent: the pair_factor is derived purely
+    from row_stride vs bank_row_bytes.
+    """
+    original_layout: DataLayout
+    pair_factor: int           # M-rows packed per LDS row
+    effective_layout: DataLayout  # layout with widened row_stride
+
+    @staticmethod
+    def from_layout(layout: DataLayout,
+                    mem: BankedMemoryConfig = LDS_GFX950) -> 'PairedRowLayout':
+        """Derive the paired-row layout for zero bank conflicts."""
+        bank_row = mem.bank_row_bytes  # 256B for 64 banks
+        pair_factor = max(1, -(-bank_row // layout.row_stride_bytes))
+        eff_stride = layout.row_stride_bytes * pair_factor
+        eff_layout = DataLayout(
+            row_stride_bytes=eff_stride,
+            mfma_k=layout.mfma_k,
+            mfma_m=layout.mfma_m,
+            elem_bytes=layout.elem_bytes,
+            wave_size=layout.wave_size,
+        )
+        return PairedRowLayout(
+            original_layout=layout,
+            pair_factor=pair_factor,
+            effective_layout=eff_layout,
+        )
+
+    @property
+    def effective_cols(self) -> int:
+        return self.effective_layout.num_cols
+
+    @property
+    def needs_pairing(self) -> bool:
+        return self.pair_factor > 1
+
+    def write_col(self, m_row: int, k_col: int) -> int:
+        """Map (m_row, k_col) to column in the paired LDS row."""
+        half = m_row % self.pair_factor
+        orig_cols = self.original_layout.num_cols
+        return half * orig_cols + k_col
+
+    def read_col(self, m_row: int, k_group: int) -> int:
+        """Map (m_row, k_group) to base column in the paired LDS row."""
+        half = m_row % self.pair_factor
+        orig_cols = self.original_layout.num_cols
+        return half * orig_cols + k_group
+
+    def lds_row(self, m_row: int) -> int:
+        """Which LDS row an M-row belongs to."""
+        return m_row // self.pair_factor
+
+    def verify(self, mem: BankedMemoryConfig = LDS_GFX950) -> int:
+        """Verify conflict cycles with row rotation on the paired layout."""
+        sw = RowRotationSwizzle()
+        return sw.verify_all_ki(self.effective_layout, mem)
