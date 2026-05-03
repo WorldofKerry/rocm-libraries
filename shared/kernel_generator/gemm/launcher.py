@@ -680,7 +680,10 @@ class GemmLauncher:
         hip.hipFree(d_kernarg)
         hip.hipModuleUnload(module)
 
-        return GemmResult(D=D_out, time_seconds=avg_time)
+        # Compute correctness against CPU reference
+        _, _, _, D_ref = self.reference_numpy()
+        max_err = float(np.max(np.abs(D_out.astype(np.float32) - D_ref.astype(np.float32))))
+        return GemmResult(D=D_out, time_seconds=avg_time, max_abs_error=max_err)
 
     def run_streamk(self, co_path: str, kernel_name: str = "gemm_kernel",
                     num_warmup: int = 10, num_iters: int = 100,

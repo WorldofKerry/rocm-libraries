@@ -21,6 +21,8 @@ def _a_off(mi: int, ki: int, tile: TileConfig, mfma: MfmaConfig, elem: float) ->
     row_start = mi * mfma.m
     row_stride = int(tile.unroll_k * elem)
     if getattr(tile, 'lds_swizzle', False) or tile.resolved_swizzle(elem) is not None:
+        # Swizzle mode: ki offset is encoded in per-ki base registers
+        # (v_lds_rd_a_k{ki}). Return only the mi row offset.
         return int(row_start * row_stride)
     pad_bytes = tile.lds_pad
     tpr = int(tile.unroll_k * elem) // 16
