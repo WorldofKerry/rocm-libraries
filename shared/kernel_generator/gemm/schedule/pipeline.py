@@ -161,7 +161,12 @@ class ScheduledCompute(ComputePipeline):
         ctx.raw("")
 
         if self.pgr2:
-            # Prefetch tile 1 into the other LDS buffer
+            # PGR=2 disabled: the current loop structure overwrites
+            # tile 0 in the first iteration before reading it.
+            # Fixing requires restructuring the loop body order.
+            # TODO: implement proper PGR=2 with read-before-write loop.
+            pass
+        if False:  # PGR=2 disabled
             ctx.comment("PGR=2: prefetch tile 1 into other buffer")
             ctx.inst("s_cmp_le_u32", ctx.sreg("s_k_tiles"), "1",
                      comment="skip prefetch if only 1 tile")
