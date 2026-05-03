@@ -202,14 +202,24 @@ class BufferLoader(GlobalLoader):
                      ctx.sreg(srd, 1, 1), "0", comment="carry")
 
     def toggle_write(self) -> None:
-        """Toggle LDS write base for double-buffering (scalar regs)."""
+        """Toggle LDS write double-buffer offset.
+
+        Uses a scalar register (s_buf_wr_db) that toggles between
+        0 and db_step. Added to the per-thread LDS offset in ds_write.
+        """
         ctx = self.ctx
+        # Also toggle the scalar bases (for DTL compat if mixed)
         ctx.inst("s_xor_b32", ctx.sreg("s_lds_wr_a_sg"),
                  ctx.sreg("s_lds_wr_a_sg"), ctx.sreg("s_lds_db_step"),
                  comment="wr_a ^= db")
         ctx.inst("s_xor_b32", ctx.sreg("s_lds_wr_b_sg"),
                  ctx.sreg("s_lds_wr_b_sg"), ctx.sreg("s_lds_db_step"),
                  comment="wr_b ^= db")
+        # Toggle the BUF db offset
+        if ctx.has("s_buf_wr_db"):
+            ctx.inst("s_xor_b32", ctx.sreg("s_buf_wr_db"),
+                     ctx.sreg("s_buf_wr_db"), ctx.sreg("s_lds_db_step"),
+                     comment="buf_wr_db ^= db")
 
     def emit_sync(self) -> None:
         """Wait for LDS writes (issued during emit_produce), then barrier.
@@ -302,24 +312,40 @@ class BufferLoader(GlobalLoader):
             load = ctx.get(gload_name)
             num_loads = load.count // 4
 
+            # v_lds_wr_off contains the full per-thread LDS offset
+            # (thread_row * lds_stride + col_bytes). We add the
+            # double-buffer offset from a dedicated VGPR that tracks
+            # which buffer we're writing to.
+            #
+            # For A: offset = v_lds_wr_off
+            # For B: offset = v_lds_wr_off + lds_b_offset
+            b_offset = 0
+            if name == "b":
+                b_offset = int(self.tile.wg_m * self.tile.unroll_k * self.elem)
+
+            # Start with per-thread offset
             if has_swz:
-                ctx.v_add(ctx.vreg("v_tmp0"),
-                          ctx.sreg(f"s_lds_wr_{name}_sg"),
-                          ctx.vreg("v_lds_wr_swz"),
-                          comment=f"LDS addr {name.upper()} = base + swizzled")
+                ctx.v_mov(ctx.vreg("v_tmp0"), ctx.vreg("v_lds_wr_swz"),
+                          comment=f"{name.upper()}: swizzled offset")
+            elif ctx.has("v_lds_wr_off"):
+                ctx.v_mov(ctx.vreg("v_tmp0"), ctx.vreg("v_lds_wr_off"),
+                          comment=f"{name.upper()}: lds_wr_off")
             else:
-                # Compute LDS offset: thread_row * unroll_k*elem + col_bytes
-                # v_lds_wr_off was precomputed in setup with the LDS row stride
-                if ctx.has("v_lds_wr_off"):
-                    ctx.v_add(ctx.vreg("v_tmp0"),
-                              ctx.sreg(f"s_lds_wr_{name}_sg"),
-                              ctx.vreg("v_lds_wr_off"),
-                              comment=f"LDS addr {name.upper()} = base + lds_off")
-                else:
-                    ctx.v_add(ctx.vreg("v_tmp0"),
-                              ctx.sreg(f"s_lds_wr_{name}_sg"),
-                              ctx.vreg(f"v_dtl_off_{name}"),
-                              comment=f"LDS addr {name.upper()} = base + voff")
+                ctx.v_mov(ctx.vreg("v_tmp0"), ctx.vreg(f"v_dtl_off_{name}"),
+                          comment=f"{name.upper()}: dtl_off")
+
+            # Add B region offset
+            if b_offset:
+                ctx.s_mov(ctx.sreg("s_tmp0"), str(b_offset),
+                          comment=f"B_off={b_offset}")
+                ctx.v_add(ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"),
+                          ctx.sreg("s_tmp0"), comment="+ B_off")
+
+            # Add double-buffer offset
+            if ctx.has("s_buf_wr_db"):
+                ctx.v_add(ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"),
+                          ctx.sreg("s_buf_wr_db"),
+                          comment="+ db offset")
 
             for i in range(num_loads):
                 src = ctx.vreg(gload_name, i * 4, 4)

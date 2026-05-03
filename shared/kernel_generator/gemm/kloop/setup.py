@@ -221,6 +221,12 @@ def phase_wave_abi_setup(level: TileLevel, ctx: AsmContext) -> None:
               ctx.vreg("v_tmp1"), comment="+ col_bytes -> v_lds_wr_off")
     ctx.raw("")
 
+    # Double-buffer write offset for BufferLoader (starts at 0)
+    ctx.alloc_sgpr_permanent(1, "s_buf_wr_db")
+    ctx.s_mov(ctx.sreg("s_buf_wr_db"), "0",
+              comment="buf_wr_db = 0 (buffer 0)")
+    ctx.raw("")
+
     # DTL voffset = thread_row * K * elem + col_bytes (global stride)
     ctx.inst("v_mul_lo_u32", ctx.vreg("v_dtl_off_a"),
              ctx.sreg("s_k_stride"), ctx.vreg("v_tmp0"), comment="row * K*elem")
@@ -636,6 +642,12 @@ def phase_dtl_interleaved_setup(level: TileLevel, ctx: AsmContext) -> None:
               ctx.vreg("v_tmp0"), comment=f"row * {row_stride_lds} (LDS stride)")
     ctx.v_add(ctx.vreg("v_lds_wr_off"), ctx.vreg("v_lds_wr_off"),
               ctx.vreg("v_tmp1"), comment="+ col_bytes -> v_lds_wr_off")
+    ctx.raw("")
+
+    # Double-buffer write offset for BufferLoader (starts at 0)
+    ctx.alloc_sgpr_permanent(1, "s_buf_wr_db")
+    ctx.s_mov(ctx.sreg("s_buf_wr_db"), "0",
+              comment="buf_wr_db = 0 (buffer 0)")
     ctx.raw("")
 
     # DTL voffset = thread_row * K * elem + col_bytes (global stride)
