@@ -663,7 +663,11 @@ class GemmLauncher:
 
         # Copy result back
         out_dtype = np.float16 if p.dtype == DataType.MXFP4 else self._np_dtype(p.dtype)
-        D_out = np.zeros((p.m, p.n), dtype=out_dtype)
+        if use_1d_grid:
+            # Column-major output: D[m + n*M], read as Fortran-order
+            D_out = np.zeros((p.m, p.n), dtype=out_dtype, order='F')
+        else:
+            D_out = np.zeros((p.m, p.n), dtype=out_dtype)
         _check(hip.hipMemcpy(D_out.ctypes.data, d_D, d_bytes, 2), "D2H D")
 
         # Cleanup

@@ -339,7 +339,9 @@ def phase_store_d(level: TileLevel, ctx: AsmContext) -> None:
     elem = 2
     elem_int = 2
     # TensileLite uses column-major BF16; standalone uses row-major FP16
-    colmajor = ctx._metadata.get("use_1d_grid", False) or ctx._metadata.get("use_wave_abi", False)
+    colmajor = (ctx._metadata.get("use_1d_grid", False) 
+                or ctx._metadata.get("use_wave_abi", False)
+                or ctx._metadata.get("colmajor_output", False))
     use_bf16 = colmajor and mfma.is_mx  # MXFP4 dest is BFloat16 in TL
 
     ctx.comment("=== Store D via buffer SRD ===")

@@ -372,6 +372,7 @@ class KLoopScheduler:
                 existing = int(waits[mfma_idx].split("(")[1].rstrip(")"))
                 wait_for = min(wait_for, existing)
 
+            wait_for = min(wait_for, 15)  # hardware max lgkmcnt
             waits[mfma_idx] = f"lgkmcnt({wait_for})"
 
         return waits

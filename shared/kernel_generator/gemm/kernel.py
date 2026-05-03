@@ -124,7 +124,8 @@ class GemmKernel:
               wave_abi: bool = False,
               use_dtl: bool = True,
               pgr2: bool = False,
-              wg_mapping_xcc: int = 1) -> GemmKernel:
+              wg_mapping_xcc: int = 1,
+              colmajor_output: bool = False) -> GemmKernel:
         """Build a GemmKernel.  GemmTiling is the source of truth.
 
         Args:
@@ -169,6 +170,7 @@ class GemmKernel:
         k.use_dtl = use_dtl
         k.pgr2 = pgr2
         k.wg_mapping_xcc = wg_mapping_xcc
+        k.colmajor_output = colmajor_output
         return k
 
     def emit(self) -> AsmKernel:
@@ -213,6 +215,7 @@ class GemmKernel:
             "swizzled_scales": getattr(self, "swizzled_scales", False),
             "pgr2": getattr(self, "pgr2", False),
             "wg_mapping_xcc": getattr(self, "wg_mapping_xcc", 1),
+            "colmajor_output": getattr(self, "colmajor_output", False),
         }
         if is_dtl:
             alloc_registers_dtl(ctx, self.problem, tile)
