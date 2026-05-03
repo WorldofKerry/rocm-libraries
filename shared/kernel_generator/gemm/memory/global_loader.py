@@ -270,18 +270,26 @@ class BufferLoader(GlobalLoader):
     def _emit_ds_writes(self) -> None:
         """Write loaded VGPRs to LDS.
 
-        Computes LDS write address = scalar base (s_lds_wr_{a,b}_sg)
-        + per-thread offset (v_dtl_off_{a,b}). The DTL offset is the
-        same row*stride+col layout used for DTL, which is correct for
-        non-swizzled access.
+        When swizzle is active, uses v_lds_wr_swz (pre-computed swizzled
+        offset from setup phase). Otherwise uses v_dtl_off (unswizzled).
+        Both are combined with the scalar LDS base for double-buffering.
         """
         ctx = self.ctx
         tile = self.tile
         elem = self.elem
         tpr = int(tile.unroll_k * elem) // 16
         rpl = tile.block_size // tpr
-        row_stride = int(tile.unroll_k * elem)
-        lds_group_stride = rpl * row_stride + tile.lds_pad
+
+        swz = tile.resolved_swizzle(elem)
+        has_swz = swz is not None and hasattr(swz, 'pair_factor') and ctx.has("v_lds_wr_swz")
+
+        if has_swz:
+            pf = swz.pair_factor
+            eff_stride = swz.effective_cols * 16
+            lds_group_stride = (rpl // pf) * eff_stride
+        else:
+            row_stride = int(tile.unroll_k * elem)
+            lds_group_stride = rpl * row_stride + tile.lds_pad
 
         for name in ["a", "b"]:
             gload_name = f"v_gload_{name}"
@@ -289,11 +297,19 @@ class BufferLoader(GlobalLoader):
                 continue
             load = ctx.get(gload_name)
             num_loads = load.count // 4
-            voff = ctx.vreg(f"v_dtl_off_{name}")
 
-            # LDS addr = scalar_base + per-thread offset
-            ctx.v_add(ctx.vreg("v_tmp0"), ctx.sreg(f"s_lds_wr_{name}_sg"),
-                      voff, comment=f"LDS addr {name.upper()} = base + voff")
+            if has_swz:
+                # Swizzled: use v_lds_wr_swz + scalar base
+                ctx.v_add(ctx.vreg("v_tmp0"),
+                          ctx.sreg(f"s_lds_wr_{name}_sg"),
+                          ctx.vreg("v_lds_wr_swz"),
+                          comment=f"LDS addr {name.upper()} = base + swizzled")
+            else:
+                # Unswizzled: use v_dtl_off + scalar base
+                ctx.v_add(ctx.vreg("v_tmp0"),
+                          ctx.sreg(f"s_lds_wr_{name}_sg"),
+                          ctx.vreg(f"v_dtl_off_{name}"),
+                          comment=f"LDS addr {name.upper()} = base + voff")
 
             for i in range(num_loads):
                 src = ctx.vreg(gload_name, i * 4, 4)
