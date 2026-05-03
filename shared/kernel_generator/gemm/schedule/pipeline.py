@@ -463,9 +463,17 @@ def pipeline_kloop_phase(level, ctx) -> None:
     # Legacy: pgr2 flag maps to pgr=2
     if ctx._metadata.get("pgr2", False) and pgr < 2:
         pgr = 2
+
+    auto_pipeline = ctx._metadata.get("auto_pipeline", False)
+    if auto_pipeline:
+        from .auto_pipeline import AutoPipelinedCompute
+        compute = AutoPipelinedCompute(loader, reader, scale_loader, pgr=pgr)
+    else:
+        compute = ScheduledCompute(loader, reader, scale_loader, pgr=pgr)
+
     pipeline = KernelPipeline(
         partitioner=GridPartitioner(),
-        compute=ScheduledCompute(loader, reader, scale_loader, pgr=pgr),
+        compute=compute,
     )
     pipeline.emit(ctx)
 
