@@ -161,8 +161,15 @@ class LDSReader:
             for matrix in ["a", "b"]:
                 base = self.ctx.vreg(f"v_lds_rd_{matrix}")
                 out = self.ctx.vreg(f"v_lds_rd_{matrix}_k{ki}")
-                self.ctx.inst("v_xor_b32", out, base, str(xor_bytes),
-                              comment=f"rd_{matrix}_k{ki} = rd_{matrix} ^ {xor_bytes}")
+                if xor_bytes > 64:
+                    self.ctx.s_mov(self.ctx.sreg("s_tmp0"), str(xor_bytes),
+                                  comment=f"xor val {xor_bytes}")
+                    self.ctx.inst("v_xor_b32", out, base,
+                                 self.ctx.sreg("s_tmp0"),
+                                 comment=f"rd_{matrix}_k{ki} = rd_{matrix} ^ {xor_bytes}")
+                else:
+                    self.ctx.inst("v_xor_b32", out, base, str(xor_bytes),
+                                 comment=f"rd_{matrix}_k{ki} = rd_{matrix} ^ {xor_bytes}")
 
     def toggle_read(self) -> None:
         """Toggle LDS read bases for double-buffering + recompute ki bases."""
@@ -181,10 +188,18 @@ class LDSReader:
                 for ki in range(1, self.ki_count):
                     step = ki * swz_layout.k_step
                     xor_bytes = step * 16
-                    ctx.inst("v_xor_b32",
-                             ctx.vreg(f"v_lds_rd_{matrix}_k{ki}"),
-                             ctx.vreg(base_name), str(xor_bytes),
-                             comment=f"rd_{matrix}_k{ki} = rd_{matrix} ^ {xor_bytes}")
+                    if xor_bytes > 64:
+                        ctx.s_mov(ctx.sreg("s_tmp0"), str(xor_bytes),
+                                  comment=f"xor val {xor_bytes}")
+                        ctx.inst("v_xor_b32",
+                                 ctx.vreg(f"v_lds_rd_{matrix}_k{ki}"),
+                                 ctx.vreg(base_name), ctx.sreg("s_tmp0"),
+                                 comment=f"rd_{matrix}_k{ki} = rd_{matrix} ^ {xor_bytes}")
+                    else:
+                        ctx.inst("v_xor_b32",
+                                 ctx.vreg(f"v_lds_rd_{matrix}_k{ki}"),
+                                 ctx.vreg(base_name), str(xor_bytes),
+                                 comment=f"rd_{matrix}_k{ki} = rd_{matrix} ^ {xor_bytes}")
 
     def _emit_swizzled_ds_read(self, dst: str, base_reg: str, offset: int, ki: int, width: int, comment: str) -> None:
         """Emit ds_read using per-ki base VGPR when swizzle is active."""
