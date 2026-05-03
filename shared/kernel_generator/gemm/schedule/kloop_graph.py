@@ -242,11 +242,11 @@ class DSReadBlock(BuildingBlock):
 
                 def _mk(mi_=mi, ki_=ki, buf_=buf):
                     def emit():
-                        # Recompute swizzled base for this mi.
-                        # Called for every ki (not just ki==0) because in
-                        # the preamble, ki=1 reads may be separated from
-                        # ki=0 reads by other ops that clobber the base.
-                        reader.emit_recompute_a_for_mi(mi_)
+                        # Recompute swizzled base for this mi at ki=0.
+                        # Safe because A reads for same mi are always
+                        # adjacent (ki=0 immediately followed by ki=1).
+                        if ki_ == 0:
+                            reader.emit_recompute_a_for_mi(mi_)
                         reader.emit_read_a(mi_, ki_, buf_)
                     return emit
 
@@ -272,11 +272,8 @@ class DSReadBlock(BuildingBlock):
 
                 def _mk(ni_=ni, ki_=ki):
                     def emit():
-                        # Always recompute for paired-row swizzle (no-op
-                        # for non-swizzle). Needed because preamble may
-                        # issue ki>0 reads after other ni's clobbered
-                        # the base register.
-                        reader.emit_recompute_b_for_ni(ni_)
+                        if ki_ == 0:
+                            reader.emit_recompute_b_for_ni(ni_)
                         reader.emit_read_b(ni_, ki_)
                     return emit
 

@@ -511,7 +511,14 @@ class ReadComputeStageEmitter(StageEmitter):
 
         # Preamble reads
         ctx.comment("Preamble: A[m0] + B ki=1")
+        reader = ctx._metadata.get("_reader")
         for op in schedule.preamble_ops:
+            # B ki>0 reads need per-ni recompute in the preamble
+            if (reader and op.name.startswith("read_b_") and "_k0" not in op.name):
+                import re as _re
+                _m = _re.search(r"read_b_n(\d+)", op.name)
+                if _m:
+                    reader.emit_recompute_b_for_ni(int(_m.group(1)))
             if op.emit:
                 op.emit()
 
