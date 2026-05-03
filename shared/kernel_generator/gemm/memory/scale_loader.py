@@ -375,6 +375,13 @@ class VMEMScaleLoader(ScaleLoader):
     def advance(self) -> None:
         """Advance both scale SRDs by ``scale_k_stride`` bytes."""
         ctx = self._ctx
+        stride = self._scale_k_stride
+        for srd_name in ["s_srd_scale_a", "s_srd_scale_b"]:
+            ctx.inst("s_add_u32", ctx.sreg(srd_name, 0, 1),
+                     ctx.sreg(srd_name, 0, 1), str(stride),
+                     comment=f"{srd_name} += {stride}")
+            ctx.inst("s_addc_u32", ctx.sreg(srd_name, 1, 1),
+                     ctx.sreg(srd_name, 1, 1), "0", comment="carry")
 
     # -- per-index emission (for ScaleBlock integration) --------------------
 
@@ -434,13 +441,6 @@ class VMEMScaleLoader(ScaleLoader):
                      soff, f"offen{off_str}",
                      comment=f"scale B ni={ni} ki={ki}")
 
-        stride = self._scale_k_stride
-        for srd_name in ["s_srd_scale_a", "s_srd_scale_b"]:
-            ctx.inst("s_add_u32", ctx.sreg(srd_name, 0, 1),
-                     ctx.sreg(srd_name, 0, 1), str(stride),
-                     comment=f"{srd_name} += {stride}")
-            ctx.inst("s_addc_u32", ctx.sreg(srd_name, 1, 1),
-                     ctx.sreg(srd_name, 1, 1), "0", comment="carry")
 
     # -- composable K-loop integration -------------------------------------
 
