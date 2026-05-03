@@ -746,6 +746,10 @@ class GemmLauncher:
         tile = self.tile
         elem = p.element_bytes
 
+        def _check(ret: int, msg: str = "HIP error") -> None:
+            if ret != 0:
+                raise RuntimeError(f"{msg}: {ret}")
+
         if k_split <= 1:
             return self.run_asm_kernel(co_path, kernel_name=kernel_name,
                                        num_warmup=num_warmup, num_iters=num_iters)
