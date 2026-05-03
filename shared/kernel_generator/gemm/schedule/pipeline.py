@@ -466,16 +466,17 @@ def pipeline_kloop_phase(level, ctx) -> None:
 
     pipeline_strategy = ctx._metadata.get("pipeline_strategy", None)
     if pipeline_strategy is not None:
-        # pipeline_strategy is a class or callable that builds a ComputePipeline
+        # Explicit strategy: class, callable, or pre-built instance
         if isinstance(pipeline_strategy, type):
             compute = pipeline_strategy(loader, reader, scale_loader, pgr=pgr)
         elif callable(pipeline_strategy):
             compute = pipeline_strategy(loader, reader, scale_loader, pgr=pgr)
         else:
-            # Already an instance -- use directly (must implement emit(ctx))
             compute = pipeline_strategy
     else:
-        compute = ScheduledCompute(loader, reader, scale_loader, pgr=pgr)
+        # Default: auto-pipelined (generic stage-driven framework)
+        from .auto_pipeline import AutoPipelinedCompute
+        compute = AutoPipelinedCompute(loader, reader, scale_loader, pgr=pgr)
 
     pipeline = KernelPipeline(
         partitioner=GridPartitioner(),

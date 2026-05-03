@@ -270,7 +270,7 @@ class SoftwarePipeline:
                 emitters[s.name].emit_consume(ctx)
 
         # Loop tail
-        self._emit_loop_tail(ctx)
+        self._emit_loop_tail(ctx, emitters)
 
     def _emit_body_consume_first(self, ctx, emitters, pgr):
         """Body: barrier -> pre-body -> R+M -> lgkmcnt(0) -> G."""
@@ -310,7 +310,7 @@ class SoftwarePipeline:
         ctx.label("load_skip_all")
 
         # Loop tail
-        self._emit_loop_tail(ctx)
+        self._emit_loop_tail(ctx, emitters)
 
     def _emit_sync(self, ctx, emitters):
         """Emit barrier between producer and consumer stages."""
@@ -323,12 +323,32 @@ class SoftwarePipeline:
                     return
         ctx.s_barrier(comment="sync producer -> consumer")
 
-    def _emit_loop_tail(self, ctx):
-        """Emit loop branch back."""
+    def _emit_loop_tail(self, ctx, emitters=None):
+        """Emit loop branch back.
+
+        If any producer emitter has cross_iter_prefetch, use an
+        exit-branch pattern to skip prefetch on the last iteration.
+        """
+        has_cross_iter_pf = False
+        if emitters:
+            for s in self.producer_stages:
+                if s.name in emitters:
+                    e = emitters[s.name]
+                    if (hasattr(e, 'scale_loader') and e.scale_loader
+                            and e.scale_loader.has_cross_iter_prefetch):
+                        has_cross_iter_pf = True
+                        break
+
         ctx.s_barrier(comment="sync")
         ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
                  comment="more?")
-        ctx.inst("s_cbranch_scc1", "k_loop", comment="loop")
+        if has_cross_iter_pf:
+            ctx.inst("s_cbranch_scc0", "k_loop_end",
+                     comment="exit if last")
+            ctx.inst("s_branch", "k_loop", comment="loop back")
+            ctx.label("k_loop_end")
+        else:
+            ctx.inst("s_cbranch_scc1", "k_loop", comment="loop")
         ctx.raw("")
 
     def describe(self, num_tiles: int = 8) -> List[str]:

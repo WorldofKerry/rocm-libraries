@@ -6,6 +6,7 @@ assembly to the manual ScheduledCompute for all supported configs.
 import pytest
 from kernel_generator.gemm.problem import GemmProblem, DataType
 from kernel_generator.gemm.kernel import GemmKernel
+from kernel_generator.gemm.tiling import GemmTiling
 from kernel_generator.gemm.schedule.auto_pipeline import (
     AutoPipelinedCompute,
     SoftwarePipeline, PipelineStage, StageDep, ResourceConfig,
@@ -117,3 +118,25 @@ class TestAutoVsManualAssembly:
         manual_inst = _strip_instructions(manual.emit().asm_text)
         assert auto_inst == manual_inst, (
             f"{dtype.value} PGR=2: instructions differ")
+
+    def test_mxfp4_identical(self):
+        tiling = GemmTiling.mxfp4_standard()
+        p = GemmProblem(128, 128, 256, dtype=DataType.MXFP4)
+        auto = GemmKernel.build(p, tiling=tiling,
+                                pipeline_strategy=AutoPipelinedCompute)
+        manual = GemmKernel.build(p, tiling=tiling)
+
+        auto_inst = _strip_instructions(auto.emit().asm_text)
+        manual_inst = _strip_instructions(manual.emit().asm_text)
+        assert auto_inst == manual_inst, "MXFP4: instructions differ"
+
+    def test_mxfp4_4k_identical(self):
+        tiling = GemmTiling.mxfp4_standard()
+        p = GemmProblem(4096, 4096, 4096, dtype=DataType.MXFP4)
+        auto = GemmKernel.build(p, tiling=tiling,
+                                pipeline_strategy=AutoPipelinedCompute)
+        manual = GemmKernel.build(p, tiling=tiling)
+
+        auto_inst = _strip_instructions(auto.emit().asm_text)
+        manual_inst = _strip_instructions(manual.emit().asm_text)
+        assert auto_inst == manual_inst, "MXFP4 4k: instructions differ"
