@@ -115,6 +115,31 @@ class MfmaConfig:
         )
 
     @staticmethod
+    def bf16_16x16x16() -> MfmaConfig:
+        """  ``v_mfma_f32_16x16x16_bf16``: 16x16 output, K=16, 4 acc VGPRs.
+
+        Same shape and register usage as f16_16x16x16, different input type.
+        """
+        return MfmaConfig(
+            m=16, n=16, k=16, blocks=1,
+            input_type="bf16", acc_type="f32",
+            a_vgprs=2, b_vgprs=2, acc_vgprs=4,
+        )
+
+    @staticmethod
+    def bf16_16x16x32() -> MfmaConfig:
+        """  ``v_mfma_f32_16x16x32_bf16``: 16x16 output, K=32 (gfx950).
+
+        Same shape and register usage as f16_16x16x32, different input type.
+        2x K-depth of bf16_16x16x16 at the same cycle count (16 cycles).
+        """
+        return MfmaConfig(
+            m=16, n=16, k=32, blocks=1,
+            input_type="bf16", acc_type="f32",
+            a_vgprs=4, b_vgprs=4, acc_vgprs=4,
+        )
+
+    @staticmethod
     def mxfp4_16x16x128() -> MfmaConfig:
         """``v_mfma_scale_f32_16x16x128_f8f6f4``: MXFP4 on gfx950.
 
@@ -515,6 +540,11 @@ class GemmProblem:
         if self.dtype == DataType.F16 and tile.mfma.input_type != "f16":
             raise ValueError(
                 f"Data type {self.dtype} requires f16 MFMA, "
+                f"got {tile.mfma.input_type}"
+            )
+        if self.dtype == DataType.BF16 and tile.mfma.input_type != "bf16":
+            raise ValueError(
+                f"Data type {self.dtype} requires bf16 MFMA, "
                 f"got {tile.mfma.input_type}"
             )
         if self.dtype == DataType.MXFP4 and tile.mfma.input_type != "f8f6f4":

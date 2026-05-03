@@ -21,7 +21,7 @@ from typing import Callable
 
 from .context import AsmContext
 from .layouts import emit_affine, GemmLayouts
-from ..problem import GemmProblem, MfmaConfig, TileConfig
+from ..problem import DataType, GemmProblem, MfmaConfig, TileConfig
 from ..tile.tree import TileLevel, TilePhase
 from ..tile.transforms import Embed, Dim
 
@@ -342,7 +342,7 @@ def phase_store_d(level: TileLevel, ctx: AsmContext) -> None:
     colmajor = (ctx._metadata.get("use_1d_grid", False) 
                 or ctx._metadata.get("use_wave_abi", False)
                 or ctx._metadata.get("colmajor_output", False))
-    use_bf16 = colmajor and mfma.is_mx  # MXFP4 dest is BFloat16 in TL
+    use_bf16 = (problem.dtype == DataType.BF16) or (colmajor and mfma.is_mx)
 
     ctx.comment("=== Store D via buffer SRD ===")
 
@@ -437,9 +437,9 @@ def phase_store_d(level: TileLevel, ctx: AsmContext) -> None:
         ctx.raw("")
         use_pk_cvt = (acc_per % 2 == 0)
         if use_pk_cvt:
-            _store_d_packed(ctx, tile, mfma, acc_per, elem_int)
+            _store_d_packed(ctx, tile, mfma, acc_per, elem_int, use_bf16)
         else:
-            _store_d_scalar(ctx, tile, mfma, acc_per, elem_int)
+            _store_d_scalar(ctx, tile, mfma, acc_per, elem_int, use_bf16)
 
     ctx.s_waitcnt("vmcnt(0)", comment="wait for stores")
     ctx.raw("")
@@ -534,11 +534,12 @@ def _store_d_colmajor(ctx: AsmContext, tile: TileConfig, mfma: MfmaConfig, acc_p
                                              f"store D m{mi}_n{ni}_a{ai}")
 
 
-def _store_d_scalar(ctx: AsmContext, tile: TileConfig, mfma: MfmaConfig, acc_per: int, elem_int: int) -> None:
-    """Emit buffer_store_short with individual v_cvt_f16_f32_e32 per element.
+def _store_d_scalar(ctx: AsmContext, tile: TileConfig, mfma: MfmaConfig, acc_per: int, elem_int: int, use_bf16: bool = False) -> None:
+    """Emit buffer_store_short with individual f32->f16/bf16 convert per element.
 
     Fallback for odd acc_per (uncommon).
     """
+    cvt_scalar = "v_cvt_bf16_f32_e32" if use_bf16 else "v_cvt_f16_f32_e32"
     for mi in range(tile.mfma_m_repeat):
         for ai in range(acc_per):
             row_delta = mi * mfma.m + ai
@@ -558,15 +559,16 @@ def _store_d_scalar(ctx: AsmContext, tile: TileConfig, mfma: MfmaConfig, acc_per
                 ctx.inst("v_accvgpr_read_b32", ctx.vreg("v_store_tmp"),
                          ctx.areg("acc_C", acc_idx, 1),
                          comment=f"acc[{acc_idx}] m{mi}_n{ni}_a{ai}")
-                ctx.inst("v_cvt_f16_f32_e32", ctx.vreg("v_store_tmp"),
-                         ctx.vreg("v_store_tmp"), comment="f32->f16")
+                ctx.inst(cvt_scalar, ctx.vreg("v_store_tmp"),
+                         ctx.vreg("v_store_tmp"),
+                         comment="f32->bf16" if use_bf16 else "f32->f16")
                 _emit_buffer_store_short(ctx, "v_store_tmp",
                                          "s_tmp1", ni_imm,
                                          f"store D m{mi}_n{ni}_a{ai}")
 
 
-def _store_d_packed(ctx: AsmContext, tile: TileConfig, mfma: MfmaConfig, acc_per: int, elem_int: int) -> None:
-    """Emit buffer_store_short with v_cvt_pk_f16_f32 for accumulator pairs.
+def _store_d_packed(ctx: AsmContext, tile: TileConfig, mfma: MfmaConfig, acc_per: int, elem_int: int, use_bf16: bool = False) -> None:
+    """Emit buffer_store_short with v_cvt_pk_f16/bf16_f32 for accumulator pairs.
 
     Processes ai in pairs (0,1), (2,3), etc.  For each pair:
       - Precompute soffset_lo and soffset_hi (= soffset_lo + row_stride)
@@ -612,7 +614,7 @@ def _store_d_packed(ctx: AsmContext, tile: TileConfig, mfma: MfmaConfig, acc_per
                 ctx.inst("v_accvgpr_read_b32", ctx.vreg("v_tmp1"),
                          ctx.areg("acc_C", acc_idx_hi, 1),
                          comment=f"acc[{acc_idx_hi}] m{mi}_n{ni}_a{ai_hi}")
-                ctx.inst("v_cvt_pk_f16_f32", ctx.vreg("v_store_tmp"),
+                ctx.inst("v_cvt_pk_bf16_f32" if use_bf16 else "v_cvt_pk_f16_f32", ctx.vreg("v_store_tmp"),
                          ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),
                          comment=f"pk cvt a{ai_lo},a{ai_hi}")
 

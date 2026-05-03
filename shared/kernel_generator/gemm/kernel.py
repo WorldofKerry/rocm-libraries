@@ -24,7 +24,7 @@ from .emit.context import AsmContext
 from .emit.emitter import alloc_registers, alloc_registers_dtl, emit_header, emit_descriptor, assemble_kernel
 from .emit.layouts import emit_affine, GemmLayouts
 from .emit.phases import default_mfma_visitor
-from .problem import GemmProblem, TileConfig
+from .problem import DataType, GemmProblem, MfmaConfig, TileConfig
 from .tiling import GemmTiling
 from .tile.tree import TileLevel, walk_tile_tree
 from .tile.transforms import Embed
@@ -140,11 +140,20 @@ class GemmKernel:
             if tile is not None:
                 tiling = GemmTiling.from_tile_config(tile)
             else:
+                # Select MFMA variant matching the problem data type
+                if problem.dtype == DataType.BF16:
+                    default_mfma = MfmaConfig.bf16_16x16x32()
+                else:
+                    default_mfma = None  # let tiling factory pick
                 if use_dtl:
                     tiling = GemmTiling.high_perf(
-                        wg_m=256, wg_n=256, unroll_k=64)
+                        wg_m=256, wg_n=256, unroll_k=64,
+                        mfma=default_mfma)
                 else:
-                    tiling = GemmTiling.standard()
+                    if default_mfma is not None:
+                        tiling = GemmTiling.standard(mfma=default_mfma)
+                    else:
+                        tiling = GemmTiling.standard()
 
         tiling.validate()
         tile = tiling.to_tile_config()
@@ -263,6 +272,8 @@ def export_wave_kernel(kernel: "GemmKernel", output_path: str,
     if kernel_name is None:
         if mfma.is_mx:
             kernel_name = f"wave_mxfp4_{tile.wg_m}x{tile.wg_n}x{tile.unroll_k}_kgen"
+        elif mfma.input_type == "bf16":
+            kernel_name = f"wave_bf16_{tile.wg_m}x{tile.wg_n}x{tile.unroll_k}_kgen"
         else:
             kernel_name = f"wave_fp16_{tile.wg_m}x{tile.wg_n}x{tile.unroll_k}_kgen"
 
