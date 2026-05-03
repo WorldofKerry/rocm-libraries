@@ -47,14 +47,10 @@ def _a_off(mi: int, ki: int, tile: TileConfig, mfma: MfmaConfig, elem: float) ->
     row_stride = int(tile.unroll_k * elem)
     swz = tile.resolved_swizzle(elem)
     if swz is not None and hasattr(swz, 'pair_factor'):
-        # Paired layout: offset = (row_start / pair_factor) * eff_stride
-        # But the actual per-lane offset is computed at runtime via
-        # emit_read_setup. The mi offset just advances the row_base
-        # by mi * mfma.m rows in the paired layout.
-        pf = swz.pair_factor
-        eff_stride = swz.effective_cols * 16
-        lds_row = row_start // pf
-        return int(lds_row * eff_stride)
+        # Paired-row swizzle: mi offset is handled by
+        # emit_recompute_a_for_mi() which fully recomputes the read
+        # base. Return 0 so ds_read uses the recomputed base directly.
+        return 0
     if getattr(tile, 'lds_swizzle', False):
         return int(row_start * row_stride)
     pad_bytes = tile.lds_pad
@@ -70,10 +66,8 @@ def _b_off(ni: int, ki: int, tile: TileConfig, mfma: MfmaConfig, elem: float) ->
     row_stride = int(tile.unroll_k * elem)
     swz = tile.resolved_swizzle(elem)
     if swz is not None and hasattr(swz, 'pair_factor'):
-        pf = swz.pair_factor
-        eff_stride = swz.effective_cols * 16
-        lds_row = row_start // pf
-        return int(lds_row * eff_stride)
+        # Paired-row swizzle: ni offset handled by recomputation. Return 0.
+        return 0
     if getattr(tile, 'lds_swizzle', False):
         return int(row_start * row_stride)
     pad_bytes = tile.lds_pad
@@ -766,6 +760,16 @@ def phase_dtl_interleaved_setup(level: TileLevel, ctx: AsmContext) -> None:
         swz.emit_read_setup(ctx, swz_layout, LDS_GFX950,
                             ctx.vreg("v_lds_rd_a"), ctx.vreg("v_tmp1"),
                             ctx.vreg("v_tmp2"), a_out)
+
+        # Save m_row_base and k_group for per-mi recomputation
+        ctx.alloc_vgpr_permanent(1, "v_m_row_base_a")
+        ctx.v_mul(ctx.vreg("v_m_row_base_a"), str(tile.m_per_wave),
+                  ctx.vreg("v_wave_m"), comment=f"m_row_base = wave_m * {tile.m_per_wave}")
+        ctx.v_add(ctx.vreg("v_m_row_base_a"), ctx.vreg("v_m_row_base_a"),
+                  ctx.vreg("v_tmp0"), comment="+ lane_row (persistent)")
+        ctx.alloc_vgpr_permanent(1, "v_k_group_a")
+        ctx.v_mov(ctx.vreg("v_k_group_a"), ctx.vreg("v_tmp1"),
+                  comment="k_group (persistent)")
         ctx.raw("")
 
         # B: n_row = wave_n * n_per_wave + lane_row
@@ -793,6 +797,16 @@ def phase_dtl_interleaved_setup(level: TileLevel, ctx: AsmContext) -> None:
         swz.emit_read_setup(ctx, swz_layout, LDS_GFX950,
                             ctx.vreg("v_lds_rd_b"), ctx.vreg("v_tmp1"),
                             ctx.vreg("v_tmp2"), b_out)
+
+        # Save n_row_base for per-ni recomputation
+        ctx.alloc_vgpr_permanent(1, "v_n_row_base_b")
+        ctx.v_mul(ctx.vreg("v_n_row_base_b"), str(tile.n_per_wave),
+                  ctx.vreg("v_wave_n"), comment=f"n_row_base = wave_n * {tile.n_per_wave}")
+        ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.m - 1,
+                  comment="lane_row (re-derive for save)")
+        ctx.v_add(ctx.vreg("v_n_row_base_b"), ctx.vreg("v_n_row_base_b"),
+                  ctx.vreg("v_tmp0"), comment="+ lane_row (persistent)")
+        ctx.raw("")
     elif swz is not None:
         # Legacy swizzle (non-paired)
         from ..memory.swizzle import DataLayout as SwzLayout, LDS_GFX950

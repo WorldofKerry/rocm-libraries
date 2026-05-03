@@ -242,6 +242,10 @@ class DSReadBlock(BuildingBlock):
 
                 def _mk(mi_=mi, ki_=ki, buf_=buf):
                     def emit():
+                        # Recompute swizzled base for this mi
+                        # (only does work if paired-row swizzle is active)
+                        if ki_ == 0:
+                            reader.emit_recompute_a_for_mi(mi_)
                         reader.emit_read_a(mi_, ki_, buf_)
                     return emit
 
@@ -267,6 +271,8 @@ class DSReadBlock(BuildingBlock):
 
                 def _mk(ni_=ni, ki_=ki):
                     def emit():
+                        if ki_ == 0:
+                            reader.emit_recompute_b_for_ni(ni_)
                         reader.emit_read_b(ni_, ki_)
                     return emit
 

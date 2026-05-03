@@ -15,14 +15,15 @@ __all__ = ["LDSReader"]
 def _a_off(mi: int, ki: int, tile: TileConfig, mfma: MfmaConfig, elem: float) -> int:
     """LDS byte offset for A operand at (mi, ki).
 
-    With swizzle: ki is handled by base-register selection, so
-    only the mi row offset is returned.
+    With paired-row swizzle: returns 0 (mi handled by recomputation).
+    With legacy swizzle: ki offset in per-ki base regs, mi row offset only.
     """
     row_start = mi * mfma.m
     row_stride = int(tile.unroll_k * elem)
-    if getattr(tile, 'lds_swizzle', False) or tile.resolved_swizzle(elem) is not None:
-        # Swizzle mode: ki offset is encoded in per-ki base registers
-        # (v_lds_rd_a_k{ki}). Return only the mi row offset.
+    swz = tile.resolved_swizzle(elem)
+    if swz is not None and hasattr(swz, 'pair_factor'):
+        return 0  # mi handled by emit_recompute_a_for_mi
+    if getattr(tile, 'lds_swizzle', False) or swz is not None:
         return int(row_start * row_stride)
     pad_bytes = tile.lds_pad
     tpr = int(tile.unroll_k * elem) // 16
@@ -35,7 +36,10 @@ def _b_off(ni: int, ki: int, tile: TileConfig, mfma: MfmaConfig, elem: float) ->
     """LDS byte offset for B operand at (ni, ki)."""
     row_start = ni * mfma.n
     row_stride = int(tile.unroll_k * elem)
-    if getattr(tile, 'lds_swizzle', False) or tile.resolved_swizzle(elem) is not None:
+    swz = tile.resolved_swizzle(elem)
+    if swz is not None and hasattr(swz, 'pair_factor'):
+        return 0  # ni handled by emit_recompute_b_for_ni
+    if getattr(tile, 'lds_swizzle', False) or swz is not None:
         return int(row_start * row_stride)
     pad_bytes = tile.lds_pad
     tpr = int(tile.unroll_k * elem) // 16
@@ -147,6 +151,146 @@ class LDSReader:
         ctx.s_waitcnt(f"lgkmcnt({wait_cnt})",
                       comment="wait B[ki=0] + A[m0,k0]")
         return inflight
+
+    def emit_recompute_a_for_mi(self, mi: int) -> None:
+        """Recompute v_lds_rd_a (and ki variants) for a new mi value.
+
+        With paired-row swizzle, the column rotation changes per mi
+        because lds_row = m_row // pair_factor changes. This method
+        recomputes the read base from scratch for the given mi.
+
+        Must be called before emit_read_a(mi, ...) when mi changes.
+        """
+        swz = self._swizzle
+        if swz is None or not hasattr(swz, 'pair_factor'):
+            return  # non-swizzle or non-paired: _a_off handles mi offset
+
+        from .swizzle import DataLayout as SwzLayout, LDS_GFX950
+        import math
+        ctx = self.ctx
+        tile = self.tile
+        elem = self.elem
+        pf = swz.pair_factor
+        ec = swz.effective_cols
+        oc = swz.orig_cols
+        eff_stride = ec * 16
+
+        swz_layout = SwzLayout(
+            row_stride_bytes=int(tile.unroll_k * elem),
+            mfma_k=self.mfma.k, mfma_m=self.mfma.m,
+            elem_bytes=elem, wave_size=tile.wave_size)
+
+        # m_row_base = mi * mfma_m (offset from the lane's initial m_row)
+        # The initial v_lds_rd_a was set up for mi=0.
+        # We need to recompute from: m_row = wave_m * m_per_wave + lane_row + mi * mfma_m
+        # But we don't have wave_m or lane_row here. Instead, store the
+        # initial m_row in a permanent VGPR during setup, and add mi*mfma_m.
+
+        # Use v_tmp regs for recomputation
+        m_row_delta = mi * self.mfma.m
+        if not ctx.has("v_m_row_base_a"):
+            return  # setup didn't allocate this -- fallback to _a_off
+
+        # m_row = v_m_row_base_a + mi * mfma_m
+        if m_row_delta > 0:
+            if m_row_delta > 64:
+                ctx.s_mov(ctx.sreg("s_tmp0"), str(m_row_delta),
+                          comment=f"mi_delta={m_row_delta}")
+                ctx.v_add(ctx.vreg("v_tmp2"), ctx.vreg("v_m_row_base_a"),
+                          ctx.sreg("s_tmp0"),
+                          comment=f"m_row = m_row_base + {m_row_delta} (mi={mi})")
+            else:
+                ctx.v_add(ctx.vreg("v_tmp2"), ctx.vreg("v_m_row_base_a"),
+                          str(m_row_delta),
+                          comment=f"m_row = m_row_base + {m_row_delta} (mi={mi})")
+        else:
+            ctx.v_mov(ctx.vreg("v_tmp2"), ctx.vreg("v_m_row_base_a"),
+                      comment="m_row = m_row_base (mi=0)")
+
+        # row_base = (m_row / pf) * eff_stride
+        ctx.v_lshr(ctx.vreg("v_tmp3"), ctx.vreg("v_tmp2"),
+                   int(math.log2(pf)),
+                   comment=f"lds_row = m_row / {pf}")
+        ctx.v_mul(ctx.vreg("v_tmp3"), str(eff_stride), ctx.vreg("v_tmp3"),
+                  comment=f"row_base = lds_row * {eff_stride}")
+
+        # Recompute swizzled read setup into v_lds_rd_a (and ki variants)
+        ki_count = swz_layout.ki_count
+        a_out = [ctx.vreg("v_lds_rd_a")]
+        for ki in range(1, ki_count):
+            a_out.append(ctx.vreg(f"v_lds_rd_a_k{ki}"))
+
+        swz.emit_read_setup(ctx, swz_layout, LDS_GFX950,
+                            ctx.vreg("v_tmp2"),      # m_row
+                            ctx.vreg("v_k_group_a"), # k_group
+                            ctx.vreg("v_tmp3"),      # row_base
+                            a_out)
+
+    def emit_recompute_b_for_ni(self, ni: int) -> None:
+        """Recompute v_lds_rd_b (and ki variants) for a new ni value.
+
+        Same logic as emit_recompute_a_for_mi but for B operand.
+        """
+        swz = self._swizzle
+        if swz is None or not hasattr(swz, 'pair_factor'):
+            return
+
+        from .swizzle import DataLayout as SwzLayout, LDS_GFX950
+        import math
+        ctx = self.ctx
+        tile = self.tile
+        elem = self.elem
+        pf = swz.pair_factor
+        ec = swz.effective_cols
+        eff_stride = ec * 16
+
+        swz_layout = SwzLayout(
+            row_stride_bytes=int(tile.unroll_k * elem),
+            mfma_k=self.mfma.k, mfma_m=self.mfma.m,
+            elem_bytes=elem, wave_size=tile.wave_size)
+
+        n_row_delta = ni * self.mfma.n
+        if not ctx.has("v_n_row_base_b"):
+            return
+
+        if n_row_delta > 0:
+            if n_row_delta > 64:
+                ctx.s_mov(ctx.sreg("s_tmp0"), str(n_row_delta),
+                          comment=f"ni_delta={n_row_delta}")
+                ctx.v_add(ctx.vreg("v_tmp2"), ctx.vreg("v_n_row_base_b"),
+                          ctx.sreg("s_tmp0"),
+                          comment=f"n_row = n_row_base + {n_row_delta} (ni={ni})")
+            else:
+                ctx.v_add(ctx.vreg("v_tmp2"), ctx.vreg("v_n_row_base_b"),
+                          str(n_row_delta),
+                          comment=f"n_row = n_row_base + {n_row_delta} (ni={ni})")
+        else:
+            ctx.v_mov(ctx.vreg("v_tmp2"), ctx.vreg("v_n_row_base_b"),
+                      comment="n_row = n_row_base (ni=0)")
+
+        ctx.v_lshr(ctx.vreg("v_tmp3"), ctx.vreg("v_tmp2"),
+                   int(math.log2(pf)),
+                   comment=f"lds_row = n_row / {pf}")
+        ctx.v_mul(ctx.vreg("v_tmp3"), str(eff_stride), ctx.vreg("v_tmp3"),
+                  comment=f"row_base = lds_row * {eff_stride}")
+
+        # Add B LDS offset
+        lds_b_off = int(tile.wg_m * tile.unroll_k * elem)
+        ctx.s_mov(ctx.sreg("s_tmp0"), str(lds_b_off),
+                  comment=f"lds_b_off={lds_b_off}")
+        ctx.v_add(ctx.vreg("v_tmp3"), ctx.vreg("v_tmp3"),
+                  ctx.sreg("s_tmp0"), comment="+ lds_b_offset")
+
+        ki_count = swz_layout.ki_count
+        b_out = [ctx.vreg("v_lds_rd_b")]
+        for ki in range(1, ki_count):
+            b_out.append(ctx.vreg(f"v_lds_rd_b_k{ki}"))
+
+        swz.emit_read_setup(ctx, swz_layout, LDS_GFX950,
+                            ctx.vreg("v_tmp2"),
+                            ctx.vreg("v_k_group_a"),  # same k_group
+                            ctx.vreg("v_tmp3"),
+                            b_out)
 
     def emit_recompute_ki_bases(self) -> None:
         """Recompute per-ki LDS read base VGPRs (after toggle or first use)."""
