@@ -464,10 +464,16 @@ def pipeline_kloop_phase(level, ctx) -> None:
     if ctx._metadata.get("pgr2", False) and pgr < 2:
         pgr = 2
 
-    auto_pipeline = ctx._metadata.get("auto_pipeline", False)
-    if auto_pipeline:
-        from .auto_pipeline import AutoPipelinedCompute
-        compute = AutoPipelinedCompute(loader, reader, scale_loader, pgr=pgr)
+    pipeline_strategy = ctx._metadata.get("pipeline_strategy", None)
+    if pipeline_strategy is not None:
+        # pipeline_strategy is a class or callable that builds a ComputePipeline
+        if isinstance(pipeline_strategy, type):
+            compute = pipeline_strategy(loader, reader, scale_loader, pgr=pgr)
+        elif callable(pipeline_strategy):
+            compute = pipeline_strategy(loader, reader, scale_loader, pgr=pgr)
+        else:
+            # Already an instance -- use directly (must implement emit(ctx))
+            compute = pipeline_strategy
     else:
         compute = ScheduledCompute(loader, reader, scale_loader, pgr=pgr)
 

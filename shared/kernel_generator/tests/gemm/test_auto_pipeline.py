@@ -7,6 +7,7 @@ import pytest
 from kernel_generator.gemm.problem import GemmProblem, DataType
 from kernel_generator.gemm.kernel import GemmKernel
 from kernel_generator.gemm.schedule.auto_pipeline import (
+    AutoPipelinedCompute,
     SoftwarePipeline, PipelineStage, StageDep, ResourceConfig,
 )
 
@@ -98,8 +99,8 @@ class TestAutoVsManualAssembly:
     @pytest.mark.parametrize("dtype", [DataType.F16, DataType.BF16])
     def test_pgr1_identical(self, dtype):
         p = GemmProblem(4096, 4096, 4096, dtype=dtype)
-        auto = GemmKernel.build(p, auto_pipeline=True, pgr=1)
-        manual = GemmKernel.build(p, auto_pipeline=False, pgr=1)
+        auto = GemmKernel.build(p, pipeline_strategy=AutoPipelinedCompute, pgr=1)
+        manual = GemmKernel.build(p, pgr=1)
 
         auto_inst = _strip_instructions(auto.emit().asm_text)
         manual_inst = _strip_instructions(manual.emit().asm_text)
@@ -109,8 +110,8 @@ class TestAutoVsManualAssembly:
     @pytest.mark.parametrize("dtype", [DataType.F16, DataType.BF16])
     def test_pgr2_identical(self, dtype):
         p = GemmProblem(4096, 4096, 4096, dtype=dtype)
-        auto = GemmKernel.build(p, auto_pipeline=True, pgr=2)
-        manual = GemmKernel.build(p, auto_pipeline=False, pgr=2)
+        auto = GemmKernel.build(p, pipeline_strategy=AutoPipelinedCompute, pgr=2)
+        manual = GemmKernel.build(p, pgr=2)
 
         auto_inst = _strip_instructions(auto.emit().asm_text)
         manual_inst = _strip_instructions(manual.emit().asm_text)

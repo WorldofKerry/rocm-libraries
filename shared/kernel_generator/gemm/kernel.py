@@ -127,7 +127,7 @@ class GemmKernel:
               pgr: int = 1,
               wg_mapping_xcc: int = 1,
               colmajor_output: bool = False,
-              auto_pipeline: bool = False) -> GemmKernel:
+              pipeline_strategy=None) -> GemmKernel:
         """Build a GemmKernel.  GemmTiling is the source of truth.
 
         Args:
@@ -181,7 +181,7 @@ class GemmKernel:
         k.use_dtl = use_dtl
         k.pgr2 = pgr2
         k.pgr = pgr if pgr > 1 else (2 if pgr2 else 1)
-        k.auto_pipeline = auto_pipeline
+        k.pipeline_strategy = pipeline_strategy
         # Validate PGR vs buffer count (double-buffered = 2)
         num_lds_buffers = 2
         if k.pgr > num_lds_buffers:
@@ -236,7 +236,7 @@ class GemmKernel:
             "pgr": getattr(self, "pgr", 1),
             "wg_mapping_xcc": getattr(self, "wg_mapping_xcc", 1),
             "colmajor_output": getattr(self, "colmajor_output", False),
-            "auto_pipeline": getattr(self, "auto_pipeline", False),
+            "pipeline_strategy": getattr(self, "pipeline_strategy", None),
         }
         if is_dtl:
             alloc_registers_dtl(ctx, self.problem, tile)
