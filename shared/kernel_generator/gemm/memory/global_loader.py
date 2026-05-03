@@ -192,24 +192,27 @@ class BufferLoader(GlobalLoader):
         self._emit_global_loads()
 
     def advance(self) -> None:
+        """Advance SRD base addresses by unroll_k (same as DTLLoader)."""
         ctx = self.ctx
-        for addr in ["v_addr_a", "v_addr_b"]:
-            ctx.inst("v_add_co_u32", ctx.vreg(addr, 0, 1), "vcc",
-                     str(self.k_stride), ctx.vreg(addr, 0, 1),
-                     comment=f"{addr} += {self.k_stride}")
-            ctx.inst("v_addc_co_u32", ctx.vreg(addr, 1, 1), "vcc",
-                     ctx.vreg(addr, 1, 1), "0", "vcc", comment="carry")
+        for srd in ["s_srd_a", "s_srd_b"]:
+            ctx.inst("s_add_u32", ctx.sreg(srd, 0, 1),
+                     ctx.sreg(srd, 0, 1), str(self.k_stride),
+                     comment=f"{srd} += {self.k_stride}")
+            ctx.inst("s_addc_u32", ctx.sreg(srd, 1, 1),
+                     ctx.sreg(srd, 1, 1), "0", comment="carry")
 
     def toggle_write(self) -> None:
+        """Toggle LDS write base for double-buffering (scalar regs)."""
         ctx = self.ctx
-        ctx.inst("v_xor_b32", ctx.vreg("v_lds_wr_a"),
-                 ctx.sreg("s_lds_db_step"), ctx.vreg("v_lds_wr_a"),
+        ctx.inst("s_xor_b32", ctx.sreg("s_lds_wr_a_sg"),
+                 ctx.sreg("s_lds_wr_a_sg"), ctx.sreg("s_lds_db_step"),
                  comment="wr_a ^= db")
-        ctx.inst("v_xor_b32", ctx.vreg("v_lds_wr_b"),
-                 ctx.sreg("s_lds_db_step"), ctx.vreg("v_lds_wr_b"),
+        ctx.inst("s_xor_b32", ctx.sreg("s_lds_wr_b_sg"),
+                 ctx.sreg("s_lds_wr_b_sg"), ctx.sreg("s_lds_db_step"),
                  comment="wr_b ^= db")
 
     def emit_sync(self) -> None:
+        """Wait for global loads, write to LDS, barrier."""
         ctx = self.ctx
         ctx.s_waitcnt("vmcnt(0)", comment="wait global loads")
         self._emit_ds_writes()
@@ -221,16 +224,80 @@ class BufferLoader(GlobalLoader):
         return 0  # all loads drained by emit_sync
 
     def _emit_global_loads(self) -> None:
-        from ..emit.phases import _emit_global_load_no_wait
-        _emit_global_load_no_wait(self.ctx, self.problem, self.tile)
+        """Emit buffer_load_dwordx4 from global memory to VGPRs.
+
+        Reuses the SRD (s_srd_a/b) and voffset (v_dtl_off_a/b) already
+        set up by the DTL setup phase, but loads to VGPRs instead of LDS.
+        Multiple loads use soffset for row group separation.
+        """
+        ctx = self.ctx
+        tile = self.tile
+        elem = self.elem
+        tpr = int(tile.unroll_k * elem) // 16
+        rpl = tile.block_size // tpr
+
+        for name, num_loads in [("a", self.num_loads_a), ("b", self.num_loads_b)]:
+            gload_name = f"v_gload_{name}"
+            total_vgprs = num_loads * 4
+            if not ctx.has(gload_name):
+                ctx.alloc_vgpr_permanent(total_vgprs, gload_name)
+
+            srd = ctx.sreg(f"s_srd_{name}", 0, 4)
+            voff = ctx.vreg(f"v_dtl_off_{name}")
+            soff_name = f"s_soffset_{name}"
+
+            for i in range(num_loads):
+                dst = ctx.vreg(gload_name, i * 4, 4)
+                if i == 0:
+                    ctx.inst("buffer_load_dwordx4", dst, voff, srd,
+                             "0", "offen",
+                             comment=f"global load {name.upper()}[{i}]")
+                else:
+                    # Use precomputed scalar offset for this load group
+                    has_pre = ctx.has(f"s_dtl_soff_{name}{i}")
+                    if has_pre:
+                        soff = ctx.sreg(f"s_dtl_soff_{name}{i}")
+                    else:
+                        # Compute: soffset = i * soffset_stride
+                        ctx.s_mul(ctx.sreg("s_tmp0"),
+                                  ctx.sreg(soff_name), str(i),
+                                  comment=f"soff = {i} * soffset_{name}")
+                        soff = ctx.sreg("s_tmp0")
+                    ctx.inst("buffer_load_dwordx4", dst, voff, srd,
+                             soff, "offen",
+                             comment=f"global load {name.upper()}[{i}]")
 
     def _emit_ds_writes(self) -> None:
+        """Write loaded VGPRs to LDS.
+
+        Computes LDS write address = scalar base (s_lds_wr_{a,b}_sg)
+        + per-thread offset (v_dtl_off_{a,b}). The DTL offset is the
+        same row*stride+col layout used for DTL, which is correct for
+        non-swizzled access.
+        """
         ctx = self.ctx
+        tile = self.tile
+        elem = self.elem
+        tpr = int(tile.unroll_k * elem) // 16
+        rpl = tile.block_size // tpr
+        row_stride = int(tile.unroll_k * elem)
+        lds_group_stride = rpl * row_stride + tile.lds_pad
+
         for name in ["a", "b"]:
-            load = ctx.get(f"v_gload_{name}")
-            addr_reg = ctx.vreg(f"v_lds_wr_{name}")
-            for i in range(0, load.count, 4):
-                cnt = min(4, load.count - i)
-                src = ctx.vreg(f"v_gload_{name}", i, cnt)
-                ctx.ds_write(addr_reg, src, offset=i * 4, width=cnt,
-                             comment=f"LDS write {name.upper()}[{i}:{i+cnt}]")
+            gload_name = f"v_gload_{name}"
+            if not ctx.has(gload_name):
+                continue
+            load = ctx.get(gload_name)
+            num_loads = load.count // 4
+            voff = ctx.vreg(f"v_dtl_off_{name}")
+
+            # LDS addr = scalar_base + per-thread offset
+            ctx.v_add(ctx.vreg("v_tmp0"), ctx.sreg(f"s_lds_wr_{name}_sg"),
+                      voff, comment=f"LDS addr {name.upper()} = base + voff")
+
+            for i in range(num_loads):
+                src = ctx.vreg(gload_name, i * 4, 4)
+                offset = i * lds_group_stride
+                ctx.ds_write(ctx.vreg("v_tmp0"), src, offset=offset,
+                             width=4,
+                             comment=f"LDS write {name.upper()}[{i}]")

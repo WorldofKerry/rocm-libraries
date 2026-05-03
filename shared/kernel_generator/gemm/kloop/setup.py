@@ -469,16 +469,10 @@ def phase_dtl_interleaved_setup(level: TileLevel, ctx: AsmContext) -> None:
                comment="thread_row")
     ctx.v_and(ctx.vreg("v_tmp1"), ctx.vreg("v_tid"), threads_per_row - 1,
               comment="thread_col_group")
-    swz = tile.resolved_swizzle(elem)
-    if swz is not None:
-        from ..memory.swizzle import DataLayout as SwzLayout
-        swz_layout = SwzLayout(row_stride_bytes=int(tile.unroll_k * elem),
-                               mfma_k=mfma.k, mfma_m=mfma.m,
-                               elem_bytes=elem, wave_size=tile.wave_size)
-        from ..memory.swizzle import LDS_GFX950
-        swz.emit_write_swizzle(ctx, swz_layout, LDS_GFX950,
-                               ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),
-                               ctx.vreg("v_tmp1"))
+    # Note: swizzle is NOT applied to DTL offsets because DTL uses the
+    # same offset for both global read and LDS write. Swizzling would
+    # read from wrong global addresses. Swizzle is handled by the
+    # BufferLoader path instead (global_load -> VGPR -> ds_write).
     ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_tmp1"), 4,
                comment="* 16 -> col_bytes")
 

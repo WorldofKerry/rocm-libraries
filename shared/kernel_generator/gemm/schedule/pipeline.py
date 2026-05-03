@@ -464,6 +464,18 @@ def pipeline_kloop_phase(level, ctx) -> None:
     if ctx._metadata.get("pgr2", False) and pgr < 2:
         pgr = 2
 
+    # Force BufferLoader when swizzle is enabled (DTL can't swizzle independently)
+    # Only if the kernel was built for BufferLoader (has v_addr_a setup)
+    if tile.resolved_swizzle(problem.element_bytes) is not None and use_dtl:
+        if ctx.has("v_addr_a"):
+            use_dtl = False
+            loader_cls = BufferLoader
+            loader = loader_cls(ctx, tile, problem)
+        else:
+            # DTL path: swizzle not supported, disable it
+            tile.lds_swizzle = False
+            tile.swizzle = None
+
     pipeline_strategy = ctx._metadata.get("pipeline_strategy", None)
     if pipeline_strategy is not None:
         # Explicit strategy: class, callable, or pre-built instance
