@@ -451,11 +451,12 @@ def _store_d_colmajor(ctx: AsmContext, tile: TileConfig, mfma: MfmaConfig, acc_p
     - soffset: ni * mfma.n * col_stride (N advancement, large, in SGPR)
     - immediate offset: (mi * mfma.m + ai) * elem (M advancement, small)
 
-    Uses buffer_store_dword to store packed BF16/FP16 pairs (ai, ai+1)
-    at consecutive M addresses, avoiding potential buffer_store_short
-    format conversion issues on gfx950.
+    Uses buffer_store_dwordx2 (GWVW=4) when acc_per is divisible by 4,
+    or buffer_store_dword (GWVW=2) when divisible by 2, to store
+    packed BF16/FP16 at consecutive M addresses.
     """
     cvt_inst = "v_cvt_pk_bf16_f32" if use_bf16 else "v_cvt_pk_f16_f32"
+    use_gwvw4 = acc_per >= 4 and acc_per % 4 == 0
 
     for ni in range(tile.mfma_n_repeat):
         # soffset_ni = ni * mfma.n * col_stride
@@ -469,12 +470,33 @@ def _store_d_colmajor(ctx: AsmContext, tile: TileConfig, mfma: MfmaConfig, acc_p
                               f" (ni={ni})")
 
         for mi in range(tile.mfma_m_repeat):
-            if acc_per % 2 == 0:
+            if use_gwvw4:
+                # GWVW=4: pack 4 elements into buffer_store_dwordx2
+                for ai_base in range(0, acc_per, 4):
+                    imm = (mi * mfma.m + ai_base) * elem_int
+                    # Pack pairs: (ai+0, ai+1) -> v_store_tmp, (ai+2, ai+3) -> v_store_tmp+1
+                    for pair in range(2):
+                        ai_lo = ai_base + pair * 2
+                        ai_hi = ai_lo + 1
+                        acc_lo = (mi * tile.mfma_n_repeat + ni) * acc_per + ai_lo
+                        acc_hi = (mi * tile.mfma_n_repeat + ni) * acc_per + ai_hi
+                        ctx.inst("v_accvgpr_read_b32", ctx.vreg("v_tmp0"),
+                                 ctx.areg("acc_C", acc_lo, 1),
+                                 comment=f"acc[{acc_lo}] a{ai_lo}")
+                        ctx.inst("v_accvgpr_read_b32", ctx.vreg("v_tmp1"),
+                                 ctx.areg("acc_C", acc_hi, 1),
+                                 comment=f"acc[{acc_hi}] a{ai_hi}")
+                        ctx.inst(cvt_inst, ctx.vreg("v_store_tmp", pair, 1),
+                                 ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),
+                                 comment=f"pk cvt a{ai_lo},a{ai_hi}")
+                    # Store 8 bytes (4 bf16/fp16 values)
+                    _emit_buffer_store_dwordx2(ctx, "v_store_tmp",
+                                               "s_tmp1", imm,
+                                               f"store D m{mi}_n{ni} GWVW=4")
+            elif acc_per % 2 == 0:
                 for ai_base in range(0, acc_per, 2):
                     ai_lo = ai_base
                     ai_hi = ai_base + 1
-                    # Column-major: ai_lo and ai_hi are at consecutive M addresses
-                    # so we can store the packed dword (2x bf16) at ai_lo's address
                     imm_lo = (mi * mfma.m + ai_lo) * elem_int
 
                     acc_idx_lo = (mi * tile.mfma_n_repeat + ni) * acc_per + ai_lo
@@ -490,7 +512,6 @@ def _store_d_colmajor(ctx: AsmContext, tile: TileConfig, mfma: MfmaConfig, acc_p
                              ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),
                              comment=f"pk cvt a{ai_lo},a{ai_hi}")
 
-                    # Store packed dword (both bf16 values at consecutive M rows)
                     _emit_buffer_store_dword(ctx, "v_store_tmp",
                                              "s_tmp1", imm_lo,
                                              f"store D m{mi}_n{ni}_a{ai_lo}a{ai_hi}")
@@ -630,6 +651,33 @@ def _emit_buffer_store_dword(ctx: AsmContext, vdata_name: str, soffset_name: str
         ctx.inst("s_add_u32", soffset, soffset, str(imm_offset),
                  comment=f"fold imm {imm_offset} into soffset")
         ctx.inst("buffer_store_dword", vdata, voffset, srd,
+                 soffset, "offen nt", comment=comment)
+        ctx.inst("s_sub_u32", soffset, soffset, str(imm_offset),
+                 comment="restore soffset")
+
+
+def _emit_buffer_store_dwordx2(ctx: AsmContext, vdata_name: str, soffset_name: str, imm_offset: int,
+                               comment):
+    """Emit one buffer_store_dwordx2 via the D matrix SRD (GWVW=4).
+
+    Stores 64 bits (four packed BF16/FP16 values) at consecutive addresses.
+    """
+    vdata = ctx.vreg(vdata_name, 0, 2)
+    voffset = ctx.vreg("v_addr_d", 0, 1)
+    srd = ctx.sreg("s_srd_d", 0, 4)
+    soffset = ctx.sreg(soffset_name)
+
+    if imm_offset == 0:
+        ctx.inst("buffer_store_dwordx2", vdata, voffset, srd,
+                 soffset, "offen nt", comment=comment)
+    elif imm_offset < 4096:
+        ctx.inst("buffer_store_dwordx2", vdata, voffset, srd,
+                 soffset, f"offen offset:{imm_offset} nt",
+                 comment=comment)
+    else:
+        ctx.inst("s_add_u32", soffset, soffset, str(imm_offset),
+                 comment=f"fold imm {imm_offset} into soffset")
+        ctx.inst("buffer_store_dwordx2", vdata, voffset, srd,
                  soffset, "offen nt", comment=comment)
         ctx.inst("s_sub_u32", soffset, soffset, str(imm_offset),
                  comment="restore soffset")
