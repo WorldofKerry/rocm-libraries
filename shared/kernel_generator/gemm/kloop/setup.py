@@ -39,12 +39,22 @@ def _layouts(ctx: AsmContext) -> GemmLayouts: return ctx._metadata["layouts"]
 def _a_off(mi: int, ki: int, tile: TileConfig, mfma: MfmaConfig, elem: float) -> int:
     """LDS byte offset for A operand at (mi, ki).
 
-    When lds_swizzle is enabled the ki contribution is handled by
-    base-register selection (v_lds_rd_a for ki=0, XOR toggle for ki>0),
-    so this returns only the mi row offset.
+    With paired-row swizzle: ki is handled by per-ki base VGPRs,
+    and row offset uses paired layout (lds_row * eff_stride).
+    Without swizzle: standard row*stride + ki*k_elems*elem + padding.
     """
     row_start = mi * mfma.m
     row_stride = int(tile.unroll_k * elem)
+    swz = tile.resolved_swizzle(elem)
+    if swz is not None and hasattr(swz, 'pair_factor'):
+        # Paired layout: offset = (row_start / pair_factor) * eff_stride
+        # But the actual per-lane offset is computed at runtime via
+        # emit_read_setup. The mi offset just advances the row_base
+        # by mi * mfma.m rows in the paired layout.
+        pf = swz.pair_factor
+        eff_stride = swz.effective_cols * 16
+        lds_row = row_start // pf
+        return int(lds_row * eff_stride)
     if getattr(tile, 'lds_swizzle', False):
         return int(row_start * row_stride)
     pad_bytes = tile.lds_pad
@@ -58,6 +68,12 @@ def _b_off(ni: int, ki: int, tile: TileConfig, mfma: MfmaConfig, elem: float) ->
     """LDS byte offset for B operand at (ni, ki)."""
     row_start = ni * mfma.n
     row_stride = int(tile.unroll_k * elem)
+    swz = tile.resolved_swizzle(elem)
+    if swz is not None and hasattr(swz, 'pair_factor'):
+        pf = swz.pair_factor
+        eff_stride = swz.effective_cols * 16
+        lds_row = row_start // pf
+        return int(lds_row * eff_stride)
     if getattr(tile, 'lds_swizzle', False):
         return int(row_start * row_stride)
     pad_bytes = tile.lds_pad
@@ -195,7 +211,17 @@ def phase_wave_abi_setup(level: TileLevel, ctx: AsmContext) -> None:
                   ctx.vreg("v_tmp4"), comment="+ swizzled_col_bytes")
         ctx.raw("")
 
-    # DTL voffset = thread_row * K * elem + col_bytes (unswizzled)
+    # LDS write offset = thread_row * unroll_k * elem + col_bytes
+    # This uses the LDS row stride (unroll_k*elem), NOT the global stride (K*elem)
+    row_stride_lds = int(tile.unroll_k * elem)
+    ctx.alloc_vgpr_permanent(1, "v_lds_wr_off")
+    ctx.v_mul(ctx.vreg("v_lds_wr_off"), str(row_stride_lds),
+              ctx.vreg("v_tmp0"), comment=f"row * {row_stride_lds} (LDS stride)")
+    ctx.v_add(ctx.vreg("v_lds_wr_off"), ctx.vreg("v_lds_wr_off"),
+              ctx.vreg("v_tmp1"), comment="+ col_bytes -> v_lds_wr_off")
+    ctx.raw("")
+
+    # DTL voffset = thread_row * K * elem + col_bytes (global stride)
     ctx.inst("v_mul_lo_u32", ctx.vreg("v_dtl_off_a"),
              ctx.sreg("s_k_stride"), ctx.vreg("v_tmp0"), comment="row * K*elem")
     ctx.v_add(ctx.vreg("v_dtl_off_a"), ctx.vreg("v_dtl_off_a"),
@@ -602,7 +628,17 @@ def phase_dtl_interleaved_setup(level: TileLevel, ctx: AsmContext) -> None:
                   ctx.vreg("v_tmp4"), comment="+ swizzled_col_bytes")
         ctx.raw("")
 
-    # DTL voffset = thread_row * K * elem + col_bytes (unswizzled)
+    # LDS write offset = thread_row * unroll_k * elem + col_bytes
+    # This uses the LDS row stride (unroll_k*elem), NOT the global stride (K*elem)
+    row_stride_lds = int(tile.unroll_k * elem)
+    ctx.alloc_vgpr_permanent(1, "v_lds_wr_off")
+    ctx.v_mul(ctx.vreg("v_lds_wr_off"), str(row_stride_lds),
+              ctx.vreg("v_tmp0"), comment=f"row * {row_stride_lds} (LDS stride)")
+    ctx.v_add(ctx.vreg("v_lds_wr_off"), ctx.vreg("v_lds_wr_off"),
+              ctx.vreg("v_tmp1"), comment="+ col_bytes -> v_lds_wr_off")
+    ctx.raw("")
+
+    # DTL voffset = thread_row * K * elem + col_bytes (global stride)
     ctx.inst("v_mul_lo_u32", ctx.vreg("v_dtl_off_a"),
              ctx.sreg("s_k_stride"), ctx.vreg("v_tmp0"), comment="row * K*elem")
     ctx.v_add(ctx.vreg("v_dtl_off_a"), ctx.vreg("v_dtl_off_a"),

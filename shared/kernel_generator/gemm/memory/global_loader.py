@@ -212,10 +212,13 @@ class BufferLoader(GlobalLoader):
                  comment="wr_b ^= db")
 
     def emit_sync(self) -> None:
-        """Wait for global loads, write to LDS, barrier."""
+        """Wait for LDS writes (issued during emit_produce), then barrier.
+
+        ds_writes are issued inside the load skip check (emit_produce)
+        so they only run when new data was loaded. This method just
+        waits for them and synchronizes.
+        """
         ctx = self.ctx
-        ctx.s_waitcnt("vmcnt(0)", comment="wait global loads")
-        self._emit_ds_writes()
         ctx.s_waitcnt("lgkmcnt(0)", comment="wait LDS writes")
         ctx.s_barrier(comment="sync")
 
@@ -271,7 +274,8 @@ class BufferLoader(GlobalLoader):
         """Write loaded VGPRs to LDS.
 
         When swizzle is active, uses v_lds_wr_swz (pre-computed swizzled
-        offset from setup phase). Otherwise uses v_dtl_off (unswizzled).
+        offset from setup phase). Otherwise uses v_lds_wr_off (LDS offset
+        using unroll_k stride, NOT the global K stride in v_dtl_off).
         Both are combined with the scalar LDS base for double-buffering.
         """
         ctx = self.ctx
@@ -299,17 +303,23 @@ class BufferLoader(GlobalLoader):
             num_loads = load.count // 4
 
             if has_swz:
-                # Swizzled: use v_lds_wr_swz + scalar base
                 ctx.v_add(ctx.vreg("v_tmp0"),
                           ctx.sreg(f"s_lds_wr_{name}_sg"),
                           ctx.vreg("v_lds_wr_swz"),
                           comment=f"LDS addr {name.upper()} = base + swizzled")
             else:
-                # Unswizzled: use v_dtl_off + scalar base
-                ctx.v_add(ctx.vreg("v_tmp0"),
-                          ctx.sreg(f"s_lds_wr_{name}_sg"),
-                          ctx.vreg(f"v_dtl_off_{name}"),
-                          comment=f"LDS addr {name.upper()} = base + voff")
+                # Compute LDS offset: thread_row * unroll_k*elem + col_bytes
+                # v_lds_wr_off was precomputed in setup with the LDS row stride
+                if ctx.has("v_lds_wr_off"):
+                    ctx.v_add(ctx.vreg("v_tmp0"),
+                              ctx.sreg(f"s_lds_wr_{name}_sg"),
+                              ctx.vreg("v_lds_wr_off"),
+                              comment=f"LDS addr {name.upper()} = base + lds_off")
+                else:
+                    ctx.v_add(ctx.vreg("v_tmp0"),
+                              ctx.sreg(f"s_lds_wr_{name}_sg"),
+                              ctx.vreg(f"v_dtl_off_{name}"),
+                              comment=f"LDS addr {name.upper()} = base + voff")
 
             for i in range(num_loads):
                 src = ctx.vreg(gload_name, i * 4, 4)

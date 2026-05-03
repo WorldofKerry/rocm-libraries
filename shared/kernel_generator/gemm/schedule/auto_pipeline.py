@@ -398,6 +398,7 @@ class GlobalLoadStageEmitter(StageEmitter):
         self.scale_loader = scale_loader
 
     def emit_ramp_up(self, ctx, stage_index, is_first):
+        from ..memory.global_loader import BufferLoader
         loader = self.loader
         schedule = self.schedule
         scale_loader = self.scale_loader
@@ -412,7 +413,11 @@ class GlobalLoadStageEmitter(StageEmitter):
                 ctx.s_waitcnt(f"vmcnt({extra})",
                               comment=f"wait DTL (leave {extra} scales)")
             else:
-                ctx.s_waitcnt("vmcnt(0)", comment="wait DTL loads")
+                ctx.s_waitcnt("vmcnt(0)", comment="wait loads")
+            # BufferLoader: data is in VGPRs, write to LDS before barrier
+            if isinstance(loader, BufferLoader):
+                loader._emit_ds_writes()
+                ctx.s_waitcnt("lgkmcnt(0)", comment="wait LDS writes")
             ctx.s_barrier(comment="sync tile 0")
         else:
             ctx.inst("s_cmp_le_u32", ctx.sreg("s_k_tiles"),
@@ -434,6 +439,7 @@ class GlobalLoadStageEmitter(StageEmitter):
             ctx.label(f"pgr_skip_{stage_index}")
 
     def emit_produce(self, ctx):
+        from ..memory.global_loader import BufferLoader
         schedule = self.schedule
         scale_loader = self.scale_loader
         for op in schedule.prefetch_ops:
@@ -445,12 +451,18 @@ class GlobalLoadStageEmitter(StageEmitter):
             for op in schedule.prologue_scale_ops:
                 if op.emit:
                     op.emit()
+        # BufferLoader: wait for global loads and write to LDS
+        # This is inside the skip check, so it only runs when
+        # new data was actually loaded.
+        if isinstance(self.loader, BufferLoader):
+            ctx.s_waitcnt("vmcnt(0)", comment="wait global loads")
+            self.loader._emit_ds_writes()
 
     def emit_consume(self, ctx):
         pass  # G stage has no consumer phase
 
     def emit_sync(self, ctx):
-        """Emit barrier + early B reads (overlap with sync)."""
+        """Emit sync: for BufferLoader, ds_write + wait; then barrier."""
         self.loader.emit_sync()
         ctx.raw("")
 
