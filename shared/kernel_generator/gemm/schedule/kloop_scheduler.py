@@ -468,6 +468,8 @@ def scheduled_kloop_phase(level, ctx) -> None:
     ctx.comment("=== Scheduled K-loop ===")
     ctx.s_lshr(ctx.sreg("s_k_tiles"), ctx.sreg("s_K"), log2_uk,
                comment=f"k_tiles = K / {tile.unroll_k}")
+    ctx.alloc_sgpr_permanent(1, "s_rd_db")
+    ctx.s_mov(ctx.sreg("s_rd_db"), "0", comment="rd_db = 0 (read from buffer 0)")
     ctx.s_mov(ctx.sreg("s_lds_db_step"), str(lds_data_half),
               comment=f"DB step = {lds_data_half}")
     ctx.raw("")

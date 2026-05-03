@@ -118,6 +118,11 @@ def alloc_registers(ctx: AsmContext, problem: GemmProblem,
     ctx.alloc_vgpr_permanent(1, "v_tmp2")
     ctx.alloc_vgpr_permanent(1, "v_tmp3")
     ctx.alloc_vgpr_permanent(1, "v_tmp4")
+    ctx.alloc_vgpr_permanent(1, "v_tmp5")
+    ctx.alloc_vgpr_permanent(1, "v_tmp6")
+    ctx.alloc_vgpr_permanent(1, "v_tmp7")
+    ctx.alloc_vgpr_permanent(1, "v_tmp8")
+    ctx.alloc_vgpr_permanent(1, "v_tmp9")
 
     acc_total = tile.mfma_m_repeat * tile.mfma_n_repeat * tile.mfma.acc_vgprs
     ctx.alloc_acc_permanent(acc_total, "acc_C")
@@ -362,6 +367,11 @@ def alloc_registers_dtl(ctx: AsmContext, problem: GemmProblem,
     ctx.alloc_vgpr_permanent(1, "v_tmp2")
     ctx.alloc_vgpr_permanent(1, "v_tmp3")
     ctx.alloc_vgpr_permanent(1, "v_tmp4")
+    ctx.alloc_vgpr_permanent(1, "v_tmp5")
+    ctx.alloc_vgpr_permanent(1, "v_tmp6")
+    ctx.alloc_vgpr_permanent(1, "v_tmp7")
+    ctx.alloc_vgpr_permanent(1, "v_tmp8")
+    ctx.alloc_vgpr_permanent(1, "v_tmp9")
 
     # Accumulators
     acc_total = tile.mfma_m_repeat * tile.mfma_n_repeat * tile.mfma.acc_vgprs

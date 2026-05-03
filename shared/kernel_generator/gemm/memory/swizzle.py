@@ -762,66 +762,104 @@ class PairedRowRotationSwizzle(Swizzle):
                         v_row_base: str, out_vregs: List[str]) -> None:
         """Compute per-ki read base addresses.
 
-        v_lane_row: lane_id % mfma_m (0..15)
-        v_k_group: lane_id / mfma_m
-        v_row_base: byte offset to the start of this lane's LDS row
+        v_lane_row: actual M-row index (not just lane_id % mfma_m)
+        v_k_group: lane_id / mfma_m (sub-column index within 16B chunks)
+        v_row_base: byte offset to this lane's paired LDS row start
 
-        IMPORTANT: v_row_base must already account for the paired layout
-        (i.e., it should be lds_row * effective_stride, not m_row * orig_stride).
-        The caller must compute this correctly.
+        The swizzle operates on 16B columns (k_col), but k_group is a
+        finer granularity (multiple k_groups per column). We convert
+        k_group to k_col and handle the byte-within-column offset.
 
-        The rotation uses v_m_row (the actual M-row index) which must
-        be available in a VGPR. The caller passes this via v_lane_row
-        BUT it must be the actual M-row, not just lane_id % mfma_m.
+        Internal scratch registers: v_tmp6 (col/swizzled_col), v_tmp7
+        (byte_within), v_tmp8 (half_offset), v_tmp9 (lds_row/ki scratch).
+        Chosen to avoid aliasing with any caller's parameters (callers
+        pass v_tmp1-v_tmp5, v_k_group_a, v_lds_rd_a/b as arguments).
         """
         pf = self.pair_factor
         oc = self.orig_cols
         ec = self.effective_cols
-        tmp = ctx.vreg("v_tmp3")
-        col_vreg = ctx.vreg("v_tmp4")
+        col_vreg = ctx.vreg("v_tmp6")
+        bw_vreg = ctx.vreg("v_tmp7")       # byte_within
+        half_vreg = ctx.vreg("v_tmp8")      # half_offset
+        lds_row_vreg = ctx.vreg("v_tmp9")   # lds_row / ki scratch
 
-        # half_offset = (m_row % pair_factor) * orig_cols
+        k_per_group = layout.mfma_k // (layout.wave_size // layout.mfma_m)
+        bytes_per_kgroup = int(k_per_group * layout.elem_bytes)
+        kgroups_per_col = 16 // bytes_per_kgroup  # typically 2
+
+        # Phase 1: extract ALL values from parameters before any writes
+        # that could alias them.
+
+        # 1a. k_col = k_group / kgroups_per_col
+        if kgroups_per_col > 1:
+            log2_kpc = int(math.log2(kgroups_per_col))
+            ctx.v_lshr(col_vreg, v_k_group, log2_kpc,
+                       comment=f"k_col = k_group / {kgroups_per_col}")
+        else:
+            ctx.v_mov(col_vreg, v_k_group, comment="k_col = k_group")
+
+        # 1b. byte_within = (k_group % kgroups_per_col) * bytes_per_kgroup
+        if kgroups_per_col > 1:
+            ctx.v_and(bw_vreg, v_k_group, kgroups_per_col - 1,
+                      comment=f"k_group % {kgroups_per_col}")
+            ctx.v_lshl(bw_vreg, bw_vreg, int(math.log2(bytes_per_kgroup)),
+                       comment=f"* {bytes_per_kgroup} -> byte_within")
+        # v_k_group is no longer needed
+
+        # 1c. half_offset = (m_row % pair_factor) * orig_cols
         if pf == 2:
-            ctx.v_and(tmp, v_lane_row, 1,
-                      comment="m_row % 2")
-            ctx.v_lshl(tmp, tmp, int(math.log2(oc)),
+            ctx.v_and(half_vreg, v_lane_row, 1, comment="m_row % 2")
+            ctx.v_lshl(half_vreg, half_vreg, int(math.log2(oc)),
                        comment=f"* {oc} -> half_offset")
         else:
-            ctx.v_and(tmp, v_lane_row, pf - 1,
+            ctx.v_and(half_vreg, v_lane_row, pf - 1,
                       comment=f"m_row % {pf}")
-            ctx.v_mul(tmp, str(oc), tmp,
-                      comment=f"* {oc}")
+            if oc > 1 and (oc & (oc - 1)) == 0:
+                ctx.v_lshl(half_vreg, half_vreg, int(math.log2(oc)),
+                           comment=f"* {oc}")
+            else:
+                ctx.v_mul(half_vreg, str(oc), half_vreg,
+                          comment=f"* {oc}")
 
-        # lds_row = m_row / pair_factor (rotation key)
-        ctx.v_lshr(ctx.vreg("v_tmp2"), v_lane_row, int(math.log2(pf)),
+        # 1d. lds_row = m_row / pair_factor (rotation key)
+        ctx.v_lshr(lds_row_vreg, v_lane_row, int(math.log2(pf)),
                    comment=f"lds_row = m_row / {pf}")
+        # v_lane_row is no longer needed
 
-        # base_col = (half_offset + k_group + lds_row) % eff_cols
-        ctx.v_add(col_vreg, tmp, v_k_group,
-                  comment="half_offset + k_group")
-        ctx.v_add(col_vreg, col_vreg, ctx.vreg("v_tmp2"),
+        # Phase 2: swizzled_col = (half_offset + k_col + lds_row) % eff_cols
+        ctx.v_add(col_vreg, half_vreg, col_vreg,
+                  comment="half_offset + k_col")
+        ctx.v_add(col_vreg, col_vreg, lds_row_vreg,
                   comment="+ lds_row (rotation)")
         ctx.v_and(col_vreg, col_vreg, ec - 1,
                   comment=f"% {ec}")
 
-        # Per-ki base addresses
-        k_step = layout.k_step
+        # Phase 3: per-ki base addresses
+        k_col_step = int(layout.mfma_k * layout.elem_bytes) // 16
+
         for ki in range(len(out_vregs)):
             if ki == 0:
                 ctx.v_lshl(out_vregs[0], col_vreg, 4,
-                           comment="col * 16")
+                           comment="swizzled_col * 16")
                 ctx.v_add(out_vregs[0], out_vregs[0], v_row_base,
                           comment="+ row_base")
+                if kgroups_per_col > 1:
+                    ctx.v_add(out_vregs[0], out_vregs[0], bw_vreg,
+                              comment="+ byte_within_col")
             else:
-                step = ki * k_step
-                ctx.v_add(ctx.vreg("v_tmp2"), col_vreg, str(step),
-                          comment=f"col + {step}")
-                ctx.v_and(ctx.vreg("v_tmp2"), ctx.vreg("v_tmp2"),
-                          ec - 1, comment=f"% {ec}")
-                ctx.v_lshl(out_vregs[ki], ctx.vreg("v_tmp2"), 4,
-                           comment="* 16")
+                step = ki * k_col_step
+                # Reuse lds_row_vreg as scratch (no longer needed)
+                ctx.v_add(lds_row_vreg, col_vreg, str(step),
+                          comment=f"k_col + {step} (ki={ki})")
+                ctx.v_and(lds_row_vreg, lds_row_vreg, ec - 1,
+                          comment=f"% {ec}")
+                ctx.v_lshl(out_vregs[ki], lds_row_vreg, 4,
+                           comment="swizzled_col * 16")
                 ctx.v_add(out_vregs[ki], out_vregs[ki], v_row_base,
                           comment="+ row_base")
+                if kgroups_per_col > 1:
+                    ctx.v_add(out_vregs[ki], out_vregs[ki], bw_vreg,
+                              comment="+ byte_within_col")
 
     def verify_paired(self, layout: DataLayout,
                       mem: BankedMemoryConfig) -> int:

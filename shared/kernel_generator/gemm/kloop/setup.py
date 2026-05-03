@@ -450,8 +450,11 @@ def phase_wave_abi_setup(level: TileLevel, ctx: AsmContext) -> None:
         dtl_b_off = int(tile.wg_m * tile.unroll_k * elem) + num_loads_a__ * tile.lds_pad
     else:
         dtl_b_off = layouts.lds_b_offset
-    ctx.v_add(ctx.vreg("v_lds_rd_b"), str(dtl_b_off),
-              ctx.vreg("v_lds_rd_b"), comment=f"+ lds_b_offset({dtl_b_off})")
+    # Paired-row swizzle already added lds_b_offset in the swizzle block
+    swz_check = tile.resolved_swizzle(elem)
+    if swz_check is None or not hasattr(swz_check, 'pair_factor'):
+        ctx.v_add(ctx.vreg("v_lds_rd_b"), str(dtl_b_off),
+                  ctx.vreg("v_lds_rd_b"), comment=f"+ lds_b_offset({dtl_b_off})")
     ctx.raw("")
 
     # Init accumulators
@@ -898,8 +901,11 @@ def phase_dtl_interleaved_setup(level: TileLevel, ctx: AsmContext) -> None:
         dtl_b_off = int(tile.wg_m * tile.unroll_k * elem) + num_loads_a__ * tile.lds_pad
     else:
         dtl_b_off = layouts.lds_b_offset
-    ctx.v_add(ctx.vreg("v_lds_rd_b"), str(dtl_b_off),
-              ctx.vreg("v_lds_rd_b"), comment=f"+ lds_b_offset({dtl_b_off})")
+    # Paired-row swizzle already added lds_b_offset in the swizzle block
+    swz_check = tile.resolved_swizzle(elem)
+    if swz_check is None or not hasattr(swz_check, 'pair_factor'):
+        ctx.v_add(ctx.vreg("v_lds_rd_b"), str(dtl_b_off),
+                  ctx.vreg("v_lds_rd_b"), comment=f"+ lds_b_offset({dtl_b_off})")
     ctx.raw("")
 
     # Init accumulators

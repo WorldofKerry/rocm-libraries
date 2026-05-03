@@ -140,6 +140,9 @@ class LDSReader:
 
         if ki_count > 1:
             for ni in range(nr):
+                # Paired-row swizzle encodes ni in the base register,
+                # so recompute before each ni's ki>0 read.
+                self.emit_recompute_b_for_ni(ni)
                 self.emit_read_b(ni, 1)
             self.emit_read_a(mi=0, ki=1, buf=0)
             inflight += nr + 1
@@ -220,6 +223,11 @@ class LDSReader:
         for ki in range(1, ki_count):
             a_out.append(ctx.vreg(f"v_lds_rd_a_k{ki}"))
 
+        # Add read-side DB offset (tracks which LDS half to read from)
+        if ctx.has("s_rd_db"):
+            ctx.v_add(ctx.vreg("v_tmp3"), ctx.vreg("v_tmp3"),
+                      ctx.sreg("s_rd_db"), comment="+ rd_db offset")
+
         swz.emit_read_setup(ctx, swz_layout, LDS_GFX950,
                             ctx.vreg("v_tmp2"),      # m_row
                             ctx.vreg("v_k_group_a"), # k_group
@@ -274,12 +282,15 @@ class LDSReader:
         ctx.v_mul(ctx.vreg("v_tmp3"), str(eff_stride), ctx.vreg("v_tmp3"),
                   comment=f"row_base = lds_row * {eff_stride}")
 
-        # Add B LDS offset
+        # Add B LDS offset + read-side DB offset
         lds_b_off = int(tile.wg_m * tile.unroll_k * elem)
         ctx.s_mov(ctx.sreg("s_tmp0"), str(lds_b_off),
                   comment=f"lds_b_off={lds_b_off}")
         ctx.v_add(ctx.vreg("v_tmp3"), ctx.vreg("v_tmp3"),
                   ctx.sreg("s_tmp0"), comment="+ lds_b_offset")
+        if ctx.has("s_rd_db"):
+            ctx.v_add(ctx.vreg("v_tmp3"), ctx.vreg("v_tmp3"),
+                      ctx.sreg("s_rd_db"), comment="+ rd_db offset")
 
         ki_count = swz_layout.ki_count
         b_out = [ctx.vreg("v_lds_rd_b")]
@@ -318,34 +329,49 @@ class LDSReader:
                                  comment=f"rd_{matrix}_k{ki} = rd_{matrix} ^ {xor_bytes}")
 
     def toggle_read(self) -> None:
-        """Toggle LDS read bases for double-buffering + recompute ki bases."""
+        """Toggle LDS read bases for double-buffering + recompute ki bases.
+
+        For paired-row swizzle: toggle a scalar DB register (s_rd_db)
+        instead of XORing v_lds_rd_a/b. The recompute functions
+        add s_rd_db to the computed address, so the toggle is preserved
+        even when the base register is rewritten from scratch.
+
+        For non-swizzle: XOR the base VGPRs directly (no recompute).
+        """
         ctx = self.ctx
-        for matrix in ["a", "b"]:
-            base_name = f"v_lds_rd_{matrix}"
-            ctx.inst("v_xor_b32", ctx.vreg(base_name),
-                     ctx.sreg("s_lds_db_step"), ctx.vreg(base_name),
-                     comment=f"rd_{matrix} ^= db")
-            if self._swizzle is not None and self.ki_count > 1:
-                from .swizzle import DataLayout as SwzLayout
-                swz_layout = SwzLayout(
-                    row_stride_bytes=int(self.tile.unroll_k * self.elem),
-                    mfma_k=self.mfma.k, mfma_m=self.mfma.m,
-                    elem_bytes=self.elem, wave_size=self.tile.wave_size)
-                for ki in range(1, self.ki_count):
-                    step = ki * swz_layout.k_step
-                    xor_bytes = step * 16
-                    if xor_bytes > 64:
-                        ctx.s_mov(ctx.sreg("s_tmp0"), str(xor_bytes),
-                                  comment=f"xor val {xor_bytes}")
-                        ctx.inst("v_xor_b32",
-                                 ctx.vreg(f"v_lds_rd_{matrix}_k{ki}"),
-                                 ctx.vreg(base_name), ctx.sreg("s_tmp0"),
-                                 comment=f"rd_{matrix}_k{ki} = rd_{matrix} ^ {xor_bytes}")
-                    else:
-                        ctx.inst("v_xor_b32",
-                                 ctx.vreg(f"v_lds_rd_{matrix}_k{ki}"),
-                                 ctx.vreg(base_name), str(xor_bytes),
-                                 comment=f"rd_{matrix}_k{ki} = rd_{matrix} ^ {xor_bytes}")
+        swz = self._swizzle
+        if swz is not None and hasattr(swz, 'pair_factor'):
+            # Paired-row swizzle: toggle scalar DB state
+            ctx.inst("s_xor_b32", ctx.sreg("s_rd_db"),
+                     ctx.sreg("s_rd_db"), ctx.sreg("s_lds_db_step"),
+                     comment="s_rd_db ^= db_step (toggle read buffer)")
+        else:
+            for matrix in ["a", "b"]:
+                base_name = f"v_lds_rd_{matrix}"
+                ctx.inst("v_xor_b32", ctx.vreg(base_name),
+                         ctx.sreg("s_lds_db_step"), ctx.vreg(base_name),
+                         comment=f"rd_{matrix} ^= db")
+                if self._swizzle is not None and self.ki_count > 1:
+                    from .swizzle import DataLayout as SwzLayout
+                    swz_layout = SwzLayout(
+                        row_stride_bytes=int(self.tile.unroll_k * self.elem),
+                        mfma_k=self.mfma.k, mfma_m=self.mfma.m,
+                        elem_bytes=self.elem, wave_size=self.tile.wave_size)
+                    for ki in range(1, self.ki_count):
+                        step = ki * swz_layout.k_step
+                        xor_bytes = step * 16
+                        if xor_bytes > 64:
+                            ctx.s_mov(ctx.sreg("s_tmp0"), str(xor_bytes),
+                                      comment=f"xor val {xor_bytes}")
+                            ctx.inst("v_xor_b32",
+                                     ctx.vreg(f"v_lds_rd_{matrix}_k{ki}"),
+                                     ctx.vreg(base_name), ctx.sreg("s_tmp0"),
+                                     comment=f"rd_{matrix}_k{ki} = rd_{matrix} ^ {xor_bytes}")
+                        else:
+                            ctx.inst("v_xor_b32",
+                                     ctx.vreg(f"v_lds_rd_{matrix}_k{ki}"),
+                                     ctx.vreg(base_name), str(xor_bytes),
+                                     comment=f"rd_{matrix}_k{ki} = rd_{matrix} ^ {xor_bytes}")
 
     def _emit_swizzled_ds_read(self, dst: str, base_reg: str, offset: int, ki: int, width: int, comment: str) -> None:
         """Emit ds_read using per-ki base VGPR when swizzle is active."""
