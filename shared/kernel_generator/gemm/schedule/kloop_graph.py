@@ -319,8 +319,9 @@ class GlobalLoadBlock(BuildingBlock):
 
 
 class SuffixBlock(BuildingBlock):
-    """Declares suffix ops: vmcnt wait, LDS read toggle, DB step negate.
+    """Declares suffix ops: vmcnt wait and LDS read toggle.
 
+    With XOR-based double-buffer toggling, no negate step is needed.
     These are placed backward from the end of the MFMA body to
     maximize overlap between current-iteration compute and
     next-iteration loads.
@@ -349,12 +350,6 @@ class SuffixBlock(BuildingBlock):
         def _emit_toggle():
             reader.toggle_read()
 
-        def _emit_negate():
-            ctx = reader.ctx
-            ctx.inst("s_sub_u32", ctx.sreg("s_lds_db_step"),
-                     "0", ctx.sreg("s_lds_db_step"),
-                     comment="negate db")
-
         graph.add_op(KLoopOp(
             "suffix_vmcnt", OpKind.WAIT, _emit_vmcnt,
             comment="vmcnt wait for DTL loads"))
@@ -363,13 +358,8 @@ class SuffixBlock(BuildingBlock):
             "suffix_toggle", OpKind.SCALAR, _emit_toggle,
             comment="toggle LDS read buffer"))
 
-        graph.add_op(KLoopOp(
-            "suffix_negate", OpKind.SCALAR, _emit_negate,
-            comment="negate DB step"))
-
-        # Suffix deps: vmcnt before toggle, toggle before negate
+        # Suffix deps: vmcnt before toggle
         graph.add_dep("suffix_vmcnt", "suffix_toggle", DepKind.RAW)
-        graph.add_dep("suffix_toggle", "suffix_negate", DepKind.RAW)
 
         # Suffix must happen after all MFMAs of the last partition that
         # reads from the current buffer. In practice, placed backward

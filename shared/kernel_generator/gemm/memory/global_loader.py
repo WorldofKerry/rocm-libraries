@@ -108,12 +108,12 @@ class DTLLoader(GlobalLoader):
 
     def toggle_write(self) -> None:
         ctx = self.ctx
-        ctx.inst("s_add_u32", ctx.sreg("s_lds_wr_a_sg"),
+        ctx.inst("s_xor_b32", ctx.sreg("s_lds_wr_a_sg"),
                  ctx.sreg("s_lds_wr_a_sg"), ctx.sreg("s_lds_db_step"),
-                 comment="wr_a += db")
-        ctx.inst("s_add_u32", ctx.sreg("s_lds_wr_b_sg"),
+                 comment="wr_a ^= db")
+        ctx.inst("s_xor_b32", ctx.sreg("s_lds_wr_b_sg"),
                  ctx.sreg("s_lds_wr_b_sg"), ctx.sreg("s_lds_db_step"),
-                 comment="wr_b += db")
+                 comment="wr_b ^= db")
 
     def emit_sync(self) -> None:
         # DTL writes to OTHER buffer; preamble reads from CURRENT.
@@ -202,12 +202,12 @@ class BufferLoader(GlobalLoader):
 
     def toggle_write(self) -> None:
         ctx = self.ctx
-        ctx.v_add(ctx.vreg("v_lds_wr_a"),
-                  ctx.sreg("s_lds_db_step"), ctx.vreg("v_lds_wr_a"),
-                  comment="wr_a += db")
-        ctx.v_add(ctx.vreg("v_lds_wr_b"),
-                  ctx.sreg("s_lds_db_step"), ctx.vreg("v_lds_wr_b"),
-                  comment="wr_b += db")
+        ctx.inst("v_xor_b32", ctx.vreg("v_lds_wr_a"),
+                 ctx.sreg("s_lds_db_step"), ctx.vreg("v_lds_wr_a"),
+                 comment="wr_a ^= db")
+        ctx.inst("v_xor_b32", ctx.vreg("v_lds_wr_b"),
+                 ctx.sreg("s_lds_db_step"), ctx.vreg("v_lds_wr_b"),
+                 comment="wr_b ^= db")
 
     def emit_sync(self) -> None:
         ctx = self.ctx

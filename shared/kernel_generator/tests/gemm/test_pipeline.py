@@ -241,3 +241,56 @@ class TestTreeStructure:
         assert "epilogue:" in s
         assert "scheduled_k_loop" in s
         assert "store_d" in s
+
+
+class TestXorToggle:
+    """Verify XOR-based double-buffer toggling and PGR=2 support."""
+
+    def test_xor_toggle_no_negate(self):
+        """Assembly should use v_xor/s_xor for toggle, no negate."""
+        kernel = GemmKernel.build(GemmProblem(256, 256, 64))
+        result = kernel.emit()
+        asm = result.asm_text
+        # XOR toggle should be present
+        assert "v_xor_b32" in asm, "Missing v_xor_b32 for read toggle"
+        assert "s_xor_b32" in asm, "Missing s_xor_b32 for write toggle"
+        # Negate should NOT be present (no s_sub_u32 ... s_lds_db_step)
+        for line in asm.split('\n'):
+            if 'negate db' in line.lower() or 'negate' in line.lower():
+                if 's_sub_u32' in line and 's_lds_db_step' in line:
+                    pytest.fail(f"Found negate instruction: {line.strip()}")
+
+    def test_pgr2_emits_prefetch(self):
+        """PGR=2 should emit a tile 1 prefetch in prologue."""
+        kernel = GemmKernel.build(GemmProblem(256, 256, 256), pgr2=True)
+        result = kernel.emit()
+        asm = result.asm_text
+        assert "PGR=2" in asm or "pgr2_skip" in asm, \
+            "PGR=2 prologue section missing"
+
+    def test_pgr2_assembles(self):
+        """PGR=2 kernel should assemble without errors."""
+        kernel = GemmKernel.build(GemmProblem(256, 256, 256), pgr2=True)
+        result = kernel.emit()
+        co = result.assemble()
+        assert co is not None, "PGR=2 kernel failed to assemble"
+
+    def test_pgr2_mxfp4_assembles(self):
+        """PGR=2 with MXFP4 should assemble."""
+        from kernel_generator.gemm.problem import DataType, MfmaConfig
+        from kernel_generator.gemm.tiling import GemmTiling
+        mx = MfmaConfig.mxfp4_16x16x128()
+        t = GemmTiling.high_perf(wg_m=256, wg_n=256, unroll_k=256,
+                                  mfma=mx, lds_swizzle=True)
+        p = GemmProblem(256, 256, 256, dtype=DataType.MXFP4)
+        kernel = GemmKernel.build(p, tiling=t, pgr2=True)
+        result = kernel.emit()
+        co = result.assemble()
+        assert co is not None, "PGR=2 MXFP4 kernel failed to assemble"
+
+    def test_pgr1_still_works(self):
+        """Default PGR=1 should still emit and assemble."""
+        kernel = GemmKernel.build(GemmProblem(256, 256, 256))
+        result = kernel.emit()
+        co = result.assemble()
+        assert co is not None, "PGR=1 kernel failed to assemble"

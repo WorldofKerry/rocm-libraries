@@ -169,9 +169,9 @@ class LDSReader:
         ctx = self.ctx
         for matrix in ["a", "b"]:
             base_name = f"v_lds_rd_{matrix}"
-            ctx.v_add(ctx.vreg(base_name),
-                      ctx.sreg("s_lds_db_step"), ctx.vreg(base_name),
-                      comment=f"rd_{matrix} += db")
+            ctx.inst("v_xor_b32", ctx.vreg(base_name),
+                     ctx.sreg("s_lds_db_step"), ctx.vreg(base_name),
+                     comment=f"rd_{matrix} ^= db")
             if self._swizzle is not None and self.ki_count > 1:
                 from .swizzle import DataLayout as SwzLayout
                 swz_layout = SwzLayout(

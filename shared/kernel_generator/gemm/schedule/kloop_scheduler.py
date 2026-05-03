@@ -100,7 +100,7 @@ class KLoopScheduler:
         b_reads_ki0 = []   # early B reads
         a_reads = {}       # (mi, ki) -> op
         b_reads = {}       # (ni, ki) -> op
-        suffix_ops = []    # waits, toggle, negate
+        suffix_ops = []    # waits, toggle
 
         for name, op in g.ops.items():
             if op.kind == OpKind.MFMA or op.kind == OpKind.BARRIER:
@@ -172,7 +172,7 @@ class KLoopScheduler:
                     latest = min(latest, mfma_positions[c] - lead)
             read_latest[op.name] = max(latest, 0)
 
-        # Build suffix: vmcnt wait + toggle + negate (reader suffix ops)
+        # Build suffix: vmcnt wait + toggle (reader suffix ops)
         # These will be placed backward from the end of the MFMA body
         # For now, suffix ops are declared by the reader (not in the graph yet)
         # The graph-based scheduler will add them in a future iteration.
@@ -206,7 +206,7 @@ class KLoopScheduler:
                     break
 
         # Phase 4b: Place suffix ops backward from end
-        suffix_names = ["suffix_vmcnt", "suffix_toggle", "suffix_negate"]
+        suffix_names = ["suffix_vmcnt", "suffix_toggle"]
         suffix_ops_list = [g.ops[n] for n in suffix_names if n in g.ops]
         epilogue_ops: List[KLoopOp] = []
         if suffix_ops_list:

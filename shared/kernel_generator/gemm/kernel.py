@@ -122,7 +122,8 @@ class GemmKernel:
               tile_tree: Optional[TileLevel] = None,
               tiling: Optional[GemmTiling] = None,
               wave_abi: bool = False,
-              use_dtl: bool = True) -> GemmKernel:
+              use_dtl: bool = True,
+              pgr2: bool = False) -> GemmKernel:
         """Build a GemmKernel.  GemmTiling is the source of truth.
 
         Args:
@@ -165,6 +166,7 @@ class GemmKernel:
         # Derive real scales from data type (MX types always need scales)
         k.use_real_scales = problem.dtype.value == 'mxfp4'
         k.use_dtl = use_dtl
+        k.pgr2 = pgr2
         return k
 
     def emit(self) -> AsmKernel:
@@ -207,6 +209,7 @@ class GemmKernel:
             "lds_data_half": lds_half - lds_scale_half,
             "use_1d_grid": getattr(self, "use_1d_grid", False),
             "swizzled_scales": getattr(self, "swizzled_scales", False),
+            "pgr2": getattr(self, "pgr2", False),
         }
         if is_dtl:
             alloc_registers_dtl(ctx, self.problem, tile)

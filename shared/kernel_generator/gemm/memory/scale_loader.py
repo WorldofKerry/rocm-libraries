@@ -101,6 +101,15 @@ class NullScaleLoader(ScaleLoader):
     def scale_names_b(self) -> dict:
         return {}
 
+    def emit_load_a(self, mi: int, ki: int) -> None:
+        """No-op: emit a single scale-A load for (mi, ki)."""
+        pass
+
+    def emit_load_b(self, ni: int, ki: int) -> None:
+        """No-op: emit a single scale-B load for (ni, ki)."""
+        pass
+
+
 
 # ---------------------------------------------------------------------------
     @property
@@ -366,6 +375,65 @@ class VMEMScaleLoader(ScaleLoader):
     def advance(self) -> None:
         """Advance both scale SRDs by ``scale_k_stride`` bytes."""
         ctx = self._ctx
+
+    # -- per-index emission (for ScaleBlock integration) --------------------
+
+    def emit_load_a(self, mi: int, ki: int) -> None:
+        """Emit a single ``buffer_load_dword`` for scale A at (mi, ki).
+
+        Swizzled mode emits per-group loads; linear mode emits
+        per-(mi,ki) loads.
+        """
+        ctx = self._ctx
+        if self._swizzled:
+            group = mi // 2
+            gname = f"v_scale_a_g{group}"
+            soff_name = f"s_scale_soff_a{group}"
+            ctx.inst("buffer_load_dword", ctx.vreg(gname),
+                     ctx.vreg("v_dtl_off_scale_a"),
+                     ctx.sreg("s_srd_scale_a", 0, 4),
+                     ctx.sreg(soff_name), "offen",
+                     comment=f"scaleA group{group} (mi={mi} ki={ki})")
+        else:
+            ki_bytes = self._mfma.k // self._mx_block
+            soff = "0" if mi == 0 else ctx.sreg(f"s_soff_sa_{mi}")
+            off = ki * ki_bytes
+            off_str = f" offset:{off}" if off > 0 else ""
+            ctx.inst("buffer_load_dword",
+                     ctx.vreg(f"v_scale_a_m{mi}k{ki}"),
+                     ctx.vreg("v_dtl_off_scale_a"),
+                     ctx.sreg("s_srd_scale_a", 0, 4),
+                     soff, f"offen{off_str}",
+                     comment=f"scale A mi={mi} ki={ki}")
+
+    def emit_load_b(self, ni: int, ki: int) -> None:
+        """Emit a single ``buffer_load_dword`` for scale B at (ni, ki).
+
+        Swizzled mode emits per-group loads; linear mode emits
+        per-(ni,ki) loads.
+        """
+        ctx = self._ctx
+        if self._swizzled:
+            group = ni // 2
+            gname = f"v_scale_b_g{group}"
+            soff_name = f"s_scale_soff_b{group}"
+            ctx.inst("buffer_load_dword", ctx.vreg(gname),
+                     ctx.vreg("v_dtl_off_scale_b"),
+                     ctx.sreg("s_srd_scale_b", 0, 4),
+                     ctx.sreg(soff_name), "offen",
+                     comment=f"scaleB group{group} (ni={ni} ki={ki})")
+        else:
+            ki_bytes = self._mfma.k // self._mx_block
+            soff = "0" if ni == 0 else ctx.sreg(f"s_soff_sb_{ni}")
+            off = ki * ki_bytes
+            off_str = f" offset:{off}" if off > 0 else ""
+            ctx.inst("buffer_load_dword",
+                     ctx.vreg(f"v_scale_b_n{ni}k{ki}"),
+                     ctx.vreg("v_dtl_off_scale_b"),
+                     ctx.sreg("s_srd_scale_b", 0, 4),
+                     soff, f"offen{off_str}",
+                     comment=f"scale B ni={ni} ki={ki}")
+
         stride = self._scale_k_stride
         for srd_name in ["s_srd_scale_a", "s_srd_scale_b"]:
             ctx.inst("s_add_u32", ctx.sreg(srd_name, 0, 1),

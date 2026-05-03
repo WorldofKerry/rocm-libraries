@@ -98,10 +98,11 @@ class ScheduledCompute(ComputePipeline):
     """
 
     def __init__(self, loader: GlobalLoader, reader: LDSReader,
-                 scale_loader: object = None) -> None:
+                 scale_loader: object = None, pgr2: bool = False) -> None:
         self.loader = loader
         self.reader = reader
         self.scale_loader = scale_loader
+        self.pgr2 = pgr2
 
     def emit(self, ctx: AsmContext) -> None:
         tile = ctx._metadata["tile"]
@@ -142,7 +143,7 @@ class ScheduledCompute(ComputePipeline):
         self._emit_loop(ctx, schedule, loader, reader, scale_loader)
 
     def _emit_prologue(self, ctx, loader, scale_loader):
-        """Load first K-tile into LDS."""
+        """Load first K-tile into LDS. With PGR=2, also prefetch tile 1."""
         ctx.comment("Prologue: load tile 0")
         loader.emit_loads()
         if scale_loader:
@@ -154,6 +155,24 @@ class ScheduledCompute(ComputePipeline):
             ctx.s_waitcnt("vmcnt(0)", comment="wait DTL loads")
         ctx.s_barrier(comment="sync first tile")
         ctx.raw("")
+
+        if self.pgr2:
+            # Prefetch tile 1 into the other LDS buffer
+            ctx.comment("PGR=2: prefetch tile 1 into other buffer")
+            ctx.inst("s_cmp_le_u32", ctx.sreg("s_k_tiles"), "1",
+                     comment="skip prefetch if only 1 tile")
+            ctx.inst("s_cbranch_scc1", "pgr2_skip",
+                     comment="skip if k_tiles <= 1")
+            loader.advance()
+            loader.toggle_write()
+            loader.emit_loads()
+            if scale_loader and not scale_loader.has_cross_iter_prefetch:
+                scale_loader.advance()
+                scale_loader.emit_loop_loads()
+            ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
+                      comment="k_tiles-- (prefetched tile 1)")
+            ctx.label("pgr2_skip")
+            ctx.raw("")
 
     def _emit_loop(self, ctx, schedule, loader, reader, scale_loader):
         """Emit the K-loop: iterate over K-tiles."""
@@ -357,9 +376,10 @@ def pipeline_kloop_phase(level, ctx) -> None:
         swizzled = ctx._metadata.get("swizzled_scales", False)
         scale_loader = VMEMScaleLoader(ctx, tile, swizzled=swizzled)
 
+    pgr2 = ctx._metadata.get("pgr2", False)
     pipeline = KernelPipeline(
         partitioner=GridPartitioner(),
-        compute=ScheduledCompute(loader, reader, scale_loader),
+        compute=ScheduledCompute(loader, reader, scale_loader, pgr2=pgr2),
     )
     pipeline.emit(ctx)
 
