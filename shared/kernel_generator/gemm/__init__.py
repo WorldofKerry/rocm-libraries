@@ -4,7 +4,7 @@
 
 Architecture
 ------------
-1. **Transforms** -- ``Dim``, ``Tile``, ``Embed``, ``Xor``, etc.
+1. **Transforms** -- ``Dim``, ``Tile``, ``Embed``, etc.
    Composable index-space mappings that drive ALL address computation.
 2. **Problem** -- ``GemmProblem``, ``TileConfig``, ``MfmaConfig``.
 3. **Tile Tree** -- ``TileLevel``, ``TilePhase``, ``walk_tile_tree``.
@@ -35,14 +35,13 @@ Quick start::
 from __future__ import annotations
 
 from .tile.transforms import (
-    Dim, Transform, PassThrough, Tile, Flatten, Pad, Embed, Xor,
-    TileDescriptor, tile_hierarchy,
+    Dim, Transform, Tile, Embed, TileDescriptor,
 )
 from .problem import (
     DataType, GemmProblem, TileConfig, MfmaConfig,
     SubTileConfig, PartitionConfig,
 )
-from .tile.tree import TileLevel, TilePhase, build_gemm_tile_tree, walk_tile_tree
+from .tile.tree import TileLevel, TilePhase, walk_tile_tree
 from .tile.context import TileContext, Binding, Lifetime
 from .emit.context import AsmContext
 from .emit.layouts import emit_affine, GemmLayouts
@@ -51,11 +50,10 @@ from .tiling import TileDim, GemmTiling, ScheduleKind
 from .emit.emitter import assemble_kernel
 
 __all__ = [
-    "Dim", "Transform", "PassThrough", "Tile", "Flatten", "Pad",
-    "Embed", "Xor", "TileDescriptor", "tile_hierarchy",
+    "Dim", "Transform", "Tile", "Embed", "TileDescriptor",
     "DataType", "GemmProblem", "TileConfig", "MfmaConfig",
     "SubTileConfig", "PartitionConfig",
-    "TileLevel", "TilePhase", "build_gemm_tile_tree", "walk_tile_tree",
+    "TileLevel", "TilePhase", "walk_tile_tree",
     "TileContext", "Binding", "Lifetime", "AsmContext",
     "emit_affine", "GemmLayouts", "MemoryView",
     "GemmKernel", "default_mfma_visitor",

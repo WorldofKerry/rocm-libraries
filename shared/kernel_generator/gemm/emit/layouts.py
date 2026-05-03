@@ -238,27 +238,3 @@ class GemmLayouts:
             elem_bytes=elem,
         )
 
-    # -- Backward compat aliases (used by existing code) --
-
-    @property
-    def global_a_row_major(self) -> Embed:
-        return self.global_a
-
-    @property
-    def global_b_row_major(self) -> Embed:
-        return self.global_b
-
-    @property
-    def global_d_row_major(self) -> Embed:
-        return self.global_d
-
-    def summary(self) -> str:
-        lines = [
-            f"LDS A: {self.lds_a}",
-            f"LDS B: {self.lds_b} (offset={self.lds_b_offset})",
-            f"Global A: {self.global_a}  [m coeff is dynamic: K]",
-            f"Global B: {self.global_b}  [n coeff is dynamic: K]",
-            f"Global D: {self.global_d}  [m coeff is dynamic: N]",
-            f"elem_bytes: {self.elem_bytes}",
-        ]
-        return "\n".join(lines)

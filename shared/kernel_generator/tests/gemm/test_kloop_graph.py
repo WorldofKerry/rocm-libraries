@@ -790,7 +790,7 @@ class TestStreamKParams:
     def test_pipeline_with_grid_partitioner(self):
         """KernelPipeline with GridPartitioner produces valid kernel."""
         from kernel_generator.gemm.schedule.pipeline import (
-            KernelPipeline, GridPartitioner, ScheduledCompute,
+            KernelPipeline, GridPartitioner,
         )
         from kernel_generator.gemm.kernel import GemmKernel
 

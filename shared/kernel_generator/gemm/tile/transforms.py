@@ -99,30 +99,6 @@ class Transform(ABC):
 # Concrete transforms
 # ---------------------------------------------------------------------------
 
-class PassThrough(Transform):
-    """Identity -- dimension passes through unchanged."""
-
-    def __init__(self, dim: Dim) -> None:
-        self._dim = dim
-
-    @property
-    def upper_dims(self) -> List[Dim]:
-        return [self._dim]
-
-    @property
-    def lower_dims(self) -> List[Dim]:
-        return [self._dim]
-
-    def forward(self, upper_indices: Dict[str, int]) -> Dict[str, int]:
-        return {self._dim.name: upper_indices[self._dim.name]}
-
-    def codegen_forward(self, upper_exprs: Dict[str, str]) -> Dict[str, str]:
-        return {self._dim.name: upper_exprs[self._dim.name]}
-
-    def __repr__(self) -> str:
-        return f"PassThrough({self._dim})"
-
-
 class Tile(Transform):
     """Split one dimension into an outer and inner pair (tiling).
 
@@ -190,94 +166,6 @@ class Tile(Transform):
         return f"Tile({self._dim} -> {self._outer}, {self._inner})"
 
 
-class Flatten(Transform):
-    """Merge multiple dimensions into one (row-major).
-
-    ``Flatten([Dim("M_wave", 2), Dim("M_mfma", 32)])`` produces::
-
-        upper:  [Dim("M_wave", 2),  Dim("M_mfma", 32)]
-        lower:  [Dim("M_wave_M_mfma", 64)]
-        forward:  flat = d0 * size(d1) + d1
-
-    This is CK's ``Merge``.
-    """
-
-    def __init__(self, dims: List[Dim], merged_name: Optional[str] = None) -> None:
-        if len(dims) < 2:
-            raise ValueError("Flatten requires at least 2 dimensions")
-        self._dims = list(dims)
-        total = math.prod(d.size for d in dims)
-        self._merged = Dim(merged_name or "_".join(d.name for d in dims), total)
-
-    @property
-    def upper_dims(self) -> List[Dim]:
-        return list(self._dims)
-
-    @property
-    def lower_dims(self) -> List[Dim]:
-        return [self._merged]
-
-    @property
-    def merged(self) -> Dim:
-        return self._merged
-
-    def forward(self, upper_indices: Dict[str, int]) -> Dict[str, int]:
-        result = 0
-        stride = 1
-        for d in reversed(self._dims):
-            result += upper_indices[d.name] * stride
-            stride *= d.size
-        return {self._merged.name: result}
-
-    def codegen_forward(self, upper_exprs: Dict[str, str]) -> Dict[str, str]:
-        terms: list[str] = []
-        stride = 1
-        for d in reversed(self._dims):
-            expr = upper_exprs[d.name]
-            if stride == 1:
-                terms.append(str(expr))
-            else:
-                terms.append(f"({expr} * {stride})")
-            stride *= d.size
-        return {self._merged.name: " + ".join(reversed(terms))}
-
-    def __repr__(self) -> str:
-        return f"Flatten({self._dims} -> {self._merged})"
-
-
-class Pad(Transform):
-    """Pad a dimension to a larger size (for tile alignment)."""
-
-    def __init__(
-        self, dim: Dim, pad_to: int, padded_name: Optional[str] = None
-    ) -> None:
-        if pad_to < dim.size:
-            raise ValueError(f"pad_to={pad_to} < dim.size={dim.size}")
-        self._dim = dim
-        self._padded = Dim(padded_name or f"{dim.name}_padded", pad_to)
-
-    @property
-    def upper_dims(self) -> List[Dim]:
-        return [self._padded]
-
-    @property
-    def lower_dims(self) -> List[Dim]:
-        return [self._dim]
-
-    @property
-    def padded(self) -> Dim:
-        return self._padded
-
-    def forward(self, upper_indices: Dict[str, int]) -> Dict[str, int]:
-        return {self._dim.name: upper_indices[self._padded.name]}
-
-    def codegen_forward(self, upper_exprs: Dict[str, str]) -> Dict[str, str]:
-        return {self._dim.name: upper_exprs[self._padded.name]}
-
-    def __repr__(self) -> str:
-        return f"Pad({self._dim} -> {self._padded})"
-
-
 class Embed(Transform):
     """Affine index map: ``lower = sum(upper_i * coefficient_i)``.
 
@@ -322,57 +210,6 @@ class Embed(Transform):
         pairs = [f"{d.name}*{c}" for d, c in zip(self._upper, self._coefficients)]
         return f"Embed({' + '.join(pairs)} -> {self._lower})"
 
-
-class Xor(Transform):
-    """XOR-based index remapping for LDS bank-conflict avoidance.
-
-    ``forward:  row_out = row ^ (col >> shift),  col_out = col``
-    """
-
-    def __init__(
-        self,
-        row_dim: Dim,
-        col_dim: Dim,
-        shift: int = 0,
-        output_name: Optional[str] = None,
-    ) -> None:
-        self._row = row_dim
-        self._col = col_dim
-        self._shift = shift
-        self._row_out = Dim(output_name or f"{row_dim.name}_xor", row_dim.size)
-
-    @property
-    def upper_dims(self) -> List[Dim]:
-        return [self._row, self._col]
-
-    @property
-    def lower_dims(self) -> List[Dim]:
-        return [self._row_out, self._col]
-
-    def forward(self, upper_indices: Dict[str, int]) -> Dict[str, int]:
-        row = upper_indices[self._row.name]
-        col = upper_indices[self._col.name]
-        return {
-            self._row_out.name: row ^ (col >> self._shift),
-            self._col.name: col,
-        }
-
-    def codegen_forward(self, upper_exprs: Dict[str, str]) -> Dict[str, str]:
-        row = upper_exprs[self._row.name]
-        col = upper_exprs[self._col.name]
-        if self._shift == 0:
-            xor_expr = f"({row} ^ {col})"
-        else:
-            xor_expr = f"({row} ^ ({col} >> {self._shift}))"
-        return {self._row_out.name: xor_expr, self._col.name: col}
-
-    def __repr__(self) -> str:
-        return f"Xor({self._row}, {self._col}, shift={self._shift})"
-
-
-# ---------------------------------------------------------------------------
-# Tile descriptor -- a tensor view built from chained transforms
-# ---------------------------------------------------------------------------
 
 class TileDescriptor:
     """A tensor view described by a chain of coordinate transforms.
@@ -454,31 +291,3 @@ class TileDescriptor:
 # Convenience helpers
 # ---------------------------------------------------------------------------
 
-def tile_hierarchy(
-    dim: Dim,
-    tile_sizes: List[Tuple[int, str, str]],
-) -> List[Tile]:
-    """Create a multi-level tiling hierarchy for a single dimension.
-
-    Args:
-        dim: The dimension to tile.
-        tile_sizes: ``[(tile_size, outer_name, inner_name), ...]``
-            from coarsest to finest.
-
-    Returns:
-        List of ``Tile`` transforms, outermost first.
-
-    Example::
-
-        tiles = tile_hierarchy(Dim("M", 256), [
-            (128, "M_wg_id",  "M_wg"),   # workgroup-level tile
-            (32,  "M_wave_id", "M_wave"), # wave-level tile
-        ])
-    """
-    transforms: list[Tile] = []
-    cur = dim
-    for size, outer, inner in tile_sizes:
-        t = Tile(cur, size, outer_name=outer, inner_name=inner)
-        transforms.append(t)
-        cur = t.inner
-    return transforms

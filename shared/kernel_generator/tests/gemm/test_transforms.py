@@ -3,8 +3,7 @@
 """Tests for the coordinate transform system."""
 import pytest
 from kernel_generator.gemm.tile.transforms import (
-    Dim, PassThrough, Tile, Flatten, Pad, Embed, Xor,
-    TileDescriptor, tile_hierarchy,
+    Dim, Tile, Embed, TileDescriptor,
 )
 
 
@@ -34,23 +33,6 @@ class TestDim:
     def test_hashable(self):
         s = {Dim("M", 128), Dim("M", 128), Dim("N", 64)}
         assert len(s) == 2
-
-
-# ===========================================================================
-# PassThrough
-# ===========================================================================
-
-class TestPassThrough:
-    def test_identity(self):
-        d = Dim("M", 128)
-        pt = PassThrough(d)
-        assert pt.upper_dims == [d]
-        assert pt.lower_dims == [d]
-        assert pt.forward({"M": 42}) == {"M": 42}
-
-    def test_codegen(self):
-        pt = PassThrough(Dim("x", 10))
-        assert pt.codegen_forward({"x": "v0"}) == {"x": "v0"}
 
 
 # ===========================================================================
@@ -94,55 +76,6 @@ class TestTile:
 
 
 # ===========================================================================
-# Flatten
-# ===========================================================================
-
-class TestFlatten:
-    def test_two_dims(self):
-        f = Flatten([Dim("A", 4), Dim("B", 8)])
-        assert f.merged == Dim("A_B", 32)
-        assert f.forward({"A": 2, "B": 5}) == {"A_B": 2 * 8 + 5}
-
-    def test_three_dims(self):
-        f = Flatten([Dim("X", 2), Dim("Y", 3), Dim("Z", 4)])
-        assert f.merged.size == 24
-        # X=1, Y=2, Z=3 -> 1*12 + 2*4 + 3 = 23
-        assert f.forward({"X": 1, "Y": 2, "Z": 3}) == {"X_Y_Z": 23}
-
-    def test_custom_name(self):
-        f = Flatten([Dim("A", 4), Dim("B", 8)], merged_name="flat")
-        assert f.merged.name == "flat"
-
-    def test_codegen(self):
-        f = Flatten([Dim("A", 4), Dim("B", 8)])
-        result = f.codegen_forward({"A": "x", "B": "y"})
-        assert "A_B" in result
-
-    def test_too_few_dims(self):
-        with pytest.raises(ValueError):
-            Flatten([Dim("A", 4)])
-
-
-# ===========================================================================
-# Pad
-# ===========================================================================
-
-class TestPad:
-    def test_basic(self):
-        p = Pad(Dim("M", 250), 256)
-        assert p.padded == Dim("M_padded", 256)
-        assert p.forward({"M_padded": 100}) == {"M": 100}
-
-    def test_no_pad_needed(self):
-        p = Pad(Dim("M", 256), 256)
-        assert p.padded.size == 256
-
-    def test_too_small(self):
-        with pytest.raises(ValueError):
-            Pad(Dim("M", 256), 128)
-
-
-# ===========================================================================
 # Embed
 # ===========================================================================
 
@@ -174,29 +107,6 @@ class TestEmbed:
             [1, 0],
         )
         assert e.forward({"a": 3, "b": 999}) == {"x": 3}
-
-
-# ===========================================================================
-# Xor
-# ===========================================================================
-
-class TestXor:
-    def test_basic(self):
-        x = Xor(Dim("row", 64), Dim("col", 8))
-        result = x.forward({"row": 5, "col": 3})
-        assert result["row_xor"] == 5 ^ 3
-        assert result["col"] == 3
-
-    def test_with_shift(self):
-        x = Xor(Dim("row", 64), Dim("col", 8), shift=2)
-        result = x.forward({"row": 5, "col": 12})
-        assert result["row_xor"] == 5 ^ (12 >> 2)
-
-    def test_codegen(self):
-        x = Xor(Dim("r", 64), Dim("c", 8), shift=3)
-        result = x.codegen_forward({"r": "v_r", "c": "v_c"})
-        assert "^" in result["r_xor"]
-        assert ">>" in result["r_xor"]
 
 
 # ===========================================================================
@@ -240,32 +150,3 @@ class TestTileDescriptor:
 
 
 # ===========================================================================
-# tile_hierarchy
-# ===========================================================================
-
-class TestTileHierarchy:
-    def test_two_levels(self):
-        tiles = tile_hierarchy(Dim("M", 256), [
-            (128, "M_wg_id", "M_wg"),
-            (32, "M_wave_id", "M_wave"),
-        ])
-        assert len(tiles) == 2
-        assert tiles[0].outer.name == "M_wg_id"
-        assert tiles[0].inner.name == "M_wg"
-        assert tiles[1].outer.name == "M_wave_id"
-        assert tiles[1].inner.name == "M_wave"
-        # First tile: 256 / 128 = 2 outer tiles
-        assert tiles[0].outer.size == 2
-        # Second tile operates on the inner of the first: 128 / 32 = 4
-        assert tiles[1].outer.size == 4
-        assert tiles[1].inner.size == 32
-
-    def test_three_levels(self):
-        tiles = tile_hierarchy(Dim("M", 512), [
-            (256, "L0_out", "L0_in"),
-            (64,  "L1_out", "L1_in"),
-            (16,  "L2_out", "L2_in"),
-        ])
-        assert len(tiles) == 3
-        assert tiles[2].inner.size == 16
-        assert tiles[2].outer.size == 4  # 64 / 16

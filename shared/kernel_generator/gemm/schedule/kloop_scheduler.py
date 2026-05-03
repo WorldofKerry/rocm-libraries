@@ -14,8 +14,6 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .kloop_graph import KLoopGraph, KLoopOp, OpKind, DepKind
-from .slot_placer import PlacedOp, PlacedSchedule, SLOTS_PER_INTERVAL
-
 __all__ = ["KLoopScheduler", "ScheduledKLoop"]
 
 # Approximate MFMA latency in cycles (gfx950 v_mfma_f32_16x16x32_f16)
@@ -49,21 +47,6 @@ class ScheduledKLoop:
     scale_advance_op: Optional[KLoopOp] = None
     # Auto-inserted waits: position -> waitcnt string
     waits: Dict[int, str] = field(default_factory=dict)
-
-    def to_placed_schedule(self) -> PlacedSchedule:
-        """Convert to a PlacedSchedule for compatibility with existing code."""
-        intervals = []
-        for i, mfma in enumerate(self.mfma_order):
-            side = [PlacedOp(emit_fn=op.emit, op_type=op.kind.value,
-                             comment=op.comment)
-                    for op in self.side_ops[i]]
-            mfma_placed = PlacedOp(emit_fn=mfma.emit, op_type="mfma",
-                                   comment=mfma.comment)
-            intervals.append((side, mfma_placed))
-        epilogue = [PlacedOp(emit_fn=op.emit, op_type=op.kind.value,
-                             comment=op.comment)
-                    for op in self.epilogue_ops]
-        return PlacedSchedule(intervals=intervals, epilogue=epilogue)
 
 
 class KLoopScheduler:
@@ -376,32 +359,6 @@ class KLoopScheduler:
             waits[mfma_idx] = f"lgkmcnt({wait_for})"
 
         return waits
-
-    # ------------------------------------------------------------------
-    # Analysis helpers
-    # ------------------------------------------------------------------
-
-    def mfma_order_names(self) -> List[str]:
-        """Return MFMA op names in scheduled order (for testing)."""
-        g = self.graph
-        tile = g.tile
-        names = []
-        for mi in range(tile.mfma_m_repeat):
-            for ki in range(tile.k_iterations):
-                for ni in range(tile.mfma_n_repeat):
-                    names.append(f"mfma_m{mi}_n{ni}_k{ki}")
-        return names
-
-    def read_schedule_summary(self) -> Dict[str, int]:
-        """Return {read_name: mfma_position_placed_before} for testing."""
-        result = self.schedule()
-        summary = {}
-        for i, ops in enumerate(result.side_ops):
-            for op in ops:
-                if op.kind == OpKind.DS_READ:
-                    summary[op.name] = i
-        return summary
-
 
 # ===================================================================
 # Phase function: emit a scheduled K-loop as assembly

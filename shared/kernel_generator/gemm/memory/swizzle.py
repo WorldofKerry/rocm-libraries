@@ -18,7 +18,7 @@ __all__ = [
     "BankingLevel", "BankedMemoryConfig",
     "LDS_GFX950", "LDS_GFX1250",
     "DataLayout",
-    "Swizzle", "SwizzleState",
+    "Swizzle",
     "IdentitySwizzle", "XorSwizzle", "RotationSwizzle", "RowRotationSwizzle",
     "ComposedSwizzle", "PairedRowRotationSwizzle", "PairedRowLayout",
 ]
@@ -103,7 +103,6 @@ class DataLayout:
     elem_bytes: float       # bytes per element (0.5, 1, 2, 4)
     wave_size: int = 64
 
-    @staticmethod
     def from_tile(tile: TileConfig, mfma: MfmaConfig, elem_bytes: float) -> DataLayout:
         return DataLayout(
             row_stride_bytes=int(tile.unroll_k * elem_bytes),
@@ -144,23 +143,6 @@ class DataLayout:
 # ---------------------------------------------------------------------------
 
 @dataclass
-class SwizzleState:
-    """Registers allocated by a Swizzle for use in the K-loop.
-
-    Opaque to the kernel generator -- the Swizzle decides what goes here.
-    The K-loop uses write_col_vreg for DTL offsets and read_base_vregs[ki]
-    for ds_read base addresses.
-    """
-    write_col_vreg: str              # swizzled thread_col for DTL writes
-    read_base_vregs: List[str]       # per-ki precomputed LR base addresses
-    # Write-side swizzle VGPR (for thread_col -> swizzled_col mapping):
-    write_swizzle_vreg: Optional[str] = None
-
-
-# ---------------------------------------------------------------------------
-# Swizzle base class
-# ---------------------------------------------------------------------------
-
 class Swizzle(ABC):
     """Column permutation for bank-conflict avoidance.
 
@@ -569,16 +551,6 @@ def auto_swizzle(layout: DataLayout,
     return paired
 
 
-def auto_swizzle_from_tile(tile: 'TileConfig', mem: BankedMemoryConfig = LDS_GFX950) -> Swizzle:
-    """Convenience: derive swizzle from TileConfig."""
-    layout = DataLayout.from_tile(tile, tile.mfma, tile.mfma.element_bytes)
-    return auto_swizzle(layout, mem)
-
-
-# ---------------------------------------------------------------------------
-# Paired-row layout for zero bank conflicts
-# ---------------------------------------------------------------------------
-
 @dataclass(frozen=True)
 class PairedRowLayout:
     """LDS layout that packs multiple M-rows per LDS row for zero conflicts.
@@ -703,12 +675,6 @@ class PairedRowRotationSwizzle(Swizzle):
     def lds_row_of(self, m_row: int) -> int:
         """Which LDS row an M-row maps to."""
         return m_row // self.pair_factor
-
-    def lds_offset(self, m_row: int, col: int) -> int:
-        """Full LDS byte offset for a given M-row and k-column."""
-        lds_row = self.lds_row_of(m_row)
-        swizzled_col = self.forward(m_row, col, self.orig_cols)
-        return lds_row * self.effective_cols * 16 + swizzled_col * 16
 
     def emit_write_swizzle(self, ctx: AsmContext, layout: DataLayout,
                            mem: BankedMemoryConfig,

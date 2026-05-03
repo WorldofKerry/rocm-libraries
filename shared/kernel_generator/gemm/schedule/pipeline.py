@@ -1,16 +1,10 @@
-"""Kernel pipeline: TilePartitioner + ComputePipeline + Epilogue.
+"""Kernel pipeline: TilePartitioner + ComputePipeline.
 
 Separates work distribution, compute, and output into independent
 components following the CK/TensileLite/Triton pattern.
 
-Usage::
-
-    pipeline = KernelPipeline(
-        partitioner=GridPartitioner(),
-        compute=ScheduledCompute(loader, reader, scale_loader),
-        epilogue=DirectEpilogue(),
-    )
-    pipeline.emit(ctx)
+The K-loop compute is handled by AutoPipelinedCompute (see
+auto_pipeline.py), composed via KernelPipeline.
 """
 from __future__ import annotations
 
@@ -18,19 +12,13 @@ import math
 from typing import Optional
 
 from ..emit.context import AsmContext
-from ..problem import TileConfig, GemmProblem, MfmaConfig
+from ..problem import TileConfig, GemmProblem
 from ..memory.global_loader import GlobalLoader, DTLLoader, BufferLoader
 from ..memory.lds_reader import LDSReader
-from .kloop_graph import (
-    KLoopGraph, KLoopOp, OpKind, MFMABlock, DSReadBlock,
-    GlobalLoadBlock, ScaleBlock, SuffixBlock,
-)
-from .kloop_scheduler import KLoopScheduler, ScheduledKLoop
 
 __all__ = [
-    "TilePartitioner", "GridPartitioner",
-    "ComputePipeline", "ScheduledCompute",
-    "Epilogue", "DirectEpilogue",
+    "TilePartitioner", "GridPartitioner", "StreamKPartitioner",
+    "ComputePipeline",
     "KernelPipeline",
 ]
 
@@ -90,325 +78,6 @@ class ComputePipeline:
         raise NotImplementedError
 
 
-class ScheduledCompute(ComputePipeline):
-    """K-loop using KLoopGraph + KLoopScheduler.
-
-    Builds a dependency graph of MFMA/ds_read/load ops, schedules
-    them, and emits the interleaved instruction sequence.
-    """
-
-    def __init__(self, loader: GlobalLoader, reader: LDSReader,
-                 scale_loader: object = None, pgr2: bool = False,
-                 pgr: int = 0, num_lds_buffers: int = 2) -> None:
-        self.loader = loader
-        self.reader = reader
-        self.scale_loader = scale_loader
-        # Resolve PGR count: pgr2 flag maps to pgr=2 for backwards compat
-        self.pgr = pgr if pgr > 0 else (2 if pgr2 else 1)
-        self.pgr2 = self.pgr >= 2  # compat
-        self.num_lds_buffers = num_lds_buffers
-
-        if self.pgr > self.num_lds_buffers:
-            raise ValueError(
-                f"PGR={self.pgr} exceeds num_lds_buffers={self.num_lds_buffers}. "
-                f"Cannot preload more tiles than available buffers.")
-
-    @property
-    def loads_before_reads(self) -> bool:
-        """True when a free buffer is always available for next-iter loads.
-
-        PGR <= num_buffers - 1: load goes into a buffer not being read.
-        PGR == num_buffers: all buffers full, must read before loading.
-        """
-        return self.pgr < self.num_lds_buffers
-
-    def emit(self, ctx: AsmContext) -> None:
-        tile = ctx._metadata["tile"]
-        problem = ctx._metadata["problem"]
-        loader = self.loader
-        reader = self.reader
-        scale_loader = self.scale_loader
-        elem = problem.element_bytes
-        lds_data_half = int((tile.wg_m + tile.wg_n) * tile.unroll_k * elem)
-
-        # Store reader in metadata for MFMABlock emit closures
-        ctx._metadata["_reader"] = reader
-
-        # DB step register
-        ctx.alloc_sgpr_permanent(1, "s_lds_db_step")
-        ctx.s_mov(ctx.sreg("s_lds_db_step"), str(lds_data_half),
-                  comment=f"DB step = {lds_data_half}")
-        ctx.raw("")
-
-        # Precompute offsets
-        loader.precompute_soffsets()
-        if scale_loader:
-            scale_loader.precompute_soffsets()
-
-        # Build dependency graph
-        graph = KLoopGraph(tile, problem)
-        GlobalLoadBlock(loader).register(graph)
-        DSReadBlock(reader).register(graph)
-        if scale_loader:
-            ScaleBlock(scale_loader, tile).register(graph)
-        MFMABlock(ctx, tile, scale_loader).register(graph)
-        SuffixBlock(reader, scale_loader, loader).register(graph)
-        graph.validate()
-
-        # Schedule
-        schedule = KLoopScheduler(graph).schedule()
-
-        # Emit
-        self._emit_prologue(ctx, loader, scale_loader, schedule)
-        self._emit_loop(ctx, schedule, loader, reader, scale_loader)
-
-    def _emit_prologue(self, ctx, loader, scale_loader, schedule=None):
-        """Emit PGR prologue stages: load tiles 0..PGR-1 into LDS buffers.
-
-        Each stage loads one tile. Stage 0 waits + barriers (data needed
-        immediately). Stages 1..PGR-1 are prefetch-only (loaded into
-        other buffers for future iterations).
-
-        The loop body is the inductive step (G+R+M). The prologue just
-        fills the pipeline.
-        """
-        pgr = self.pgr
-
-        # Stage 0: load tile 0, wait, barrier (always needed)
-        ctx.comment(f"Prologue stage 0/{pgr}: load tile 0")
-        loader.emit_loads()
-        if schedule and schedule.prologue_scale_ops:
-            for op in schedule.prologue_scale_ops:
-                if op.emit:
-                    op.emit()
-            extra = len(schedule.prologue_scale_ops)
-            ctx.s_waitcnt(f"vmcnt({extra})",
-                          comment=f"wait DTL (leave {extra} scale loads)")
-        else:
-            ctx.s_waitcnt("vmcnt(0)", comment="wait DTL loads")
-        ctx.s_barrier(comment="sync tile 0")
-        ctx.raw("")
-
-        # Stages 1..PGR-1: prefetch additional tiles (no wait/barrier)
-        for stage in range(1, pgr):
-            ctx.comment(f"Prologue stage {stage}/{pgr}: prefetch tile {stage}")
-            ctx.inst("s_cmp_le_u32", ctx.sreg("s_k_tiles"),
-                     str(stage),
-                     comment=f"skip if k_tiles <= {stage}")
-            ctx.inst("s_cbranch_scc1", f"pgr_skip_{stage}",
-                     comment=f"not enough tiles for PGR stage {stage}")
-            loader.advance()
-            loader.toggle_write()
-            loader.emit_loads()
-            if schedule and schedule.scale_advance_op and schedule.scale_advance_op.emit:
-                schedule.scale_advance_op.emit()
-            if (schedule and schedule.prologue_scale_ops and scale_loader
-                    and not scale_loader.has_cross_iter_prefetch):
-                for op in schedule.prologue_scale_ops:
-                    if op.emit:
-                        op.emit()
-            ctx.label(f"pgr_skip_{stage}")
-            ctx.raw("")
-
-    def _emit_global_load_ops(self, ctx, schedule, scale_loader):
-        """Emit global load + scale advance ops (shared by both load paths)."""
-        for op in schedule.prefetch_ops:
-            if op.emit:
-                op.emit()
-
-        if schedule.scale_advance_op and schedule.scale_advance_op.emit:
-            schedule.scale_advance_op.emit()
-        if scale_loader and not scale_loader.has_cross_iter_prefetch:
-            for op in schedule.prologue_scale_ops:
-                if op.emit:
-                    op.emit()
-
-    def _emit_loop(self, ctx, schedule, loader, reader, scale_loader):
-        """Emit the K-loop inductive step.
-
-        The body is the same for all PGR values: R(current) + M(current)
-        with conditional G(next). Load placement depends on buffer
-        lifecycle:
-
-          PGR < num_buffers: G before R (free buffer available)
-          PGR = num_buffers: G after R  (must consume before overwrite)
-
-        The load condition ``k_tiles > PGR-1`` naturally produces:
-        - First T-PGR iters: G+R+M (steady state)
-        - Last PGR-1 iters: R+M only (drain, no more loads needed)
-        """
-        tile = ctx._metadata["tile"]
-        nr = tile.mfma_n_repeat
-        mr = tile.mfma_m_repeat
-        ki_count = tile.k_iterations
-        mfmas_per_mi = nr * ki_count
-        partition_m = 4
-        pgr = self.pgr
-
-        ctx.label("k_loop")
-        ctx.raw("")
-
-        if self.loads_before_reads:
-            # --- Load-before-read: G then R ---
-            ctx.comment(f"Early B reads (PGR={pgr})")
-            for op in schedule.pre_body_ops:
-                if op.emit:
-                    op.emit()
-
-            ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
-                      comment="k_tiles--")
-            ctx.inst("s_cmp_gt_u32", ctx.sreg("s_k_tiles"),
-                     str(pgr - 1),
-                     comment=f"k_tiles > {pgr - 1}?")
-            ctx.inst("s_cbranch_scc0", "load_skip_all",
-                     comment="skip G (drain phase)")
-
-            self._emit_global_load_ops(ctx, schedule, scale_loader)
-            ctx.raw("")
-            ctx.label("load_skip_all")
-            loader.emit_sync()
-            ctx.raw("")
-        else:
-            # --- Read-before-write: R then G ---
-            loader.emit_sync()
-            ctx.raw("")
-
-            ctx.comment(f"Early B reads (PGR={pgr})")
-            for op in schedule.pre_body_ops:
-                if op.emit:
-                    op.emit()
-
-        # Preamble reads
-        ctx.comment("Preamble: A[m0] + B ki=1")
-        for op in schedule.preamble_ops:
-            if op.emit:
-                op.emit()
-
-        # Preamble inflight tracking
-        preamble_inflight = nr + 1
-        if ki_count > 1:
-            preamble_inflight += nr + 1
-        first_batch = nr + 1
-        remaining = preamble_inflight - first_batch
-        wait_cnt = min(remaining, 15)
-        ctx.s_waitcnt(f"lgkmcnt({wait_cnt})",
-                      comment="wait B[ki=0] + A[m0,k0]")
-
-        if schedule.prologue_scale_ops:
-            num_dtl = loader.num_inflight if hasattr(loader, "num_inflight") else 0
-            ctx.s_waitcnt(f"vmcnt({num_dtl})",
-                          comment=f"wait scales (leave {num_dtl} DTL in-flight)")
-        ctx.raw("")
-
-        reader.emit_recompute_ki_bases()
-        ctx.raw("")
-
-        # Emit scheduled MFMA body
-        inflight_lgkm = preamble_inflight
-        mfma_count = 0
-
-        for i, mfma_op in enumerate(schedule.mfma_order):
-            if i in schedule.waits:
-                ctx.s_waitcnt(schedule.waits[i],
-                              comment=f"auto-wait before MFMA[{i}]")
-                inflight_lgkm = 0
-
-            if mfma_count == nr and inflight_lgkm > 0:
-                ctx.s_waitcnt("lgkmcnt(0)",
-                              comment="wait B[ki=1] + A[m0,k1]")
-                inflight_lgkm = 0
-
-            if (mfma_count > 0 and mfma_count % mfmas_per_mi == 0
-                    and inflight_lgkm > 0):
-                ctx.s_waitcnt("lgkmcnt(0)",
-                              comment=f"wait A[m{mfma_count // mfmas_per_mi}]")
-                inflight_lgkm = 0
-
-            if schedule.prologue_scale_ops:
-                mps = partition_m * mfmas_per_mi
-                n_st = mr // partition_m
-                if mfma_count > 0 and mfma_count % mps == 0:
-                    st_idx = mfma_count // mps
-                    if st_idx < n_st:
-                        num_dtl = loader.num_inflight if hasattr(loader, "num_inflight") else 0
-                        ctx.s_waitcnt(f"vmcnt({num_dtl})",
-                                      comment=f"wait scale_a subtile {st_idx} (leave DTL)")
-
-            if mfma_count % (partition_m * mfmas_per_mi) == 0:
-                ctx.comment(
-                    f"--- Partition "
-                    f"{mfma_count // (partition_m * mfmas_per_mi)} ---")
-
-            for op in schedule.side_ops[i]:
-                if op.emit:
-                    op.emit()
-                if op.kind == OpKind.DS_READ:
-                    inflight_lgkm += 1
-
-            if mfma_op.emit:
-                mfma_op.emit()
-            mfma_count += 1
-
-        for op in schedule.epilogue_ops:
-            if op.emit:
-                op.emit()
-
-        # Read-before-write: issue loads AFTER MFMA body
-        if not self.loads_before_reads:
-            ctx.s_waitcnt("lgkmcnt(0)",
-                          comment="wait all ds_reads before overwriting LDS")
-            ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
-                      comment="k_tiles--")
-            ctx.inst("s_cmp_gt_u32", ctx.sreg("s_k_tiles"),
-                     str(pgr - 1),
-                     comment=f"k_tiles > {pgr - 1}?")
-            ctx.inst("s_cbranch_scc0", "load_skip_all",
-                     comment="skip G (drain phase)")
-
-            self._emit_global_load_ops(ctx, schedule, scale_loader)
-            ctx.raw("")
-            ctx.label("load_skip_all")
-
-        # Postamble
-        ctx.s_barrier(comment="sync")
-        has_pf = (scale_loader
-                  and scale_loader.has_cross_iter_prefetch)
-        ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
-                 comment="more?")
-        if has_pf:
-            ctx.inst("s_cbranch_scc0", "k_loop_end",
-                     comment="exit if last")
-            ctx.inst("s_branch", "k_loop", comment="loop back")
-            ctx.label("k_loop_end")
-        else:
-            ctx.inst("s_cbranch_scc1", "k_loop", comment="loop")
-        ctx.raw("")
-
-
-# ===================================================================
-# Epilogue: output strategy
-# ===================================================================
-
-class Epilogue:
-    """Base class: stores accumulated results."""
-
-    def emit(self, ctx: AsmContext) -> None:
-        raise NotImplementedError
-
-
-class DirectEpilogue(Epilogue):
-    """Write accumulators directly to D via phase_store_d.
-
-    This wraps the existing phase_store_d function. It's invoked
-    automatically by the tile tree walker as the workgroup epilogue,
-    so this class is a thin compatibility layer.
-    """
-
-    def emit(self, ctx: AsmContext) -> None:
-        from ..emit.phases import phase_store_d
-        phase_store_d(None, ctx)
-
-
 # ===================================================================
 # KernelPipeline: composition
 # ===================================================================
@@ -423,7 +92,7 @@ class KernelPipeline:
 
     def __init__(self, partitioner: TilePartitioner,
                  compute: ComputePipeline,
-                 epilogue: Optional[Epilogue] = None) -> None:
+                 epilogue: Optional[object] = None) -> None:
         self.partitioner = partitioner
         self.compute = compute
         self.epilogue = epilogue
@@ -459,43 +128,21 @@ def pipeline_kloop_phase(level, ctx) -> None:
         swizzled = ctx._metadata.get("swizzled_scales", False)
         scale_loader = VMEMScaleLoader(ctx, tile, swizzled=swizzled)
 
-    pgr = ctx._metadata.get("pgr", 1)
-    # Legacy: pgr2 flag maps to pgr=2
-    if ctx._metadata.get("pgr2", False) and pgr < 2:
-        pgr = 2
-
-    # Force BufferLoader when swizzle is enabled (DTL can't swizzle independently)
-    # Only if the kernel was built for BufferLoader (has v_addr_a setup)
-    if tile.resolved_swizzle(problem.element_bytes) is not None and use_dtl:
-        if ctx.has("v_addr_a"):
-            use_dtl = False
-            loader_cls = BufferLoader
-            loader = loader_cls(ctx, tile, problem)
-        else:
-            # DTL path: swizzle not supported, disable it
-            tile.lds_swizzle = False
-            tile.swizzle = None
-
-    pipeline_strategy = ctx._metadata.get("pipeline_strategy", None)
-    if pipeline_strategy is not None:
-        # Explicit strategy: class, callable, or pre-built instance
-        if isinstance(pipeline_strategy, type):
-            compute = pipeline_strategy(loader, reader, scale_loader, pgr=pgr)
-        elif callable(pipeline_strategy):
-            compute = pipeline_strategy(loader, reader, scale_loader, pgr=pgr)
-        else:
-            compute = pipeline_strategy
+    pgr_raw = ctx._metadata.get("pgr", None)
+    if pgr_raw is None:
+        pgr2 = ctx._metadata.get("pgr2", False)
+        pgr = 2 if pgr2 else 1
     else:
-        # Default: auto-pipelined (generic stage-driven framework)
-        from .auto_pipeline import AutoPipelinedCompute
-        compute = AutoPipelinedCompute(loader, reader, scale_loader, pgr=pgr)
+        pgr = int(pgr_raw)
+
+    from .auto_pipeline import AutoPipelinedCompute
+    compute = AutoPipelinedCompute(loader, reader, scale_loader, pgr=pgr)
 
     pipeline = KernelPipeline(
         partitioner=GridPartitioner(),
         compute=compute,
     )
     pipeline.emit(ctx)
-
 
 
 # ===================================================================
@@ -694,210 +341,3 @@ class StreamKPartitioner(TilePartitioner):
             "iters_per_sk_cta": iters_per_cta,
             "extra_iters": extra,
         }
-
-
-# ===================================================================
-# Atomic epilogue (for StreamK partial tiles)
-# ===================================================================
-
-class AtomicEpilogue(Epilogue):
-    """Atomic-add accumulators to workspace for StreamK partial tiles.
-
-    Uses global_atomic_add_f32 to accumulate FP32 partial results
-    into a workspace buffer. A fixup kernel later converts the
-    workspace to the output data type (BF16/FP16).
-
-    For full tiles (is_partial=0), delegates to DirectEpilogue.
-    """
-
-    def emit(self, ctx: AsmContext) -> None:
-        tile = ctx._metadata["tile"]
-        mfma = tile.mfma
-        acc_per = mfma.acc_vgprs
-        mr = tile.mfma_m_repeat
-        nr = tile.mfma_n_repeat
-
-        # Check if this WG has a partial tile
-        ctx.inst("s_cmp_eq_u32", ctx.sreg("s_is_partial"), "0",
-                 comment="full tile?")
-        ctx.inst("s_cbranch_scc1", "sk_direct_store",
-                 comment="full tile -> direct store")
-
-        # Partial tile: atomic add to workspace
-        ctx.comment("=== StreamK: atomic add to workspace ===")
-
-        # Build workspace SRD
-        ctx.alloc_sgpr_permanent(4, "s_srd_ws")
-        ctx.inst("s_mov_b32", ctx.sreg("s_srd_ws", 0, 1),
-                 ctx.sreg("s_workspace_ptr", 0, 1), comment="WS SRD lo")
-        ctx.inst("s_mov_b32", ctx.sreg("s_srd_ws", 1, 1),
-                 ctx.sreg("s_workspace_ptr", 1, 1), comment="WS SRD hi")
-        ctx.inst("s_mov_b32", ctx.sreg("s_srd_ws", 2, 1),
-                 "0xFFFFFFFF", comment="WS limit")
-        ctx.inst("s_mov_b32", ctx.sreg("s_srd_ws", 3, 1),
-                 "0x20000", comment="WS flags")
-        ctx.raw("")
-
-        # Compute per-lane workspace offset
-        # workspace layout: [num_tiles * wg_m * wg_n] FP32 values
-        # Per-WG offset = tile_idx * wg_m * wg_n * 4
-        # Per-lane offset within WG = (wave_m * m_per_wave + lane_m) * wg_n
-        #                             + (wave_n * n_per_wave + lane_n)
-        # times 4 (FP32 bytes)
-
-        # Reuse lane coordinates from store_d setup
-        ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.n - 1,
-                  comment="lane_n")
-        ctx.v_lshr(ctx.vreg("v_tmp1"), ctx.vreg("v_lane_id"),
-                   int(math.log2(mfma.m)), comment=f"lane_id / {mfma.m}")
-        ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_tmp1"), 2,
-                   comment="* 4 -> lane_m_base")
-
-        # global_row = wave_m * m_per_wave + lane_m_base
-        ctx.v_mul(ctx.vreg("v_tmp2"), str(tile.m_per_wave),
-                  ctx.vreg("v_wave_m"), comment=f"wave_m * {tile.m_per_wave}")
-        ctx.v_add(ctx.vreg("v_tmp2"), ctx.vreg("v_tmp2"),
-                  ctx.vreg("v_tmp1"), comment="+ lane_m_base")
-
-        # global_col = wave_n * n_per_wave + lane_n
-        ctx.v_mul(ctx.vreg("v_tmp3"), str(tile.n_per_wave),
-                  ctx.vreg("v_wave_n"), comment=f"wave_n * {tile.n_per_wave}")
-        ctx.v_add(ctx.vreg("v_tmp3"), ctx.vreg("v_tmp3"),
-                  ctx.vreg("v_tmp0"), comment="+ lane_n")
-
-        # ws_base_offset = (global_row * wg_n + global_col) * 4
-        ctx.inst("v_mul_lo_u32", ctx.vreg("v_tmp2"),
-                 str(tile.wg_n), ctx.vreg("v_tmp2"),
-                 comment="row * wg_n")
-        ctx.v_add(ctx.vreg("v_tmp2"), ctx.vreg("v_tmp2"),
-                  ctx.vreg("v_tmp3"), comment="+ col")
-        ctx.v_lshl(ctx.vreg("v_tmp2"), ctx.vreg("v_tmp2"), 2,
-                   comment="* 4 -> FP32 byte offset")
-
-        # Add tile offset: wg_id_x * wg_m * wg_n * 4 + wg_id_y * ...
-        # For now, use flat tile index from setup
-        ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"),
-                  str(tile.wg_m), comment="wg_base_m")
-        ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
-                 ctx.sreg("s_N"), comment="* N")
-        ctx.s_mul(ctx.sreg("s_tmp1"), ctx.sreg("s_wg_id_y"),
-                  str(tile.wg_n), comment="wg_base_n")
-        ctx.inst("s_add_u32", ctx.sreg("s_tmp0"),
-                 ctx.sreg("s_tmp0"), ctx.sreg("s_tmp1"),
-                 comment="tile_offset_elems")
-        ctx.s_lshl(ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"), 2,
-                    comment="* 4 -> bytes")
-        ctx.v_add(ctx.vreg("v_tmp2"), ctx.sreg("s_tmp0"),
-                  ctx.vreg("v_tmp2"), comment="+ tile_base -> ws_offset")
-        ctx.raw("")
-
-        # Atomic add each accumulator
-        ctx.comment(f"Atomic add {mr * nr * acc_per} accumulators")
-        for mi in range(mr):
-            for ni in range(nr):
-                for ai in range(acc_per):
-                    acc_idx = (mi * nr + ni) * acc_per + ai
-                    row_off = (mi * mfma.m + ai) * tile.wg_n
-                    col_off = ni * mfma.n
-                    elem_off = (row_off + col_off) * 4  # FP32 bytes
-
-                    ctx.inst("v_accvgpr_read_b32", ctx.vreg("v_tmp0"),
-                             ctx.areg("acc_C", acc_idx, 1),
-                             comment=f"acc[{acc_idx}]")
-
-                    if elem_off < 4096:
-                        ctx.inst("buffer_atomic_add_f32",
-                                 ctx.vreg("v_tmp0"),
-                                 ctx.vreg("v_tmp2"),
-                                 ctx.sreg("s_srd_ws", 0, 4),
-                                 "0", f"offen offset:{elem_off}",
-                                 comment=f"atomic m{mi}_n{ni}_a{ai}")
-                    else:
-                        ctx.inst("buffer_atomic_add_f32",
-                                 ctx.vreg("v_tmp0"),
-                                 ctx.vreg("v_tmp2"),
-                                 ctx.sreg("s_srd_ws", 0, 4),
-                                 str(elem_off), "offen",
-                                 comment=f"atomic m{mi}_n{ni}_a{ai}")
-
-        ctx.s_waitcnt("vmcnt(0)", comment="wait atomics")
-        ctx.inst("s_branch", "sk_store_done", comment="skip direct store")
-        ctx.raw("")
-
-        # Full tile: direct store
-        ctx.label("sk_direct_store")
-        DirectEpilogue().emit(ctx)
-        ctx.label("sk_store_done")
-        ctx.raw("")
-
-
-# ===================================================================
-# Fixup kernel for StreamK workspace -> output conversion
-# ===================================================================
-
-def generate_fixup_kernel(m: int, n: int, output_bf16: bool = True) -> str:
-    """Generate a simple fixup kernel that converts FP32 workspace to BF16/FP16.
-
-    The fixup kernel:
-    1. Reads FP32 values from workspace
-    2. Converts to BF16 or FP16
-    3. Writes to output D
-
-    Kernargs (32 bytes):
-        offset 0: workspace_ptr (u64)
-        offset 8: d_ptr (u64)
-        offset 16: num_elements (u32)
-
-    Grid: 1D, (num_elements + 255) / 256 workgroups, 256 threads each.
-    Each thread converts one element.
-    """
-    from ..emit.context import AsmContext
-    from ..emit.emitter import assemble_kernel
-
-    ctx = AsmContext()
-    ctx._metadata = {}
-
-    cvt = "v_cvt_pk_bf16_f32" if output_bf16 else "v_cvt_pk_f16_f32"
-    total = m * n
-
-    ctx.comment("=== StreamK Fixup Kernel ===")
-    ctx.comment(f"Convert {total} FP32 workspace values to {'BF16' if output_bf16 else 'FP16'}")
-    ctx.raw("")
-
-    # Load kernargs
-    ctx.inst("s_load_dwordx2", "s[0:1]", "s[4:5]", "0",
-             comment="workspace_ptr")
-    ctx.inst("s_load_dwordx2", "s[2:3]", "s[4:5]", "8",
-             comment="d_ptr")
-    ctx.inst("s_load_dword", "s6", "s[4:5]", "16",
-             comment="num_elements")
-    ctx.inst("s_waitcnt", "lgkmcnt(0)", comment="wait kernargs")
-    ctx.raw("")
-
-    # Global ID
-    ctx.inst("v_mov_b32", "v0", "s8", comment="block_id")  # s8 from dispatch
-    ctx.inst("v_lshlrev_b32", "v0", "8", "v0", comment="* 256")
-    ctx.inst("v_add_u32", "v0", "v0", "v1", comment="+ thread_id -> gid")
-
-    # Bounds check
-    ctx.inst("v_cmp_lt_u32", "vcc", "v0", "s6", comment="gid < num_elements")
-    ctx.inst("s_and_saveexec_b64", "s[10:11]", "vcc",
-             comment="mask out-of-bounds lanes")
-    ctx.raw("")
-
-    # Read FP32 from workspace
-    ctx.inst("v_lshlrev_b32", "v2", "2", "v0", comment="byte offset (FP32)")
-    ctx.inst("global_load_dword", "v3", "v2", "s[0:1]", comment="load FP32")
-    ctx.inst("s_waitcnt", "vmcnt(0)", comment="wait load")
-
-    # Convert to BF16/FP16 and store
-    ctx.inst("v_cvt_f16_f32_e32" if not output_bf16 else "v_cvt_bf16_f32_e32",
-             "v3", "v3", comment="FP32 -> output type")
-    ctx.inst("v_lshlrev_b32", "v2", "1", "v0", comment="byte offset (output)")
-    ctx.inst("global_store_short", "v2", "v3", "s[2:3]",
-             comment="store output")
-
-    ctx.inst("s_waitcnt", "vmcnt(0)", comment="wait store")
-    ctx.inst("s_endpgm", comment="done")
-
-    return ctx.lines

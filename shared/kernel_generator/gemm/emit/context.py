@@ -118,9 +118,6 @@ class AsmContext(TileContext):
     def v_add(self, dst: str, src0: object, src1: object, comment: str = "") -> None:
         self.inst("v_add_u32", dst, str(src0), str(src1), comment=comment)
 
-    def v_sub(self, dst: str, src0: object, src1: object, comment: str = "") -> None:
-        self.inst("v_sub_u32", dst, str(src0), str(src1), comment=comment)
-
     def v_mul(self, dst: str, src0: object, src1: object, comment: str = "") -> None:
         # Use shift for power-of-2 multipliers to avoid literal constant issues
         s0, s1 = str(src0), str(src1)
@@ -168,9 +165,6 @@ class AsmContext(TileContext):
     def s_mov(self, dst: str, src: object, comment: str = "") -> None:
         self.inst("s_mov_b32", dst, str(src), comment=comment)
 
-    def s_add(self, dst: str, src0: object, src1: object, comment: str = "") -> None:
-        self.inst("s_add_u32", dst, str(src0), str(src1), comment=comment)
-
     def s_sub(self, dst: str, src0: object, src1: object, comment: str = "") -> None:
         self.inst("s_sub_u32", dst, str(src0), str(src1), comment=comment)
 
@@ -209,16 +203,3 @@ class AsmContext(TileContext):
         else:
             self.inst(f"ds_write_{suffix}", addr, src, comment=comment)
 
-    def flat_load(self, dst: str, addr: str, width: int = 1,
-                  comment: str = "") -> None:
-        """Emit flat_load_dword/dwordx2/dwordx4."""
-        suffix = {1: "dword", 2: "dwordx2", 4: "dwordx4"}[width]
-        addr_fmt = f"[{addr}]" if "[" not in addr else addr
-        self.inst(f"flat_load_{suffix}", dst, addr_fmt, comment=comment)
-
-    def flat_store(self, addr: str, src: str, width: int = 1,
-                   comment: str = "") -> None:
-        """Emit flat_store_dword/short/dwordx2/dwordx4."""
-        suffix = {1: "dword", 2: "short"}[width]
-        addr_fmt = f"[{addr}]" if "[" not in addr else addr
-        self.inst(f"flat_store_{suffix}", addr_fmt, src, comment=comment)

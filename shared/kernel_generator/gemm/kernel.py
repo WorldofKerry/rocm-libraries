@@ -42,16 +42,6 @@ class MemoryView:
     base_reg: Optional[str] = None
     base_offset: int = 0
 
-    def emit_offset(self, ctx: AsmContext, bindings: dict, result_reg: str) -> None:
-        emit_affine(ctx, self.layout, bindings, result_reg,
-                    scale=self.elem_bytes,
-                    base=str(self.base_offset) if self.base_offset else None,
-                    comment=f"{self.name} offset: {self.layout}")
-
-    def summary(self) -> str:
-        return f"{self.name}({self.source}): {self.layout}"
-
-
 # Monkey-patch MemoryView registry onto AsmContext
 def _register_view(ctx: AsmContext, view: MemoryView) -> None:
     if not hasattr(ctx, '_views'):
