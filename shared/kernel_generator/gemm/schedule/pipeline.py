@@ -23,7 +23,7 @@ from ..memory.global_loader import GlobalLoader, DTLLoader, BufferLoader
 from ..memory.lds_reader import LDSReader
 from .kloop_graph import (
     KLoopGraph, KLoopOp, OpKind, MFMABlock, DSReadBlock,
-    GlobalLoadBlock, SuffixBlock,
+    GlobalLoadBlock, ScaleBlock, SuffixBlock,
 )
 from .kloop_scheduler import KLoopScheduler, ScheduledKLoop
 
@@ -131,6 +131,8 @@ class ScheduledCompute(ComputePipeline):
         graph = KLoopGraph(tile, problem)
         GlobalLoadBlock(loader).register(graph)
         DSReadBlock(reader).register(graph)
+        if scale_loader:
+            ScaleBlock(scale_loader, tile).register(graph)
         MFMABlock(ctx, tile, scale_loader).register(graph)
         SuffixBlock(reader, scale_loader, loader).register(graph)
         graph.validate()
@@ -139,16 +141,18 @@ class ScheduledCompute(ComputePipeline):
         schedule = KLoopScheduler(graph).schedule()
 
         # Emit
-        self._emit_prologue(ctx, loader, scale_loader)
+        self._emit_prologue(ctx, loader, scale_loader, schedule)
         self._emit_loop(ctx, schedule, loader, reader, scale_loader)
 
-    def _emit_prologue(self, ctx, loader, scale_loader):
+    def _emit_prologue(self, ctx, loader, scale_loader, schedule=None):
         """Load first K-tile into LDS. With PGR=2, also prefetch tile 1."""
         ctx.comment("Prologue: load tile 0")
         loader.emit_loads()
-        if scale_loader:
-            scale_loader.emit_initial_loads(4)
-            extra = scale_loader.num_initial_inflight(4)
+        if schedule and schedule.prologue_scale_ops:
+            for op in schedule.prologue_scale_ops:
+                if op.emit:
+                    op.emit()
+            extra = len(schedule.prologue_scale_ops)
             ctx.s_waitcnt(f"vmcnt({extra})",
                           comment=f"wait DTL (leave {extra} scale loads)")
         else:
@@ -166,9 +170,12 @@ class ScheduledCompute(ComputePipeline):
             loader.advance()
             loader.toggle_write()
             loader.emit_loads()
-            if scale_loader and not scale_loader.has_cross_iter_prefetch:
-                scale_loader.advance()
-                scale_loader.emit_loop_loads()
+            if schedule and schedule.scale_advance_op and schedule.scale_advance_op.emit:
+                schedule.scale_advance_op.emit()
+            if schedule and schedule.prologue_scale_ops and scale_loader and not scale_loader.has_cross_iter_prefetch:
+                for op in schedule.prologue_scale_ops:
+                    if op.emit:
+                        op.emit()
             ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
                       comment="k_tiles-- (prefetched tile 1)")
             ctx.label("pgr2_skip")
@@ -204,10 +211,13 @@ class ScheduledCompute(ComputePipeline):
             if op.emit:
                 op.emit()
 
-        if scale_loader:
-            if not scale_loader.has_cross_iter_prefetch:
-                scale_loader.advance()
-            scale_loader.emit_loop_loads()
+        if schedule.scale_advance_op and schedule.scale_advance_op.emit:
+            schedule.scale_advance_op.emit()
+        # Swizzled mode: re-emit scale loads for next iteration
+        if scale_loader and not scale_loader.has_cross_iter_prefetch:
+            for op in schedule.prologue_scale_ops:
+                if op.emit:
+                    op.emit()
 
         ctx.raw("")
         ctx.label("load_skip_all")
@@ -231,8 +241,10 @@ class ScheduledCompute(ComputePipeline):
         ctx.s_waitcnt(f"lgkmcnt({wait_cnt})",
                       comment="wait B[ki=0] + A[m0,k0]")
 
-        if scale_loader:
-            scale_loader.emit_scale_wait(loader)
+        if schedule.prologue_scale_ops:
+            num_dtl = loader.num_inflight if hasattr(loader, "num_inflight") else 0
+            ctx.s_waitcnt(f"vmcnt({num_dtl})",
+                          comment=f"wait scales (leave {num_dtl} DTL in-flight)")
         ctx.raw("")
 
         reader.emit_recompute_ki_bases()
@@ -259,13 +271,15 @@ class ScheduledCompute(ComputePipeline):
                               comment=f"wait A[m{mfma_count // mfmas_per_mi}]")
                 inflight_lgkm = 0
 
-            if scale_loader:
+            if schedule.prologue_scale_ops:
                 mps = partition_m * mfmas_per_mi
                 n_st = mr // partition_m
                 if mfma_count > 0 and mfma_count % mps == 0:
                     st_idx = mfma_count // mps
                     if st_idx < n_st:
-                        scale_loader.emit_subtile_wait(loader, st_idx)
+                        num_dtl = loader.num_inflight if hasattr(loader, "num_inflight") else 0
+                        ctx.s_waitcnt(f"vmcnt({num_dtl})",
+                                      comment=f"wait scale_a subtile {st_idx} (leave DTL)")
 
             if mfma_count % (partition_m * mfmas_per_mi) == 0:
                 ctx.comment(

@@ -43,6 +43,10 @@ class ScheduledKLoop:
     prefetch_ops: List[KLoopOp] = field(default_factory=list)
     # Preamble reads (A[m0] + B[ki=1] before scheduled body)
     preamble_ops: List[KLoopOp] = field(default_factory=list)
+    # Scale load ops for prologue (first subtile A + all B)
+    prologue_scale_ops: List[KLoopOp] = field(default_factory=list)
+    # Scale advance op for next iteration (iteration=1)
+    scale_advance_op: Optional[KLoopOp] = None
     # Auto-inserted waits: position -> waitcnt string
     waits: Dict[int, str] = field(default_factory=dict)
 
@@ -101,9 +105,23 @@ class KLoopScheduler:
         a_reads = {}       # (mi, ki) -> op
         b_reads = {}       # (ni, ki) -> op
         suffix_ops = []    # waits, toggle
+        scale_a_ops = {}   # (mi, ki) -> op
+        scale_b_ops = {}   # (ni, ki) -> op
+        scale_advance_op = None
 
         for name, op in g.ops.items():
             if op.kind == OpKind.MFMA or op.kind == OpKind.BARRIER:
+                continue
+            if name == "advance_scale":
+                scale_advance_op = op
+                continue
+            if op.kind == OpKind.SCALE_LOAD:
+                if name.startswith("scale_a_m"):
+                    parts = name.replace("scale_a_m", "").replace("_k", " ").split()
+                    scale_a_ops[(int(parts[0]), int(parts[1]))] = op
+                elif name.startswith("scale_b_n"):
+                    parts = name.replace("scale_b_n", "").replace("_k", " ").split()
+                    scale_b_ops[(int(parts[0]), int(parts[1]))] = op
                 continue
             if op.iteration == 1:
                 prefetch_ops.append(op)
@@ -205,6 +223,40 @@ class KLoopScheduler:
                     side_ops[pos].append(op)
                     break
 
+        # Phase 4a: Place scale load ops
+        # Group scale ops into subtiles: first subtile goes to prologue,
+        # remaining subtiles are placed at subtile boundaries in side_ops.
+        prologue_scale_ops: List[KLoopOp] = []
+        partition_m = min(4, mr)
+
+        if scale_a_ops or scale_b_ops:
+            # Prologue: A scales for first subtile + all B scales
+            for mi in range(partition_m):
+                for ki in range(ki_count):
+                    if (mi, ki) in scale_a_ops:
+                        prologue_scale_ops.append(scale_a_ops[(mi, ki)])
+            for ni in range(nr):
+                for ki in range(ki_count):
+                    if (ni, ki) in scale_b_ops:
+                        prologue_scale_ops.append(scale_b_ops[(ni, ki)])
+
+            # Remaining subtiles: place A scale loads at subtile boundaries.
+            # Each subtile boundary is at the first MFMA of the next
+            # partition_m group.
+            n_subtiles = (mr + partition_m - 1) // partition_m
+            for st in range(1, n_subtiles):
+                st_start_mi = st * partition_m
+                st_end_mi = min(st_start_mi + partition_m, mr)
+                # Find the MFMA position of the first MFMA in this subtile
+                first_mfma_name = f"mfma_m{st_start_mi}_n0_k0"
+                if first_mfma_name in mfma_positions:
+                    target_pos = mfma_positions[first_mfma_name]
+                    for mi in range(st_start_mi, st_end_mi):
+                        for ki in range(ki_count):
+                            if (mi, ki) in scale_a_ops:
+                                op = scale_a_ops[(mi, ki)]
+                                side_ops[target_pos].insert(0, op)
+
         # Phase 4b: Place suffix ops backward from end
         suffix_names = ["suffix_vmcnt", "suffix_toggle"]
         suffix_ops_list = [g.ops[n] for n in suffix_names if n in g.ops]
@@ -233,6 +285,8 @@ class KLoopScheduler:
             barrier_op=barrier_op,
             prefetch_ops=prefetch_ops,
             preamble_ops=preamble,
+            prologue_scale_ops=prologue_scale_ops,
+            scale_advance_op=scale_advance_op,
             waits=waits,
         )
 
@@ -243,9 +297,9 @@ class KLoopScheduler:
                        mfma_positions: Dict[str, int]) -> Dict[int, str]:
         """Compute where s_waitcnt lgkmcnt(N) needs to be inserted.
 
-        Tracks in-flight lgkmcnt as ds_reads are issued, counts down
-        as instructions execute. Inserts wait before each MFMA whose
-        operand reads haven't completed yet.
+        Simulates lgkmcnt tracking: each ds_read increments the count,
+        and we insert waits before MFMAs whose operands haven't been
+        guaranteed available yet.
         """
         g = self.graph
         waits: Dict[int, str] = {}
@@ -259,51 +313,66 @@ class KLoopScheduler:
                     mfma_read_deps.setdefault(dep.consumer, []).append(
                         dep.producer)
 
-        # Build a timeline: position of each ds_read in the total
-        # instruction sequence (pre_body, preamble, then interleaved body)
-        read_positions: Dict[str, int] = {}
-        pos = 0
+        # Build timeline of all ds_reads in issue order
+        read_issue_order: List[str] = []
         for op in pre_body:
             if op.kind == OpKind.DS_READ:
-                read_positions[op.name] = pos
-            pos += 1
+                read_issue_order.append(op.name)
         for op in preamble:
             if op.kind == OpKind.DS_READ:
-                read_positions[op.name] = pos
-            pos += 1
-        # Barrier + sync adds some instruction distance
-        pos += 2  # approximate barrier + vmcnt
-
+                read_issue_order.append(op.name)
         for i in range(len(mfma_order)):
             for op in side_ops[i]:
                 if op.kind == OpKind.DS_READ:
-                    read_positions[op.name] = pos
-                pos += 1
-            pos += 1  # MFMA itself
+                    read_issue_order.append(op.name)
 
-        # For each MFMA, check if all its operand reads have enough
-        # distance. If not, note that a wait is needed.
-        mfma_inst_pos = {}
-        pos = len(pre_body) + len(preamble) + 2  # after pre_body + preamble + barrier
+        # Assign each read a position in the issue order (0 = first issued)
+        read_issue_idx = {name: idx for idx, name in enumerate(read_issue_order)}
+        total_reads = len(read_issue_order)
+
+        # Count reads issued before each MFMA position
+        reads_before_mfma: Dict[int, int] = {}
+        n_preamble_reads = sum(1 for op in pre_body + preamble
+                               if op.kind == OpKind.DS_READ)
+        count = n_preamble_reads
         for i in range(len(mfma_order)):
-            pos += len(side_ops[i])
-            mfma_inst_pos[mfma_order[i].name] = pos
-            pos += 1
+            reads_before_mfma[i] = count
+            for op in side_ops[i]:
+                if op.kind == OpKind.DS_READ:
+                    count += 1
 
+        # For each MFMA, find the latest ds_read it depends on
         for mfma_name, reads in mfma_read_deps.items():
-            if mfma_name not in mfma_inst_pos:
+            if mfma_name not in mfma_positions:
                 continue
-            mfma_pos = mfma_inst_pos[mfma_name]
+            mfma_idx = mfma_positions[mfma_name]
+
+            # Find latest read this MFMA depends on
+            latest_dep_idx = -1
             for read_name in reads:
-                if read_name not in read_positions:
-                    continue
-                read_pos = read_positions[read_name]
-                distance = mfma_pos - read_pos
-                if distance < DS_READ_LEAD_MFMAS:
-                    # Need a wait before this MFMA
-                    mfma_idx = mfma_positions[mfma_name]
-                    waits[mfma_idx] = "lgkmcnt(0)"
-                    break  # one wait per MFMA is enough
+                if read_name in read_issue_idx:
+                    latest_dep_idx = max(latest_dep_idx, read_issue_idx[read_name])
+
+            if latest_dep_idx < 0:
+                continue
+
+            # lgkmcnt at this MFMA = total_issued - completed
+            # We need latest_dep_idx to have completed
+            # lgkmcnt represents reads still in-flight:
+            #   inflight = total_issued - completed_count
+            # We need inflight <= (total_issued - latest_dep_idx - 1)
+            # i.e. lgkmcnt(total_reads_before_this_mfma - latest_dep_idx - 1)
+            issued_before = reads_before_mfma.get(mfma_idx, 0)
+            wait_for = issued_before - latest_dep_idx - 1
+            if wait_for < 0:
+                wait_for = 0
+
+            if mfma_idx in waits:
+                # Take the tighter (lower) wait
+                existing = int(waits[mfma_idx].split("(")[1].rstrip(")"))
+                wait_for = min(wait_for, existing)
+
+            waits[mfma_idx] = f"lgkmcnt({wait_for})"
 
         return waits
 
@@ -348,7 +417,8 @@ def scheduled_kloop_phase(level, ctx) -> None:
     from ..memory.global_loader import GlobalLoader, DTLLoader, BufferLoader
     from ..memory.lds_reader import LDSReader
     from .kloop_graph import (
-        KLoopGraph, MFMABlock, DSReadBlock, GlobalLoadBlock, SuffixBlock,
+        KLoopGraph, MFMABlock, DSReadBlock, GlobalLoadBlock, ScaleBlock,
+        SuffixBlock,
     )
 
     tile = ctx._metadata["tile"]
@@ -376,6 +446,8 @@ def scheduled_kloop_phase(level, ctx) -> None:
     graph = KLoopGraph(tile, problem)
     GlobalLoadBlock(loader).register(graph)
     DSReadBlock(reader).register(graph)
+    if scale_loader:
+        ScaleBlock(scale_loader, tile).register(graph)
     MFMABlock(ctx, tile, scale_loader).register(graph)
     SuffixBlock(reader, scale_loader, loader).register(graph)
     graph.validate()
@@ -410,9 +482,11 @@ def scheduled_kloop_phase(level, ctx) -> None:
     # Prologue: load first tile
     ctx.comment("Prologue: load tile 0")
     loader.emit_loads()
-    if scale_loader:
-        scale_loader.emit_initial_loads(4)
-        extra = scale_loader.num_initial_inflight(4)
+    if result.prologue_scale_ops:
+        for op in result.prologue_scale_ops:
+            if op.emit:
+                op.emit()
+        extra = len(result.prologue_scale_ops)
         ctx.s_waitcnt(f"vmcnt({extra})",
                       comment=f"wait DTL (leave {extra} scale loads)")
     else:
@@ -457,10 +531,13 @@ def scheduled_kloop_phase(level, ctx) -> None:
         if op.emit:
             op.emit()
 
-    if scale_loader:
-        if not scale_loader.has_cross_iter_prefetch:
-            scale_loader.advance()
-        scale_loader.emit_loop_loads()
+    if result.scale_advance_op and result.scale_advance_op.emit:
+        result.scale_advance_op.emit()
+    # Swizzled mode: re-emit scale loads for next iteration
+    if scale_loader and not scale_loader.has_cross_iter_prefetch:
+        for op in result.prologue_scale_ops:
+            if op.emit:
+                op.emit()
 
     ctx.raw("")
     ctx.label("load_skip_all")
@@ -487,8 +564,10 @@ def scheduled_kloop_phase(level, ctx) -> None:
     ctx.s_waitcnt(f"lgkmcnt({wait_cnt})",
                   comment="wait B[ki=0] + A[m0,k0]")
 
-    if scale_loader:
-        scale_loader.emit_scale_wait(loader)
+    if result.prologue_scale_ops:
+        num_dtl = loader.num_inflight if hasattr(loader, "num_inflight") else 0
+        ctx.s_waitcnt(f"vmcnt({num_dtl})",
+                      comment=f"wait scales (leave {num_dtl} DTL in-flight)")
     ctx.raw("")
 
     # Recompute per-ki LDS read bases
@@ -522,14 +601,16 @@ def scheduled_kloop_phase(level, ctx) -> None:
                           comment=f"wait A[m{mfma_count // mfmas_per_mi}]")
             inflight_lgkm = 0
 
-        # Scale subtile boundary wait
-        if scale_loader:
+        # Scale subtile boundary vmcnt wait (auto-placed by scheduler)
+        if result.prologue_scale_ops:
             mps = partition_m * mfmas_per_mi
             n_st = mr // partition_m
             if mfma_count > 0 and mfma_count % mps == 0:
                 st_idx = mfma_count // mps
                 if st_idx < n_st:
-                    scale_loader.emit_subtile_wait(loader, st_idx)
+                    num_dtl = loader.num_inflight if hasattr(loader, "num_inflight") else 0
+                    ctx.s_waitcnt(f"vmcnt({num_dtl})",
+                                  comment=f"wait scale_a subtile {st_idx} (leave DTL)")
 
         # Partition comment
         if mfma_count % (partition_m * mfmas_per_mi) == 0:
