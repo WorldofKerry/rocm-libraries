@@ -124,6 +124,7 @@ class GemmKernel:
               wave_abi: bool = False,
               use_dtl: bool = True,
               pgr2: bool = False,
+              pgr: int = 1,
               wg_mapping_xcc: int = 1,
               colmajor_output: bool = False) -> GemmKernel:
         """Build a GemmKernel.  GemmTiling is the source of truth.
@@ -178,6 +179,13 @@ class GemmKernel:
         k.use_real_scales = problem.dtype.value == 'mxfp4'
         k.use_dtl = use_dtl
         k.pgr2 = pgr2
+        k.pgr = pgr if pgr > 1 else (2 if pgr2 else 1)
+        # Validate PGR vs buffer count (double-buffered = 2)
+        num_lds_buffers = 2
+        if k.pgr > num_lds_buffers:
+            raise ValueError(
+                f"PGR={k.pgr} exceeds num_lds_buffers={num_lds_buffers}. "
+                f"Cannot preload more tiles than available buffers.")
         k.wg_mapping_xcc = wg_mapping_xcc
         k.colmajor_output = colmajor_output
         return k
@@ -223,6 +231,7 @@ class GemmKernel:
             "use_1d_grid": getattr(self, "use_1d_grid", False),
             "swizzled_scales": getattr(self, "swizzled_scales", False),
             "pgr2": getattr(self, "pgr2", False),
+            "pgr": getattr(self, "pgr", 1),
             "wg_mapping_xcc": getattr(self, "wg_mapping_xcc", 1),
             "colmajor_output": getattr(self, "colmajor_output", False),
         }

@@ -98,11 +98,29 @@ class ScheduledCompute(ComputePipeline):
     """
 
     def __init__(self, loader: GlobalLoader, reader: LDSReader,
-                 scale_loader: object = None, pgr2: bool = False) -> None:
+                 scale_loader: object = None, pgr2: bool = False,
+                 pgr: int = 0, num_lds_buffers: int = 2) -> None:
         self.loader = loader
         self.reader = reader
         self.scale_loader = scale_loader
-        self.pgr2 = pgr2
+        # Resolve PGR count: pgr2 flag maps to pgr=2 for backwards compat
+        self.pgr = pgr if pgr > 0 else (2 if pgr2 else 1)
+        self.pgr2 = self.pgr >= 2  # compat
+        self.num_lds_buffers = num_lds_buffers
+
+        if self.pgr > self.num_lds_buffers:
+            raise ValueError(
+                f"PGR={self.pgr} exceeds num_lds_buffers={self.num_lds_buffers}. "
+                f"Cannot preload more tiles than available buffers.")
+
+    @property
+    def loads_before_reads(self) -> bool:
+        """True when a free buffer is always available for next-iter loads.
+
+        PGR <= num_buffers - 1: load goes into a buffer not being read.
+        PGR == num_buffers: all buffers full, must read before loading.
+        """
+        return self.pgr < self.num_lds_buffers
 
     def emit(self, ctx: AsmContext) -> None:
         tile = ctx._metadata["tile"]
@@ -145,8 +163,19 @@ class ScheduledCompute(ComputePipeline):
         self._emit_loop(ctx, schedule, loader, reader, scale_loader)
 
     def _emit_prologue(self, ctx, loader, scale_loader, schedule=None):
-        """Load first K-tile into LDS. With PGR=2, also prefetch tile 1."""
-        ctx.comment("Prologue: load tile 0")
+        """Emit PGR prologue stages: load tiles 0..PGR-1 into LDS buffers.
+
+        Each stage loads one tile. Stage 0 waits + barriers (data needed
+        immediately). Stages 1..PGR-1 are prefetch-only (loaded into
+        other buffers for future iterations).
+
+        The loop body is the inductive step (G+R+M). The prologue just
+        fills the pipeline.
+        """
+        pgr = self.pgr
+
+        # Stage 0: load tile 0, wait, barrier (always needed)
+        ctx.comment(f"Prologue stage 0/{pgr}: load tile 0")
         loader.emit_loads()
         if schedule and schedule.prologue_scale_ops:
             for op in schedule.prologue_scale_ops:
@@ -157,78 +186,97 @@ class ScheduledCompute(ComputePipeline):
                           comment=f"wait DTL (leave {extra} scale loads)")
         else:
             ctx.s_waitcnt("vmcnt(0)", comment="wait DTL loads")
-        ctx.s_barrier(comment="sync first tile")
+        ctx.s_barrier(comment="sync tile 0")
         ctx.raw("")
 
-        if self.pgr2:
-            # PGR=2 disabled: the current loop structure overwrites
-            # tile 0 in the first iteration before reading it.
-            # Fixing requires restructuring the loop body order.
-            # TODO: implement proper PGR=2 with read-before-write loop.
-            pass
-        if False:  # PGR=2 disabled
-            ctx.comment("PGR=2: prefetch tile 1 into other buffer")
-            ctx.inst("s_cmp_le_u32", ctx.sreg("s_k_tiles"), "1",
-                     comment="skip prefetch if only 1 tile")
-            ctx.inst("s_cbranch_scc1", "pgr2_skip",
-                     comment="skip if k_tiles <= 1")
+        # Stages 1..PGR-1: prefetch additional tiles (no wait/barrier)
+        for stage in range(1, pgr):
+            ctx.comment(f"Prologue stage {stage}/{pgr}: prefetch tile {stage}")
+            ctx.inst("s_cmp_le_u32", ctx.sreg("s_k_tiles"),
+                     str(stage),
+                     comment=f"skip if k_tiles <= {stage}")
+            ctx.inst("s_cbranch_scc1", f"pgr_skip_{stage}",
+                     comment=f"not enough tiles for PGR stage {stage}")
             loader.advance()
             loader.toggle_write()
             loader.emit_loads()
             if schedule and schedule.scale_advance_op and schedule.scale_advance_op.emit:
                 schedule.scale_advance_op.emit()
-            if schedule and schedule.prologue_scale_ops and scale_loader and not scale_loader.has_cross_iter_prefetch:
+            if (schedule and schedule.prologue_scale_ops and scale_loader
+                    and not scale_loader.has_cross_iter_prefetch):
                 for op in schedule.prologue_scale_ops:
                     if op.emit:
                         op.emit()
-            ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
-                      comment="k_tiles-- (prefetched tile 1)")
-            ctx.label("pgr2_skip")
+            ctx.label(f"pgr_skip_{stage}")
             ctx.raw("")
 
-    def _emit_loop(self, ctx, schedule, loader, reader, scale_loader):
-        """Emit the K-loop: iterate over K-tiles."""
-        tile = ctx._metadata["tile"]
-        nr = tile.mfma_n_repeat
-        mr = tile.mfma_m_repeat
-        ki_count = tile.k_iterations
-        mfmas_per_mi = nr * ki_count
-        partition_m = 4
-
-        ctx.label("k_loop")
-        ctx.raw("")
-
-        # Pre-body: early B reads (overlap with arriving loads)
-        ctx.comment("Early B reads (overlap with loads)")
-        for op in schedule.pre_body_ops:
-            if op.emit:
-                op.emit()
-
-        # Conditional next-tile load
-        ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
-                  comment="k_tiles--")
-        ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
-                 comment="more tiles?")
-        ctx.inst("s_cbranch_scc0", "load_skip_all",
-                 comment="skip loads on last iter")
-
+    def _emit_global_load_ops(self, ctx, schedule, scale_loader):
+        """Emit global load + scale advance ops (shared by both load paths)."""
         for op in schedule.prefetch_ops:
             if op.emit:
                 op.emit()
 
         if schedule.scale_advance_op and schedule.scale_advance_op.emit:
             schedule.scale_advance_op.emit()
-        # Swizzled mode: re-emit scale loads for next iteration
         if scale_loader and not scale_loader.has_cross_iter_prefetch:
             for op in schedule.prologue_scale_ops:
                 if op.emit:
                     op.emit()
 
-        ctx.raw("")
-        ctx.label("load_skip_all")
+    def _emit_loop(self, ctx, schedule, loader, reader, scale_loader):
+        """Emit the K-loop inductive step.
 
-        loader.emit_sync()
+        The body is the same for all PGR values: R(current) + M(current)
+        with conditional G(next). Load placement depends on buffer
+        lifecycle:
+
+          PGR < num_buffers: G before R (free buffer available)
+          PGR = num_buffers: G after R  (must consume before overwrite)
+
+        The load condition ``k_tiles > PGR-1`` naturally produces:
+        - First T-PGR iters: G+R+M (steady state)
+        - Last PGR-1 iters: R+M only (drain, no more loads needed)
+        """
+        tile = ctx._metadata["tile"]
+        nr = tile.mfma_n_repeat
+        mr = tile.mfma_m_repeat
+        ki_count = tile.k_iterations
+        mfmas_per_mi = nr * ki_count
+        partition_m = 4
+        pgr = self.pgr
+
+        ctx.label("k_loop")
         ctx.raw("")
+
+        if self.loads_before_reads:
+            # --- Load-before-read: G then R ---
+            ctx.comment(f"Early B reads (PGR={pgr})")
+            for op in schedule.pre_body_ops:
+                if op.emit:
+                    op.emit()
+
+            ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
+                      comment="k_tiles--")
+            ctx.inst("s_cmp_gt_u32", ctx.sreg("s_k_tiles"),
+                     str(pgr - 1),
+                     comment=f"k_tiles > {pgr - 1}?")
+            ctx.inst("s_cbranch_scc0", "load_skip_all",
+                     comment="skip G (drain phase)")
+
+            self._emit_global_load_ops(ctx, schedule, scale_loader)
+            ctx.raw("")
+            ctx.label("load_skip_all")
+            loader.emit_sync()
+            ctx.raw("")
+        else:
+            # --- Read-before-write: R then G ---
+            loader.emit_sync()
+            ctx.raw("")
+
+            ctx.comment(f"Early B reads (PGR={pgr})")
+            for op in schedule.pre_body_ops:
+                if op.emit:
+                    op.emit()
 
         # Preamble reads
         ctx.comment("Preamble: A[m0] + B ki=1")
@@ -304,6 +352,22 @@ class ScheduledCompute(ComputePipeline):
         for op in schedule.epilogue_ops:
             if op.emit:
                 op.emit()
+
+        # Read-before-write: issue loads AFTER MFMA body
+        if not self.loads_before_reads:
+            ctx.s_waitcnt("lgkmcnt(0)",
+                          comment="wait all ds_reads before overwriting LDS")
+            ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
+                      comment="k_tiles--")
+            ctx.inst("s_cmp_gt_u32", ctx.sreg("s_k_tiles"),
+                     str(pgr - 1),
+                     comment=f"k_tiles > {pgr - 1}?")
+            ctx.inst("s_cbranch_scc0", "load_skip_all",
+                     comment="skip G (drain phase)")
+
+            self._emit_global_load_ops(ctx, schedule, scale_loader)
+            ctx.raw("")
+            ctx.label("load_skip_all")
 
         # Postamble
         ctx.s_barrier(comment="sync")
@@ -395,10 +459,13 @@ def pipeline_kloop_phase(level, ctx) -> None:
         swizzled = ctx._metadata.get("swizzled_scales", False)
         scale_loader = VMEMScaleLoader(ctx, tile, swizzled=swizzled)
 
-    pgr2 = ctx._metadata.get("pgr2", False)
+    pgr = ctx._metadata.get("pgr", 1)
+    # Legacy: pgr2 flag maps to pgr=2
+    if ctx._metadata.get("pgr2", False) and pgr < 2:
+        pgr = 2
     pipeline = KernelPipeline(
         partitioner=GridPartitioner(),
-        compute=ScheduledCompute(loader, reader, scale_loader, pgr2=pgr2),
+        compute=ScheduledCompute(loader, reader, scale_loader, pgr=pgr),
     )
     pipeline.emit(ctx)
 
