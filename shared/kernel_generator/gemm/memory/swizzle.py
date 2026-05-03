@@ -74,7 +74,7 @@ class BankedMemoryConfig:
 
 # Architecture presets
 LDS_GFX950 = BankedMemoryConfig(
-    levels=(BankingLevel("bank", num_units=32, stride=4, max_per_cycle=1),),
+    levels=(BankingLevel("bank", num_units=64, stride=4, max_per_cycle=1),),
     access_width=16,
     lanes_per_group=16,
 )

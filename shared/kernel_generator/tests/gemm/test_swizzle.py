@@ -52,12 +52,12 @@ class TestDataLayout:
 
 class TestBankedMemoryConfig:
     def test_bank_row_bytes(self):
-        assert LDS_GFX950.bank_row_bytes == 128
+        assert LDS_GFX950.bank_row_bytes == 256  # 64 banks * 4B
 
     def test_no_conflict(self):
         # 16 accesses to 16 different banks -> 1 cycle
         addrs = [i * 16 for i in range(16)]
-        assert LDS_GFX950.cycles(addrs) == 2  # ds_read_b128 -> 4 banks each
+        assert LDS_GFX950.cycles(addrs) == 1  # 64 banks, 16*4=64 unique banks
 
     def test_worst_conflict(self):
         # All 16 lanes read from the same address -> 16-way on 4 banks
