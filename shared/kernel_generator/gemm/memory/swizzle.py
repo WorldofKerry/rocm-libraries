@@ -450,3 +450,64 @@ class ComposedSwizzle(Swizzle):
         # Fall back to the last stage's emit with modified column
         self.stages[-1].emit_read_setup(
             ctx, layout, mem, v_lane_row, v_k_group, v_row_base, out_vregs)
+
+
+# ---------------------------------------------------------------------------
+# Auto-derivation
+# ---------------------------------------------------------------------------
+
+def auto_derive_xor(layout: DataLayout,
+                    mem: BankedMemoryConfig) -> Tuple[XorSwizzle, int]:
+    """Find optimal XOR params via exhaustive search.
+
+    Returns (best_swizzle, best_cycles). For typical configs (num_cols
+    in {4, 8}), the search space is tiny (~25 combinations).
+    """
+    best_sw = XorSwizzle(0, 0)
+    best_cycles = best_sw.verify_all_ki(layout, mem)
+    max_shift = max(3, int(math.log2(max(layout.num_cols, 2))) + 2)
+
+    for sr in range(max_shift):
+        for sl in range(max_shift):
+            sw = XorSwizzle(sr, sl)
+            c = sw.verify_all_ki(layout, mem)
+            if c < best_cycles:
+                best_cycles = c
+                best_sw = sw
+
+    return best_sw, best_cycles
+
+
+def auto_swizzle(layout: DataLayout,
+                 mem: BankedMemoryConfig = LDS_GFX950) -> Swizzle:
+    """Return the best swizzle for the given layout + memory config.
+
+    Tries XOR family first (cheap, no cross-lane ops). Falls back
+    to rotation + cross-lane if XOR can't reach near-optimal.
+
+    Data-type-independent: operates on DataLayout geometry only.
+    """
+    # Theoretical minimum: each lane touches access_width/bank_stride banks
+    inner = mem.levels[-1]
+    banks_per_access = mem.access_width // inner.stride
+    total_accesses = mem.lanes_per_group * banks_per_access
+    theoretical_min = -(-total_accesses // inner.num_units)  # ceil div
+
+    # Try XOR family
+    best_xor, xor_cycles = auto_derive_xor(layout, mem)
+    if xor_cycles <= theoretical_min:
+        return best_xor  # optimal
+
+    # Try rotation (may use cross-lane ops)
+    rot = RotationSwizzle(use_cross_lane=True)
+    rot_cycles = rot.verify_all_ki(layout, mem)
+    if rot_cycles < xor_cycles:
+        return rot
+
+    return best_xor
+
+
+def auto_swizzle_from_tile(tile: 'TileConfig', mem: BankedMemoryConfig = LDS_GFX950) -> Swizzle:
+    """Convenience: derive swizzle from TileConfig."""
+    layout = DataLayout.from_tile(tile, tile.mfma, tile.mfma.element_bytes)
+    return auto_swizzle(layout, mem)
