@@ -353,7 +353,8 @@ def phase_wave_abi_setup(level: TileLevel, ctx: AsmContext) -> None:
                    int(math.log2(pf)), comment=f"lds_row = n_row / {pf}")
         ctx.v_mul(ctx.vreg("v_tmp2"), str(eff_stride), ctx.vreg("v_tmp2"),
                   comment=f"row_base = lds_row * {eff_stride}")
-        ctx.v_add(ctx.vreg("v_tmp2"), ctx.vreg("v_tmp2"), str(lds_b_off),
+        ctx.s_mov(ctx.sreg("s_tmp0"), str(lds_b_off), comment=f"lds_b_off={lds_b_off}")
+        ctx.v_add(ctx.vreg("v_tmp2"), ctx.vreg("v_tmp2"), ctx.sreg("s_tmp0"),
                   comment=f"+ lds_b_offset={lds_b_off}")
         b_out = [ctx.vreg("v_lds_rd_b")]
         for ki in range(1, ki_count):
@@ -731,38 +732,87 @@ def phase_dtl_interleaved_setup(level: TileLevel, ctx: AsmContext) -> None:
               comment=f"lane_row = lane_id % {mfma.m}")
 
     swz = tile.resolved_swizzle(elem)
-    if swz is not None:
+    if swz is not None and hasattr(swz, 'pair_factor'):
+        # Paired-row swizzle: use m_row for rotation, paired row_base
+        from ..memory.swizzle import DataLayout as SwzLayout, LDS_GFX950
+        swz_layout = SwzLayout(row_stride_bytes=row_stride_bytes,
+                               mfma_k=mfma.k, mfma_m=mfma.m,
+                               elem_bytes=elem, wave_size=tile.wave_size)
+        pf = swz.pair_factor
+        ec = swz.effective_cols
+        eff_stride = ec * 16
+        ki_count = swz_layout.ki_count
+
+        ctx.v_lshr(ctx.vreg("v_tmp1"), ctx.vreg("v_lane_id"),
+                   int(math.log2(mfma.m)), comment=f"k_group = lane_id / {mfma.m}")
+
+        # A: m_row = wave_m * m_per_wave + lane_row
+        ctx.comment("LDS read A (paired-row swizzle)")
+        ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(tile.m_per_wave),
+                  ctx.vreg("v_wave_m"), comment=f"wave_m * {tile.m_per_wave}")
+        ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
+                  ctx.vreg("v_tmp0"), comment="+ lane_row -> m_row_a")
+        # row_base = (m_row / pf) * eff_stride
+        ctx.v_lshr(ctx.vreg("v_tmp2"), ctx.vreg("v_lds_rd_a"),
+                   int(math.log2(pf)), comment=f"lds_row = m_row / {pf}")
+        ctx.v_mul(ctx.vreg("v_tmp2"), str(eff_stride), ctx.vreg("v_tmp2"),
+                  comment=f"row_base = lds_row * {eff_stride}")
+        a_out = [ctx.vreg("v_lds_rd_a")]
+        for ki in range(1, ki_count):
+            vname = f"v_lds_rd_a_k{ki}"
+            if not ctx.has(vname):
+                ctx.alloc_vgpr_permanent(1, vname)
+            a_out.append(ctx.vreg(vname))
+        swz.emit_read_setup(ctx, swz_layout, LDS_GFX950,
+                            ctx.vreg("v_lds_rd_a"), ctx.vreg("v_tmp1"),
+                            ctx.vreg("v_tmp2"), a_out)
+        ctx.raw("")
+
+        # B: n_row = wave_n * n_per_wave + lane_row
+        ctx.comment("LDS read B (paired-row swizzle)")
+        ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.m - 1,
+                  comment=f"lane_row = lane_id % {mfma.m}")
+        ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(tile.n_per_wave),
+                  ctx.vreg("v_wave_n"), comment=f"wave_n * {tile.n_per_wave}")
+        ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
+                  ctx.vreg("v_tmp0"), comment="+ lane_row -> n_row_b")
+        lds_b_off = dtl_lds_b_offset
+        ctx.v_lshr(ctx.vreg("v_tmp2"), ctx.vreg("v_lds_rd_b"),
+                   int(math.log2(pf)), comment=f"lds_row = n_row / {pf}")
+        ctx.v_mul(ctx.vreg("v_tmp2"), str(eff_stride), ctx.vreg("v_tmp2"),
+                  comment=f"row_base = lds_row * {eff_stride}")
+        ctx.s_mov(ctx.sreg("s_tmp0"), str(lds_b_off), comment=f"lds_b_off={lds_b_off}")
+        ctx.v_add(ctx.vreg("v_tmp2"), ctx.vreg("v_tmp2"), ctx.sreg("s_tmp0"),
+                  comment=f"+ lds_b_offset={lds_b_off}")
+        b_out = [ctx.vreg("v_lds_rd_b")]
+        for ki in range(1, ki_count):
+            vname = f"v_lds_rd_b_k{ki}"
+            if not ctx.has(vname):
+                ctx.alloc_vgpr_permanent(1, vname)
+            b_out.append(ctx.vreg(vname))
+        swz.emit_read_setup(ctx, swz_layout, LDS_GFX950,
+                            ctx.vreg("v_lds_rd_b"), ctx.vreg("v_tmp1"),
+                            ctx.vreg("v_tmp2"), b_out)
+    elif swz is not None:
+        # Legacy swizzle (non-paired)
         from ..memory.swizzle import DataLayout as SwzLayout, LDS_GFX950
         swz_layout = SwzLayout(row_stride_bytes=row_stride_bytes,
                                mfma_k=mfma.k, mfma_m=mfma.m,
                                elem_bytes=elem, wave_size=tile.wave_size)
         ctx.v_lshr(ctx.vreg("v_tmp1"), ctx.vreg("v_lane_id"),
                    int(math.log2(mfma.m)), comment=f"k_group = lane_id / {mfma.m}")
-
-        # Compute row_base for A
-        ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(tile.m_per_wave),
-                  ctx.vreg("v_wave_m"), comment=f"wave_m * {tile.m_per_wave}")
-        ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
-                  ctx.vreg("v_tmp0"), comment="+ lane_row")
         ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(row_stride_bytes),
-                  ctx.vreg("v_lds_rd_a"), comment=f"* {row_stride_bytes} -> row_base_a")
-        # Emit swizzled read setup for A (ki=0 into v_lds_rd_a, ki>0 into v_lds_rd_a_k{ki})
+                  ctx.vreg("v_tmp0"), comment=f"lane_row * {row_stride_bytes}")
         ki_count = swz_layout.ki_count
         a_out = [ctx.vreg("v_lds_rd_a")] + [ctx.vreg(f"v_lds_rd_a_k{ki}") for ki in range(1, ki_count)]
         swz.emit_read_setup(ctx, swz_layout, LDS_GFX950,
                             ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),
                             ctx.vreg("v_lds_rd_a"), a_out)
         ctx.raw("")
-
-        # Compute row_base for B
         ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.m - 1,
-                  comment=f"lane_row = lane_id % {mfma.m} (re-derive)")
-        ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(tile.n_per_wave),
-                  ctx.vreg("v_wave_n"), comment=f"wave_n * {tile.n_per_wave}")
-        ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
-                  ctx.vreg("v_tmp0"), comment="+ lane_row")
+                  comment=f"lane_row (re-derive)")
         ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(row_stride_bytes),
-                  ctx.vreg("v_lds_rd_b"), comment=f"* {row_stride_bytes} -> row_base_b")
+                  ctx.vreg("v_tmp0"), comment=f"lane_row * {row_stride_bytes}")
         b_out = [ctx.vreg("v_lds_rd_b")] + [ctx.vreg(f"v_lds_rd_b_k{ki}") for ki in range(1, ki_count)]
         swz.emit_read_setup(ctx, swz_layout, LDS_GFX950,
                             ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),
