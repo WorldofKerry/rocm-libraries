@@ -388,10 +388,33 @@ def phase_dtl_interleaved_setup(level: TileLevel, ctx: AsmContext) -> None:
 
     # 1D WG decomposition (KernArgsVersion >= 1: grid flattened to 1D)
     if ctx._metadata.get("use_1d_grid", False):
-        # 1D WG decomposition using pure scalar integer math
-        # numWG_m = ceil(M / MT_M), tile_n = serial / numWG_m, tile_m = serial % numWG_m
         import math as _math
         _log2_mt = int(_math.log2(tile.wg_m))
+
+        # WorkGroupMappingXCC: remap WG serial for L2 locality across XCCs
+        wgmxcc = ctx._metadata.get("wg_mapping_xcc", 1)
+        if wgmxcc > 1:
+            _log2_xcc = int(_math.log2(wgmxcc))
+            ctx.comment(f"WorkGroupMappingXCC={wgmxcc}: remap for L2 locality")
+            # Load numWG from kernarg offset 12
+            ctx.alloc_sgpr_permanent(1, "s_numWG")
+            ctx.inst("s_load_dword", ctx.sreg("s_numWG"), ctx.sreg("s_kernarg"),
+                     "12", comment="numWG (total workgroups)")
+            ctx.s_waitcnt("lgkmcnt(0)", comment="wait numWG")
+            # Interleave: new = (old >> K) + (old & (WGMXCC-1)) * (numWG >> K)
+            ctx.inst("s_lshr_b32", ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"),
+                     str(_log2_xcc), comment=f"old_wg / {wgmxcc}")
+            ctx.inst("s_and_b32", ctx.sreg("s_tmp1"), ctx.sreg("s_wg_id_x"),
+                     str(wgmxcc - 1), comment=f"old_wg % {wgmxcc} (XCC lane)")
+            ctx.inst("s_lshr_b32", ctx.sreg("s_numWG"), ctx.sreg("s_numWG"),
+                     str(_log2_xcc), comment=f"numWG / {wgmxcc}")
+            ctx.inst("s_mul_i32", ctx.sreg("s_tmp1"), ctx.sreg("s_tmp1"),
+                     ctx.sreg("s_numWG"), comment="XCC_lane * (numWG / WGMXCC)")
+            ctx.inst("s_add_u32", ctx.sreg("s_wg_id_x"), ctx.sreg("s_tmp0"),
+                     ctx.sreg("s_tmp1"), comment="remapped WG serial")
+            ctx.raw("")
+
+        # 1D WG decomposition: tile_m = serial % numWG_m, tile_n = serial / numWG_m
         ctx.s_mov(ctx.sreg("s_tmp1"), ctx.sreg("s_wg_id_x"),
                   comment="save wg_serial")
         # numWG_m = (M + MT_M - 1) >> log2(MT_M)

@@ -13,28 +13,49 @@ from .kernel import GemmKernel
 def generate_custom_kernel(
     wg_m: int = 256, wg_n: int = 256, unroll_k: int = 256,
     kernel_name: str = None,
+    dtype: str = "mxfp4",
+    pgr2: bool = False,
 ) -> str:
     """Generate a TensileLite custom kernel .s file contents.
+
+    Args:
+        wg_m, wg_n, unroll_k: Tile dimensions.
+        kernel_name: Override kernel function name.
+        dtype: Data type -- "mxfp4" or "fp16".
+        pgr2: Enable PGR=2 double-prefetch.
 
     Returns the full .s file text including assembly body,
     .amdhsa_kernel descriptor, and .amdgpu_metadata YAML config.
     """
-    mx = MfmaConfig.mxfp4_16x16x128()
-    t = GemmTiling.high_perf(wg_m=wg_m, wg_n=wg_n, unroll_k=unroll_k,
-                             mfma=mx, lds_swizzle=True)
-    # Use a large problem for codegen (actual size comes from TensileLite at runtime)
-    p = GemmProblem(4096, 4096, 4096, dtype=DataType.MXFP4)
+    if dtype == "fp16":
+        mfma = MfmaConfig.f16_16x16x16()
+        if unroll_k == 256:
+            unroll_k = 64  # reasonable default for FP16
+        t = GemmTiling.high_perf(wg_m=wg_m, wg_n=wg_n, unroll_k=unroll_k,
+                                 mfma=mfma, lds_swizzle=True)
+        p = GemmProblem(4096, 4096, 4096, dtype=DataType.F16)
+    else:
+        mfma = MfmaConfig.mxfp4_16x16x128()
+        t = GemmTiling.high_perf(wg_m=wg_m, wg_n=wg_n, unroll_k=unroll_k,
+                                 mfma=mfma, lds_swizzle=True)
+        p = GemmProblem(4096, 4096, 4096, dtype=DataType.MXFP4)
 
-    k = GemmKernel.build(p, tiling=t)
+    k = GemmKernel.build(p, tiling=t, pgr2=pgr2)
 
     # Force 1D grid + column-major store for TensileLite compatibility
     k.use_1d_grid = True
-    k.swizzled_scales = False  # Use linear scale layout (MXScaleFormat: 0)
+    if dtype != "fp16":
+        k.swizzled_scales = False  # Use linear scale layout (MXScaleFormat: 0)
 
     if kernel_name is None:
-        kernel_name = (f"Custom_Cijk_Alik_Bljk_F4BS_MXA32_MXB32"
-                       f"_MT{wg_m}x{wg_n}x{unroll_k}_MI16x16x1"
-                       f"_kgen_gfx950")
+        if dtype == "fp16":
+            kernel_name = (f"Custom_Cijk_Ailk_Bjlk_HHS_BH"
+                           f"_MT{wg_m}x{wg_n}x{unroll_k}_MI16x16x1"
+                           f"_kgen_gfx950")
+        else:
+            kernel_name = (f"Custom_Cijk_Alik_Bljk_F4BS_MXA32_MXB32"
+                           f"_MT{wg_m}x{wg_n}x{unroll_k}_MI16x16x1"
+                           f"_kgen_gfx950")
 
     # Override the kernel name before emitting
     k.kernel_name = kernel_name
@@ -66,6 +87,38 @@ def generate_custom_kernel(
             if line.strip().startswith('s_endpgm'):
                 break
     body = '\n'.join(body_lines)
+
+    # Build metadata based on dtype
+    if dtype == "fp16":
+        data_type = "H"
+        dest_type = "H"
+        transpose_a = "0"
+        mx_block = ""
+        mi_inst = f"[16, 16, {mfma.k}, 1]"
+        mi_block = f"[16, 16, {mfma.k // t.to_tile_config().k_iterations}, 1, 1, {t.to_tile_config().k_iterations}]"
+        mi_input = str(mfma.k // 2)
+        mi_input_a = str(mfma.k // 2)
+        mi_input_b = str(mfma.k // 2)
+        pgr_val = 2 if pgr2 else 1
+        gwvw_d = 4
+    else:
+        data_type = "F4"
+        dest_type = "B"
+        transpose_a = "1"
+        mx_block = """
+    MXBlockA: 32
+    MXBlockB: 32"""
+        mi_inst = "[16, 16, 128, 1]"
+        mi_block = "[16, 16, 32, 1, 1, 4]"
+        mi_input = "32"
+        mi_input_a = "32"
+        mi_input_b = "32"
+        pgr_val = 2 if pgr2 else 2  # MXFP4 default PGR=2
+        gwvw_d = 4
+
+    tile_cfg = t.to_tile_config()
+    mr = tile_cfg.mfma_m_repeat
+    nr = tile_cfg.mfma_n_repeat
 
     return f'''.amdgcn_target "amdgcn-amd-amdhsa--gfx950"
 .text
@@ -99,28 +152,26 @@ custom.config:
     KernArgsVersion: 2
   ProblemType:
     OperationType: GEMM
-    DataType: F4
-    DestDataType: B
+    DataType: {data_type}
+    DestDataType: {dest_type}
     ComputeDataType: S
     HighPrecisionAccumulate: true
-    TransposeA: 1
+    TransposeA: {transpose_a}
     TransposeB: 0
     UseBeta: true
-    Batched: true
-    MXBlockA: 32
-    MXBlockB: 32
-  MatrixInstruction: [16, 16, 128, 1]
-  MIBlock: [16, 16, 32, 1, 1, 4]
-  MIInputPerThread: 32
-  MIInputPerThreadA: 32
-  MIInputPerThreadB: 32
+    Batched: true{mx_block}
+  MatrixInstruction: {mi_inst}
+  MIBlock: {mi_block}
+  MIInputPerThread: {mi_input}
+  MIInputPerThreadA: {mi_input_a}
+  MIInputPerThreadB: {mi_input_b}
   WavefrontSize: 64
   WorkGroupMapping: 16
   WorkGroupMappingXCC: 2
   WorkGroupMappingXCCGroup: -1
   StaggerU: 0
   EnableMatrixInstruction: true
-  MIWaveGroup: [{t.to_tile_config().waves_m}, {t.to_tile_config().waves_n}]
+  MIWaveGroup: [{tile_cfg.waves_m}, {tile_cfg.waves_n}]
   MIWaveTile: [{mr}, {nr}]
   DepthU: {unroll_k}
   DirectToLds: 1
@@ -131,12 +182,13 @@ custom.config:
   GlobalSplitUAlgorithm: MultipleBuffer
   GlobalSplitUCoalesced: false
   GlobalSplitUWorkGroupMappingRoundRobin: false
-  PrefetchGlobalRead: 2
+  PrefetchGlobalRead: {pgr_val}
   PrefetchLocalRead: 1
   StreamK: 0
   StreamKAtomic: 0
   StreamKXCCMapping: 0
   TransposeLDS: 0
+  NonTemporalD: {gwvw_d}
   NoReject: true
 amdhsa.version: [1, 2]
 amdhsa.kernels:
@@ -188,88 +240,21 @@ amdhsa.kernels:
         .offset: 32
         .size: 8
         .value_kind: global_buffer
-        .address_space: generic
+        .address_space: global
       - .name: C
         .offset: 40
         .size: 8
         .value_kind: global_buffer
-        .address_space: generic
+        .address_space: global
       - .name: A
         .offset: 48
         .size: 8
         .value_kind: global_buffer
-        .address_space: generic
-      - .name: MXSA
-        .offset: 56
-        .size: 8
-        .value_kind: global_buffer
-        .address_space: generic
+        .address_space: global
       - .name: B
-        .offset: 64
+        .offset: {56 if dtype == "fp16" else 64}
         .size: 8
         .value_kind: global_buffer
-        .address_space: generic
-      - .name: MXSB
-        .offset: 72
-        .size: 8
-        .value_kind: global_buffer
-        .address_space: generic
-      - .name: strideD0
-        .offset: 80
-        .size: 4
-        .value_kind: by_value
-      - .name: strideD1
-        .offset: 84
-        .size: 4
-        .value_kind: by_value
-      - .name: strideC0
-        .offset: 88
-        .size: 4
-        .value_kind: by_value
-      - .name: strideC1
-        .offset: 92
-        .size: 4
-        .value_kind: by_value
-      - .name: strideA0
-        .offset: 96
-        .size: 4
-        .value_kind: by_value
-      - .name: strideA1
-        .offset: 100
-        .size: 4
-        .value_kind: by_value
-      - .name: strideMXSA0
-        .offset: 104
-        .size: 4
-        .value_kind: by_value
-      - .name: strideMXSA1
-        .offset: 108
-        .size: 4
-        .value_kind: by_value
-      - .name: strideB0
-        .offset: 112
-        .size: 4
-        .value_kind: by_value
-      - .name: strideB1
-        .offset: 116
-        .size: 4
-        .value_kind: by_value
-      - .name: strideMXSB0
-        .offset: 120
-        .size: 4
-        .value_kind: by_value
-      - .name: strideMXSB1
-        .offset: 124
-        .size: 4
-        .value_kind: by_value
-      - .name: alpha
-        .offset: 128
-        .size: 4
-        .value_kind: by_value
-      - .name: beta
-        .offset: 132
-        .size: 4
-        .value_kind: by_value
+        .address_space: global
 ...
-.end_amdgpu_metadata
 '''
