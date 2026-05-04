@@ -512,9 +512,10 @@ class ReadComputeStageEmitter(StageEmitter):
         # Preamble reads
         ctx.comment("Preamble: A[m0] + B ki=1")
         reader = ctx._metadata.get("_reader")
+        _needs_recompute = reader and not getattr(reader, '_precomputed_swizzle', False)
         for op in schedule.preamble_ops:
             # B ki>0 reads need per-ni recompute in the preamble
-            if (reader and op.name.startswith("read_b_") and "_k0" not in op.name):
+            if (_needs_recompute and op.name.startswith("read_b_") and "_k0" not in op.name):
                 import re as _re
                 _m = _re.search(r"read_b_n(\d+)", op.name)
                 if _m:
@@ -658,6 +659,9 @@ class AutoPipelinedCompute(ComputePipeline):
             (tile.wg_m + tile.wg_n) * tile.unroll_k * elem)
 
         ctx._metadata["_reader"] = reader
+
+        # Precompute swizzled read addresses (before DB step setup)
+        reader.precompute_swizzle_addresses()
 
         # DB step register
         ctx.alloc_sgpr_permanent(1, "s_lds_db_step")

@@ -87,6 +87,26 @@ class LDSReader:
         else:
             self._swizzle = tile.resolved_swizzle(self.elem)
 
+        # For paired-row swizzle: precompute all read addresses
+        # at setup time to avoid per-mi/ni recomputation overhead.
+        self._precomputed_swizzle = False
+        self._a_rd_names = {}  # (mi, ki) -> VGPR name
+        self._b_rd_names = {}  # (ni, ki) -> VGPR name
+        if self._swizzle is not None and hasattr(self._swizzle, 'pair_factor'):
+            self._precomputed_swizzle = True
+            for mi in range(mr):
+                for ki in range(ki_count):
+                    name = f"v_rd_a_m{mi}_k{ki}"
+                    if not ctx.has(name):
+                        ctx.alloc_vgpr_permanent(1, name)
+                    self._a_rd_names[(mi, ki)] = name
+            for ni in range(nr):
+                for ki in range(ki_count):
+                    name = f"v_rd_b_n{ni}_k{ki}"
+                    if not ctx.has(name):
+                        ctx.alloc_vgpr_permanent(1, name)
+                    self._b_rd_names[(ni, ki)] = name
+
         # Allocate operand registers
         self.b_names = {}
         for ni in range(nr):
@@ -111,7 +131,8 @@ class LDSReader:
             base_reg=self.ctx.vreg("v_lds_rd_a"),
             offset=_a_off(mi, ki, self.tile, self.mfma, self.elem),
             ki=ki, width=self.av,
-            comment=f"LR A m{mi}k{ki} b{buf}")
+            comment=f"LR A m{mi}k{ki} b{buf}",
+            mi=mi)
 
     def emit_read_b(self, ni: int, ki: int) -> None:
         """Emit ds_read for B operand at (ni, ki)."""
@@ -120,7 +141,8 @@ class LDSReader:
             base_reg=self.ctx.vreg("v_lds_rd_b"),
             offset=_b_off(ni, ki, self.tile, self.mfma, self.elem),
             ki=ki, width=self.bv,
-            comment=f"LR B n{ni}k{ki}")
+            comment=f"LR B n{ni}k{ki}",
+            ni=ni)
 
     def emit_preamble(self) -> int:
         """Emit preamble reads: B[ki=0], A[m0,k0], B[ki=1], A[m0,k1].
@@ -328,6 +350,129 @@ class LDSReader:
                     self.ctx.inst("v_xor_b32", out, base, str(xor_bytes),
                                  comment=f"rd_{matrix}_k{ki} = rd_{matrix} ^ {xor_bytes}")
 
+
+    def precompute_swizzle_addresses(self) -> None:
+        """Precompute all swizzled read addresses into permanent VGPRs.
+
+        Must be called after the initial LDS read address setup (which
+        sets v_m_row_base_a, v_k_group_a, v_n_row_base_b).
+        Computes v_rd_a_m{mi}_k{ki} and v_rd_b_n{ni}_k{ki} for all
+        (mi, ki) and (ni, ki) combinations.
+        """
+        # Re-resolve swizzle (may have been set after reader creation)
+        swz = self.tile.resolved_swizzle(self.elem)
+        if swz is None or not hasattr(swz, 'pair_factor'):
+            return
+        self._swizzle = swz
+
+        # Allocate precomputed VGPRs if not already done
+        if not self._precomputed_swizzle:
+            self._precomputed_swizzle = True
+            ctx = self.ctx
+            for mi in range(self.mr):
+                for ki in range(self.ki_count):
+                    name = f"v_rd_a_m{mi}_k{ki}"
+                    if not ctx.has(name):
+                        ctx.alloc_vgpr_permanent(1, name)
+                    self._a_rd_names[(mi, ki)] = name
+            for ni in range(self.nr):
+                for ki in range(self.ki_count):
+                    name = f"v_rd_b_n{ni}_k{ki}"
+                    if not ctx.has(name):
+                        ctx.alloc_vgpr_permanent(1, name)
+                    self._b_rd_names[(ni, ki)] = name
+
+        import math
+        from .swizzle import DataLayout as SwzLayout, LDS_GFX950
+
+        ctx = self.ctx
+        tile = self.tile
+        elem = self.elem
+        mfma = self.mfma
+        pf = swz.pair_factor
+        ec = swz.effective_cols
+        eff_stride = ec * 16
+
+        swz_layout = SwzLayout(
+            row_stride_bytes=int(tile.unroll_k * elem),
+            mfma_k=mfma.k, mfma_m=mfma.m,
+            elem_bytes=elem, wave_size=tile.wave_size)
+        ki_count = swz_layout.ki_count
+
+        if not ctx.has("v_m_row_base_a") or not ctx.has("v_k_group_a"):
+            return  # setup didn't allocate these
+
+        # Precompute A addresses for all mi
+        ctx.comment("Precompute swizzled A read addresses")
+        for mi in range(self.mr):
+            m_row_delta = mi * mfma.m
+            if m_row_delta > 0:
+                if m_row_delta > 64:
+                    ctx.s_mov(ctx.sreg("s_tmp0"), str(m_row_delta))
+                    ctx.v_add(ctx.vreg("v_tmp2"), ctx.vreg("v_m_row_base_a"),
+                              ctx.sreg("s_tmp0"),
+                              comment=f"m_row = base + {m_row_delta} (mi={mi})")
+                else:
+                    ctx.v_add(ctx.vreg("v_tmp2"), ctx.vreg("v_m_row_base_a"),
+                              str(m_row_delta),
+                              comment=f"m_row = base + {m_row_delta} (mi={mi})")
+            else:
+                ctx.v_mov(ctx.vreg("v_tmp2"), ctx.vreg("v_m_row_base_a"),
+                          comment="m_row = base (mi=0)")
+
+            ctx.v_lshr(ctx.vreg("v_tmp3"), ctx.vreg("v_tmp2"),
+                       int(math.log2(pf)),
+                       comment=f"lds_row = m_row / {pf}")
+            ctx.v_mul(ctx.vreg("v_tmp3"), str(eff_stride),
+                      ctx.vreg("v_tmp3"),
+                      comment=f"row_base = lds_row * {eff_stride}")
+
+            a_out = [ctx.vreg(self._a_rd_names[(mi, ki)]) for ki in range(ki_count)]
+            swz.emit_read_setup(ctx, swz_layout, LDS_GFX950,
+                                ctx.vreg("v_tmp2"), ctx.vreg("v_k_group_a"),
+                                ctx.vreg("v_tmp3"), a_out)
+        ctx.raw("")
+
+        # Precompute B addresses for all ni
+        if not ctx.has("v_n_row_base_b"):
+            return
+
+        ctx.comment("Precompute swizzled B read addresses")
+        lds_b_off = int(tile.wg_m * tile.unroll_k * elem)
+
+        for ni in range(self.nr):
+            n_row_delta = ni * mfma.n
+            if n_row_delta > 0:
+                if n_row_delta > 64:
+                    ctx.s_mov(ctx.sreg("s_tmp0"), str(n_row_delta))
+                    ctx.v_add(ctx.vreg("v_tmp2"), ctx.vreg("v_n_row_base_b"),
+                              ctx.sreg("s_tmp0"),
+                              comment=f"n_row = base + {n_row_delta} (ni={ni})")
+                else:
+                    ctx.v_add(ctx.vreg("v_tmp2"), ctx.vreg("v_n_row_base_b"),
+                              str(n_row_delta),
+                              comment=f"n_row = base + {n_row_delta} (ni={ni})")
+            else:
+                ctx.v_mov(ctx.vreg("v_tmp2"), ctx.vreg("v_n_row_base_b"),
+                          comment="n_row = base (ni=0)")
+
+            ctx.v_lshr(ctx.vreg("v_tmp3"), ctx.vreg("v_tmp2"),
+                       int(math.log2(pf)),
+                       comment=f"lds_row = n_row / {pf}")
+            ctx.v_mul(ctx.vreg("v_tmp3"), str(eff_stride),
+                      ctx.vreg("v_tmp3"),
+                      comment=f"row_base = lds_row * {eff_stride}")
+            ctx.s_mov(ctx.sreg("s_tmp0"), str(lds_b_off),
+                      comment=f"lds_b_off={lds_b_off}")
+            ctx.v_add(ctx.vreg("v_tmp3"), ctx.vreg("v_tmp3"),
+                      ctx.sreg("s_tmp0"), comment="+ lds_b_offset")
+
+            b_out = [ctx.vreg(self._b_rd_names[(ni, ki)]) for ki in range(ki_count)]
+            swz.emit_read_setup(ctx, swz_layout, LDS_GFX950,
+                                ctx.vreg("v_tmp2"), ctx.vreg("v_k_group_a"),
+                                ctx.vreg("v_tmp3"), b_out)
+        ctx.raw("")
+
     def toggle_read(self) -> None:
         """Toggle LDS read bases for double-buffering + recompute ki bases.
 
@@ -341,10 +486,22 @@ class LDSReader:
         ctx = self.ctx
         swz = self._swizzle
         if swz is not None and hasattr(swz, 'pair_factor'):
-            # Paired-row swizzle: toggle scalar DB state
-            ctx.inst("s_xor_b32", ctx.sreg("s_rd_db"),
-                     ctx.sreg("s_rd_db"), ctx.sreg("s_lds_db_step"),
-                     comment="s_rd_db ^= db_step (toggle read buffer)")
+            if self._precomputed_swizzle:
+                # XOR all precomputed read address VGPRs with DB step
+                ctx.comment("Toggle all precomputed read addresses")
+                for (mi, ki), name in self._a_rd_names.items():
+                    ctx.inst("v_xor_b32", ctx.vreg(name),
+                             ctx.sreg("s_lds_db_step"), ctx.vreg(name),
+                             comment=f"rd_a_m{mi}_k{ki} ^= db")
+                for (ni, ki), name in self._b_rd_names.items():
+                    ctx.inst("v_xor_b32", ctx.vreg(name),
+                             ctx.sreg("s_lds_db_step"), ctx.vreg(name),
+                             comment=f"rd_b_n{ni}_k{ki} ^= db")
+            else:
+                # Scalar DB state for recompute path
+                ctx.inst("s_xor_b32", ctx.sreg("s_rd_db"),
+                         ctx.sreg("s_rd_db"), ctx.sreg("s_lds_db_step"),
+                         comment="s_rd_db ^= db_step (toggle read buffer)")
         else:
             for matrix in ["a", "b"]:
                 base_name = f"v_lds_rd_{matrix}"
@@ -373,10 +530,21 @@ class LDSReader:
                                      ctx.vreg(base_name), str(xor_bytes),
                                      comment=f"rd_{matrix}_k{ki} = rd_{matrix} ^ {xor_bytes}")
 
-    def _emit_swizzled_ds_read(self, dst: str, base_reg: str, offset: int, ki: int, width: int, comment: str) -> None:
-        """Emit ds_read using per-ki base VGPR when swizzle is active."""
+    def _emit_swizzled_ds_read(self, dst: str, base_reg: str, offset: int, ki: int, width: int, comment: str,
+                               mi: int = -1, ni: int = -1) -> None:
+        """Emit ds_read using precomputed or per-ki base VGPR."""
         ctx = self.ctx
-        if self._swizzle is not None and ki > 0:
+        if self._precomputed_swizzle:
+            # Use precomputed per-(mi,ki) or per-(ni,ki) VGPR
+            if mi >= 0 and (mi, ki) in self._a_rd_names:
+                swz_reg = ctx.vreg(self._a_rd_names[(mi, ki)])
+            elif ni >= 0 and (ni, ki) in self._b_rd_names:
+                swz_reg = ctx.vreg(self._b_rd_names[(ni, ki)])
+            else:
+                swz_reg = base_reg
+            ctx.ds_read(dst, swz_reg, offset=offset,
+                        width=width, comment=comment)
+        elif self._swizzle is not None and ki > 0:
             if base_reg == ctx.vreg("v_lds_rd_a"):
                 swz_reg = ctx.vreg(f"v_lds_rd_a_k{ki}")
             elif base_reg == ctx.vreg("v_lds_rd_b"):

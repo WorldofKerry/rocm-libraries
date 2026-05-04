@@ -242,11 +242,10 @@ class DSReadBlock(BuildingBlock):
 
                 def _mk(mi_=mi, ki_=ki, buf_=buf):
                     def emit():
-                        # Recompute swizzled base for this mi at ki=0.
-                        # Safe because A reads for same mi are always
-                        # adjacent (ki=0 immediately followed by ki=1).
-                        if ki_ == 0:
-                            reader.emit_recompute_a_for_mi(mi_)
+                        # Only recompute if not using precomputed VGPRs
+                        if not getattr(reader, '_precomputed_swizzle', False):
+                            if ki_ == 0:
+                                reader.emit_recompute_a_for_mi(mi_)
                         reader.emit_read_a(mi_, ki_, buf_)
                     return emit
 
@@ -272,8 +271,9 @@ class DSReadBlock(BuildingBlock):
 
                 def _mk(ni_=ni, ki_=ki):
                     def emit():
-                        if ki_ == 0:
-                            reader.emit_recompute_b_for_ni(ni_)
+                        if not getattr(reader, '_precomputed_swizzle', False):
+                            if ki_ == 0:
+                                reader.emit_recompute_b_for_ni(ni_)
                         reader.emit_read_b(ni_, ki_)
                     return emit
 
