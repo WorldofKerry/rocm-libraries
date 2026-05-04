@@ -543,26 +543,25 @@ class ReadComputeStageEmitter(StageEmitter):
         ctx.raw("")
 
         # MFMA body with interleaved side ops (Level 2 scheduling)
+        # Track inflight lgkmcnt to elide redundant waits.
+        # Only emit s_waitcnt when the required count is tighter
+        # than what the current state guarantees.
         inflight_lgkm = preamble_inflight
         mfma_count = 0
 
         for i, mfma_op in enumerate(schedule.mfma_order):
+            # Compute the required wait (from scheduler + legacy conditions)
+            required_lgkm = inflight_lgkm  # no wait needed by default
+
             if i in schedule.waits:
-                ctx.s_waitcnt(schedule.waits[i],
+                val = int(schedule.waits[i].split("(")[1].rstrip(")"))
+                required_lgkm = min(required_lgkm, val)
+
+            # Only emit wait if it's tighter than current state
+            if required_lgkm < inflight_lgkm:
+                ctx.s_waitcnt(f"lgkmcnt({required_lgkm})",
                               comment=f"auto-wait before MFMA[{i}]")
-                inflight_lgkm = 0
-
-            if mfma_count == nr and inflight_lgkm > 0:
-                ctx.s_waitcnt("lgkmcnt(0)",
-                              comment="wait B[ki=1] + A[m0,k1]")
-                inflight_lgkm = 0
-
-            if (mfma_count > 0 and mfma_count % mfmas_per_mi == 0
-                    and inflight_lgkm > 0):
-                ctx.s_waitcnt(
-                    "lgkmcnt(0)",
-                    comment=f"wait A[m{mfma_count // mfmas_per_mi}]")
-                inflight_lgkm = 0
+                inflight_lgkm = required_lgkm
 
             if schedule.prologue_scale_ops:
                 mps = partition_m * mfmas_per_mi
