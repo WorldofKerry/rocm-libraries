@@ -416,13 +416,15 @@ def pipeline_v2_kloop_phase(level, ctx) -> None:
     from .emit_wiring import wire_emit_callbacks
     from ..memory.mfma_emitter import MFMAEmitter
 
-    streams = [
-        DTLDataStream("a", tile, problem),
-        DTLDataStream("b", tile, problem),
-    ]
+    # Scale streams first so scale loads issue before DTL loads.
+    # This avoids vmcnt(0) stalls before scale ds_writes:
+    # the scale loads complete during the DTL load burst.
+    streams = []
     if use_lds_scales and scale_loader is not None:
         streams.append(ScaleStream("a", tile))
         streams.append(ScaleStream("b", tile))
+    streams.append(DTLDataStream("a", tile, problem))
+    streams.append(DTLDataStream("b", tile, problem))
 
     num_buffers = 2 if pgr >= 1 else 1
     buffer_mgr = LDSBufferManager(streams, num_buffers=num_buffers)

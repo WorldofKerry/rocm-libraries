@@ -51,6 +51,9 @@ class ScheduledPipeline:
     num_buffers: int
     is_consume_first: bool
 
+    pre_body_count: int = 0
+    """Number of ops at the start of *body* that go before the skip check."""
+
     # ── helpers ────────────────────────────────────────────────────
 
     @property
@@ -103,20 +106,40 @@ class PipelineScheduler:
         # order, suffix (toggle_rd) last.
         sorted_consumers = self._sort_consumers(consumers, g)
 
+        # ── Pre-body split (produce-first only) ─────────────────
+        # B data reads for ki=0 with no WAR deps go before the
+        # barrier to overlap with the barrier stall.  They read
+        # from the stable read buffer (written + synced in the
+        # previous iteration), so they're safe before the barrier.
+        pre_body_count = 0
+        if not is_consume_first:
+            war_reads = {d.consumer for d in g.deps
+                         if d.kind == DepKind.WAR}
+            pre_body: List[KLoopOp] = []
+            rest_consumers: List[KLoopOp] = []
+            for op in sorted_consumers:
+                if (op.kind == OpKind.DS_READ
+                        and "data_b" in op.name
+                        and "_k0" in op.name
+                        and op.name not in war_reads):
+                    pre_body.append(op)
+                else:
+                    rest_consumers.append(op)
+            pre_body_count = len(pre_body)
+
         # Assemble body.
         if is_consume_first:
-            # consume-first: barrier → consumers → producers
             body: List[KLoopOp] = []
             if barrier_op:
                 body.append(barrier_op)
             body.extend(sorted_consumers)
             body.extend(sorted_producers)
         else:
-            # produce-first: producers → barrier → consumers
-            body = list(sorted_producers)
+            # produce-first: pre_body → producers → barrier → rest
+            body = list(pre_body) + list(sorted_producers)
             if barrier_op:
                 body.append(barrier_op)
-            body.extend(sorted_consumers)
+            body.extend(rest_consumers)
 
         barrier_pos = next(
             (i for i, op in enumerate(body) if op.kind == OpKind.BARRIER),
@@ -148,6 +171,7 @@ class PipelineScheduler:
             pgr=pgr,
             num_buffers=num_buffers,
             is_consume_first=is_consume_first,
+            pre_body_count=pre_body_count,
         )
 
     # ── private helpers ───────────────────────────────────────────
@@ -231,41 +255,46 @@ class PipelineScheduler:
                     cur = read_war_after.get(dep.consumer, -1)
                     read_war_after[dep.consumer] = max(cur, pos)
 
-        # Latency-driven interleaving.
-        # Walk the MFMA order and insert reads at the right points.
-        # Each read has a target position: the MFMA index AFTER which
-        # it should be placed (for WAR reads) or BEFORE which it
-        # should be placed (for preamble reads).
+        # Three-phase read placement matching v1 pattern:
+        # 1. Early preamble: reads consumed by first MFMAs (urgent)
+        # 2. Late preamble: remaining non-WAR reads (less urgent,
+        #    issued in bulk, gives LDS pipeline time to drain early)
+        # 3. Interleaved: WAR-constrained reads after WAR MFMA
+        #
+        # The split between early/late is at nr*ki_count MFMAs
+        # (one subtile of B reads). This matches v1's pre_body +
+        # preamble split where B ki=0 is issued first, then A+B ki=1.
         DS_READ_LEAD = 5
+        mfmas_per_mi = nr * ki_count  # MFMAs per mi group
 
-        # Compute target MFMA index for each read.
-        # target_mfma = the MFMA index after which the read is placed.
-        # -1 = preamble (before all MFMAs).
-        read_targets: Dict[str, int] = {}
+        early_preamble: List[KLoopOp] = []
+        late_preamble: List[KLoopOp] = []
+        interleaved: List[tuple] = []
+
         for r in reads:
             war_pos = read_war_after.get(r.name, -1)
             target = read_earliest.get(r.name, 0)
             if war_pos >= 0:
-                # WAR-constrained: place right after the WAR MFMA
-                read_targets[r.name] = war_pos
+                interleaved.append((war_pos, r))
+            elif target < mfmas_per_mi:
+                # Consumed in first subtile: urgent
+                early_preamble.append(r)
             else:
-                # No WAR: place DS_READ_LEAD before consumer
-                place_before = max(target - DS_READ_LEAD, 0)
-                # "after MFMA[place_before - 1]" = "before MFMA[place_before]"
-                read_targets[r.name] = place_before - 1  # -1 = preamble
+                # Consumed later: can go in late preamble
+                late_preamble.append(r)
 
-        # Group reads by their target MFMA position
+        # Sort by urgency
+        early_preamble.sort(key=lambda r: (read_earliest.get(r.name, 999), r.name))
+        late_preamble.sort(key=lambda r: (read_earliest.get(r.name, 999), r.name))
+        interleaved.sort(key=lambda x: (x[0], read_earliest.get(x[1].name, 999)))
+
+        # Group interleaved reads by target MFMA position
         reads_after: Dict[int, List[KLoopOp]] = {}
-        for r in reads:
-            pos = read_targets[r.name]
+        for pos, r in interleaved:
             reads_after.setdefault(pos, []).append(r)
 
-        # Sort reads within each group by their earliest consumer (urgency)
-        for pos in reads_after:
-            reads_after[pos].sort(key=lambda r: read_earliest.get(r.name, 999))
-
-        # Build result: preamble reads, then MFMA + interleaved reads
-        result: List[KLoopOp] = list(reads_after.get(-1, []))
+        # Build result: early preamble, late preamble, MFMA + interleaved
+        result: List[KLoopOp] = list(early_preamble) + list(late_preamble)
         for i, mfma_op in enumerate(mfma_order):
             result.append(mfma_op)
             for r in reads_after.get(i, []):

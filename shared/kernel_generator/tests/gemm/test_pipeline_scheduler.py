@@ -50,9 +50,19 @@ class TestPGR1ProduceFirst:
         sp = PipelineScheduler(_fp16_graph(pgr=1)).schedule()
         bp = sp.body_barrier_pos
         assert bp > 0, "barrier should not be first"
-        for op in sp.body[:bp]:
+        # Pre-body reads (B ki=0) are allowed before producers
+        for op in sp.body[sp.pre_body_count:bp]:
             assert op.iteration > 0 or op.kind == OpKind.BARRIER, \
                 f"non-producer op {op.name} before barrier"
+
+    def test_pre_body_reads_before_producers(self):
+        """Pre-body reads (B ki=0) should be at the start of the body."""
+        sp = PipelineScheduler(_fp16_graph(pgr=1)).schedule()
+        for op in sp.body[:sp.pre_body_count]:
+            assert op.kind == OpKind.DS_READ, \
+                f"pre-body op {op.name} should be DS_READ"
+            assert "data_b" in op.name and "_k0" in op.name, \
+                f"pre-body op {op.name} should be B ki=0 read"
 
     def test_consumers_after_barrier(self):
         sp = PipelineScheduler(_fp16_graph(pgr=1)).schedule()

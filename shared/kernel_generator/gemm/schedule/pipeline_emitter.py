@@ -165,16 +165,28 @@ class PipelineEmitter:
     def _emit_body_produce_first(
         self, body: List[KLoopOp], pgr: int
     ) -> None:
-        """Produce-first body: skip-check → producers → barrier → consumers.
+        """Produce-first body: pre-body → skip-check → producers → barrier → consumers.
 
-        The barrier is part of the body op list.  Producer ops
-        (iteration > 0) are wrapped in a skip-check so they're
-        elided during drain iterations.
+        Pre-body reads (B ki=0) go before the skip check to overlap
+        with the barrier stall.  Producer ops (iteration > 0) are
+        wrapped in a skip-check so they're elided during drain
+        iterations.
         """
         ctx = self.ctx
         waitcnts = self.pipeline.waitcnts
+        pre_body_count = self.pipeline.pre_body_count
+        barrier_pos = self.pipeline.body_barrier_pos
 
-        # k_tiles-- and skip check.
+        # 1. Pre-body reads (overlap with arriving DTL data)
+        if pre_body_count > 0:
+            ctx.comment("Pre-body: early B reads (overlap with loads)")
+        for i in range(pre_body_count):
+            if i in waitcnts:
+                ctx.s_waitcnt(waitcnts[i],
+                              comment=f"auto-wait at pos {i}")
+            self._emit_op(body[i])
+
+        # 2. k_tiles-- and skip check
         ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
                   comment="k_tiles--")
         ctx.inst("s_cmp_gt_u32", ctx.sreg("s_k_tiles"),
@@ -183,28 +195,30 @@ class PipelineEmitter:
         ctx.inst("s_cbranch_scc0", "load_skip_all",
                  comment="skip producers (drain)")
 
-        # Emit all body ops.  Producer ops come first (before barrier)
-        # in produce-first order.
-        in_producers = True
-        for i, op in enumerate(body):
-            # Insert waitcnt if scheduled at this position.
+        # 3. Producers (skip-guarded)
+        for i in range(pre_body_count, barrier_pos):
             if i in waitcnts:
                 ctx.s_waitcnt(waitcnts[i],
                               comment=f"auto-wait at pos {i}")
+            self._emit_op(body[i])
 
-            # Emit the skip label right before the barrier (end of
-            # producer section).
-            if op.kind == OpKind.BARRIER and in_producers:
-                ctx.raw("")
-                ctx.label("load_skip_all")
-                in_producers = False
+        # 4. load_skip_all: barrier + consumers
+        ctx.raw("")
+        ctx.label("load_skip_all")
 
-            self._emit_op(op)
-
-        # If no barrier was found, emit the skip label at the end.
-        if in_producers:
-            ctx.raw("")
-            ctx.label("load_skip_all")
+        for i in range(barrier_pos, len(body)):
+            if i in waitcnts:
+                ctx.s_waitcnt(waitcnts[i],
+                              comment=f"auto-wait at pos {i}")
+            # Before barrier: drain any LDS writes from producers
+            if body[i].kind == OpKind.BARRIER:
+                has_ds_writes = any(
+                    op.kind == OpKind.DS_WRITE
+                    for op in body[pre_body_count:barrier_pos])
+                if has_ds_writes:
+                    ctx.s_waitcnt("lgkmcnt(0)",
+                                  comment="wait LDS writes")
+            self._emit_op(body[i])
 
         # Loop tail: negate DB step + branch.
         self._emit_loop_tail()
