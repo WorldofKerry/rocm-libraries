@@ -110,7 +110,11 @@ def pipeline_kloop_phase(level, ctx) -> None:
     """Phase function using KernelPipeline architecture.
 
     Drop-in replacement for scheduled_kloop_phase.
+    Dispatches to v2 path when pipeline_strategy="v2".
     """
+    if ctx._metadata.get("pipeline_strategy") == "v2":
+        return pipeline_v2_kloop_phase(level, ctx)
+
     tile = ctx._metadata["tile"]
     problem = ctx._metadata["problem"]
     use_dtl = ctx._metadata.get("use_dtl", True)

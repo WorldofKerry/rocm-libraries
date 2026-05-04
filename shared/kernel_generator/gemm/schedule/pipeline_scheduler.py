@@ -402,7 +402,8 @@ class PipelineScheduler:
                     issued_after = _cum(ct, cons_pos - 1) - _cum(ct, latest_pos)
                     wait_val = max(issued_after, 0)
 
-                wait_val = min(wait_val, 63)  # hw max
+                hw_max = 15 if ct == "lgkmcnt" else 63
+                wait_val = min(wait_val, hw_max)
 
                 cur = raw_waits[cons_pos].get(ct)
                 if cur is None or wait_val < cur:

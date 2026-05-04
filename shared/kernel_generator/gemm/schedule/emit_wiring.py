@@ -123,10 +123,10 @@ def wire_emit_callbacks(
             a_reg = ctx.vreg(a_names[(buf, ki)])
             b_reg = ctx.vreg(b_names[(ni, ki)])
             acc_start = (mi * nr + ni) * tile.mfma.acc_vgprs
-            acc = ctx.areg("acc_c", acc_start, tile.mfma.acc_vgprs)
+            acc = ctx.areg("acc_C", acc_start, tile.mfma.acc_vgprs)
 
             op.emit = lambda acc=acc, a_reg=a_reg, b_reg=b_reg, mi=mi, ni=ni, ki=ki: \
-                mfma_emitter.emit(ctx, mfma_emitter.mfma, acc, a_reg, b_reg, mi, ni, ki)
+                mfma_emitter.emit(ctx, acc, a_reg, b_reg, mi, ni, ki)
 
         # -- Suffix toggles --
         elif op_name.startswith("toggle_rd_"):
