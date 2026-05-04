@@ -431,7 +431,14 @@ def pipeline_v2_kloop_phase(level, ctx) -> None:
     graph = build_kloop_graph(streams, tile, pgr=pgr,
                               num_buffers=num_buffers, problem=problem)
 
-    # Create MFMAEmitter
+    # Setup: soffsets, swizzle (must happen before MFMAEmitter
+    # creation so scale_names are populated)
+    loader.precompute_soffsets()
+    if scale_loader is not None and hasattr(scale_loader, 'precompute_soffsets'):
+        scale_loader.precompute_soffsets()
+    reader.precompute_swizzle_addresses()
+
+    # Create MFMAEmitter (after scale registers allocated)
     if scale_loader is not None and hasattr(scale_loader, 'scale_names_a'):
         names_a = scale_loader.scale_names_a
         names_b = scale_loader.scale_names_b
@@ -448,12 +455,6 @@ def pipeline_v2_kloop_phase(level, ctx) -> None:
                         emitter, ctx, scale_loader=scale_loader)
 
     scheduled = PipelineScheduler(graph).schedule()
-
-    # Setup: soffsets, swizzle, DB step
-    loader.precompute_soffsets()
-    if scale_loader is not None and hasattr(scale_loader, 'precompute_soffsets'):
-        scale_loader.precompute_soffsets()
-    reader.precompute_swizzle_addresses()
 
     ctx.alloc_sgpr_permanent(1, "s_lds_db_step")
     lds_scale_half = ctx._metadata.get("lds_scale_half", 0)

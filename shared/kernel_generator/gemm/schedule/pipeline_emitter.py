@@ -88,17 +88,27 @@ class PipelineEmitter:
         ctx = self.ctx
         has_writes = False
 
+        needs_vmcnt = False  # track if vmcnt needed before ds_write
         for op in ops:
             if op.kind == OpKind.BARRIER:
                 # Drain loads before barrier.
-                ctx.s_waitcnt("vmcnt(0)", comment="wait all loads")
+                if needs_vmcnt:
+                    ctx.s_waitcnt("vmcnt(0)", comment="wait all loads")
+                    needs_vmcnt = False
                 if has_writes:
                     ctx.s_waitcnt("lgkmcnt(0)",
                                  comment="wait LDS writes")
                 ctx.s_barrier(comment="sync tile 0")
                 continue
             if op.kind == OpKind.DS_WRITE:
+                # Must drain global loads before writing to LDS
+                if needs_vmcnt:
+                    ctx.s_waitcnt("vmcnt(0)",
+                                 comment="wait global loads before ds_write")
+                    needs_vmcnt = False
                 has_writes = True
+            if op.kind == OpKind.GLOBAL_LOAD:
+                needs_vmcnt = True
             self._emit_op(op)
 
     def _emit_ramp_up_subsequent(

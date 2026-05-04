@@ -240,34 +240,42 @@ class PipelineScheduler:
         ))
 
         # Interleave reads into MFMA sequence respecting WAR deps.
-        # Reads without WAR deps (or WAR after=-1) go in a preamble
-        # before MFMAs. Reads with WAR deps are placed after the
-        # required MFMA completes, with DS_READ_LEAD MFMAs of lead time.
+        # Preamble reads (no WAR dep): placed before all MFMAs.
+        # Deferred reads (WAR dep): placed after the WAR-dep MFMA,
+        # with DS_READ_LEAD MFMAs of lead time before consumption.
+        # At most 1 read per MFMA interval to spread load latency.
         preamble_reads: List[KLoopOp] = []
-        deferred_reads: Dict[int, List[KLoopOp]] = {}  # mfma_pos → reads
+        deferred: List[tuple] = []  # (earliest_slot, read_op)
 
         for r in reads_sorted:
             war_pos = read_war_after.get(r.name, -1)
             if war_pos < 0:
                 preamble_reads.append(r)
             else:
-                # Place after the WAR-dep MFMA, with lead time
                 target = read_earliest.get(r.name, len(mfma_order))
-                place_at = max(war_pos + 1, target - DS_READ_LEAD)
-                place_at = min(place_at, len(mfma_order))
-                deferred_reads.setdefault(place_at, []).append(r)
+                earliest_slot = max(war_pos + 1, target - DS_READ_LEAD)
+                earliest_slot = min(max(earliest_slot, 0), len(mfma_order))
+                deferred.append((earliest_slot, r))
+
+        # Place deferred reads: 1 per MFMA slot, scanning forward
+        deferred.sort(key=lambda x: x[0])
+        slots: Dict[int, KLoopOp] = {}
+        used: set = set()
+        for earliest, r in deferred:
+            for pos in range(earliest, len(mfma_order) + 1):
+                if pos not in used:
+                    slots[pos] = r
+                    used.add(pos)
+                    break
 
         # Build interleaved result
         result: List[KLoopOp] = list(preamble_reads)
         for i, mfma_op in enumerate(mfma_order):
-            # Insert deferred reads before this MFMA position
-            if i in deferred_reads:
-                result.extend(deferred_reads[i])
+            if i in slots:
+                result.append(slots[i])
             result.append(mfma_op)
-        # Any remaining deferred reads go after last MFMA
-        for pos in sorted(deferred_reads.keys()):
-            if pos >= len(mfma_order):
-                result.extend(deferred_reads[pos])
+        if len(mfma_order) in slots:
+            result.append(slots[len(mfma_order)])
         result.extend(suffix)
         return result
 
