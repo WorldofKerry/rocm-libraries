@@ -223,16 +223,18 @@ class TestWaitcnts:
         assert first_mfma in sp.waitcnts
         assert "lgkmcnt" in sp.waitcnts[first_mfma]
 
-    def test_last_mfma_lgkmcnt_zero(self):
-        """Last MFMA should wait for lgkmcnt(0) (all reads done)."""
+    def test_lgkmcnt_reaches_zero(self):
+        """Some waitcnt before or at the last MFMA must reach lgkmcnt(0)."""
         sp = PipelineScheduler(_fp16_graph(pgr=1)).schedule()
-        mfma_positions = [
-            i for i, op in enumerate(sp.body)
+        # With elision, lgkmcnt(0) may be on an earlier MFMA that
+        # brings the inflight count to 0. All subsequent MFMAs
+        # inherit that state and don't need another wait.
+        has_lgkm_zero = any(
+            "lgkmcnt(0)" in sp.waitcnts.get(i, "")
+            for i, op in enumerate(sp.body)
             if op.kind == OpKind.MFMA
-        ]
-        last_mfma = mfma_positions[-1]
-        assert last_mfma in sp.waitcnts
-        assert "lgkmcnt(0)" in sp.waitcnts[last_mfma]
+        )
+        assert has_lgkm_zero, "No MFMA has lgkmcnt(0)"
 
     def test_lgkmcnt_decreases(self):
         """lgkmcnt values should monotonically decrease across MFMAs."""

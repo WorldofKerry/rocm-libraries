@@ -433,9 +433,36 @@ class PipelineScheduler:
                 if cur is None or wait_val < cur:
                     raw_waits[cons_pos][ct] = wait_val
 
+        # Elide redundant waits: track inflight count per counter.
+        # Only emit a waitcnt when the required value is tighter
+        # (lower) than the current guaranteed state.
+        inflight_vm = 0
+        inflight_lgkm = 0
+        elided_waits: Dict[int, Dict[str, int]] = {}
+
+        for i in range(len(body)):
+            # Update inflight from ops issued at this position
+            ct = counter_at.get(i)
+            if ct == "vmcnt":
+                inflight_vm += 1
+            elif ct == "lgkmcnt":
+                inflight_lgkm += 1
+
+            if i in raw_waits:
+                for counter, wait_val in raw_waits[i].items():
+                    current = inflight_vm if counter == "vmcnt" else inflight_lgkm
+                    # Only emit if the wait is tighter than current state
+                    if wait_val < current:
+                        elided_waits.setdefault(i, {})[counter] = wait_val
+                        # Update inflight to reflect the wait
+                        if counter == "vmcnt":
+                            inflight_vm = wait_val
+                        else:
+                            inflight_lgkm = wait_val
+
         # Merge per-position waits into strings.
         waitcnts: Dict[int, str] = {}
-        for pos, counters in sorted(raw_waits.items()):
+        for pos, counters in sorted(elided_waits.items()):
             parts = []
             for ct in ("vmcnt", "lgkmcnt"):
                 if ct in counters:
