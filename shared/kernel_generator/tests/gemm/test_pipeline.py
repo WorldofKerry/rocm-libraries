@@ -243,22 +243,20 @@ class TestTreeStructure:
         assert "store_d" in s
 
 
-class TestXorToggle:
-    """Verify XOR-based double-buffer toggling and PGR=2 support."""
+class TestAddToggle:
+    """Verify ADD-based double-buffer toggling and PGR=2 support."""
 
-    def test_xor_toggle_no_negate(self):
-        """Assembly should use v_xor/s_xor for toggle, no negate."""
+    def test_add_toggle_with_negate(self):
+        """Assembly should use v_add/s_add for toggle with negate."""
         kernel = GemmKernel.build(GemmProblem(256, 256, 64))
         result = kernel.emit()
         asm = result.asm_text
-        # XOR toggle should be present
-        assert "v_xor_b32" in asm, "Missing v_xor_b32 for read toggle"
-        assert "s_xor_b32" in asm, "Missing s_xor_b32 for write toggle"
-        # Negate should NOT be present (no s_sub_u32 ... s_lds_db_step)
-        for line in asm.split('\n'):
-            if 'negate db' in line.lower() or 'negate' in line.lower():
-                if 's_sub_u32' in line and 's_lds_db_step' in line:
-                    pytest.fail(f"Found negate instruction: {line.strip()}")
+        # ADD toggle should be present
+        assert "v_add" in asm, "Missing v_add for read toggle"
+        assert "s_add_u32" in asm, "Missing s_add_u32 for write toggle"
+        # Negate step should be present (s_sub_u32 for db_step)
+        assert any("negate db_step" in line for line in asm.split(chr(10))), \
+            "Missing negate instruction for ADD-based toggle"
 
     def test_pgr2_disabled_safely(self):
         """PGR=2 flag accepted but disabled (falls back to PGR=1)."""

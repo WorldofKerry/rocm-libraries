@@ -215,14 +215,14 @@ class GemmKernel:
         else:
             lds_scale_half = 0
 
-        # Double-buffered LDS: data uses power-of-2 DB step,
-        # scale regions appended after BOTH data buffers.
+        # Double-buffered LDS: scales within each buffer (interlaced).
+        # Buffer 0: [data A | data B | scale A | scale B]
+        # Buffer 1: [data A | data B | scale A | scale B]
+        # DB step = lds_half + lds_scale_half (total per buffer).
+        lds_half_total = lds_half + lds_scale_half
         is_db = any(p.name in ("scheduled_k_loop",)
                      for p in self.tile_tree.prologue_phases)
-        lds_data_total = lds_half * 2 if is_db else lds_half
-        # Scale LDS: 2 copies (double-buffered) after data
-        lds_scale_total = lds_scale_half * 2 if (is_db and lds_scale_half > 0) else lds_scale_half
-        lds_total = lds_data_total + lds_scale_total
+        lds_total = lds_half_total * 2 if is_db else lds_half_total
 
         ctx = AsmContext()
         ctx._metadata = {

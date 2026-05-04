@@ -1150,15 +1150,11 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
         mx_block = tile.mfma.mx_block
         scale_a_lds_size = max(tile.wg_m * (tile.unroll_k // mx_block), 4096)
 
-        # Scale LDS is AFTER both data buffers (data uses power-of-2 DB)
-        lds_data_total = lds_data_half * 2  # both data buffers
-        scale_buf0_a = lds_data_total
-        scale_buf0_b = lds_data_total + scale_a_lds_size
-        lds_scale_half = ctx._metadata.get("lds_scale_half", 0)
-        scale_buf1_a = lds_data_total + lds_scale_half
-        scale_buf1_b = scale_buf1_a + scale_a_lds_size
+        # Scale LDS within each buffer (after data, interlaced layout)
+        scale_buf0_a = lds_data_half  # buffer 0's scale A
+        scale_buf0_b = lds_data_half + scale_a_lds_size  # buffer 0's scale B
 
-        ctx.comment("Scale LDS write bases (after both data buffers)")
+        ctx.comment("Scale LDS write bases (within buffer 0)")
         ctx.alloc_sgpr_permanent(1, "s_lds_wr_scale_a")
         ctx.alloc_sgpr_permanent(1, "s_lds_wr_scale_b")
         ctx.s_mov(ctx.sreg("s_lds_wr_scale_a"),
@@ -1167,12 +1163,7 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
         ctx.s_mov(ctx.sreg("s_lds_wr_scale_b"),
                   str(scale_buf0_b),
                   comment=f"scale B LDS write base = {scale_buf0_b}")
-
-        # Scale DB swap mask: XOR toggles between buf0 and buf1
-        scale_swap = scale_buf0_a ^ scale_buf1_a
-        ctx.alloc_sgpr_permanent(1, "s_scale_db_swap")
-        ctx.s_mov(ctx.sreg("s_scale_db_swap"), str(scale_swap),
-                  comment=f"scale DB swap mask = {scale_swap:#x}")
+        # No separate swap mask needed: ADD-based toggle uses s_lds_db_step
         ctx.raw("")
 
 

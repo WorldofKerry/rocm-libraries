@@ -359,6 +359,11 @@ class SoftwarePipeline:
 
         if self.loads_before_reads:
             ctx.s_barrier(comment="sync")
+        # Negate DB step for ADD-based toggle (alternates +/- each iter).
+        # Must happen after ALL toggles (read + write) in this iteration.
+        ctx.inst("s_sub_u32", ctx.sreg("s_lds_db_step"),
+                 "0", ctx.sreg("s_lds_db_step"),
+                 comment="negate db_step for next toggle")
         ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
                  comment="more?")
         if has_cross_iter_pf:
@@ -710,13 +715,15 @@ class AutoPipelinedCompute(ComputePipeline):
         # Precompute swizzled read addresses (before DB step setup)
         reader.precompute_swizzle_addresses()
 
-        # DB step = lds_data_half (must be power of 2 for XOR toggle).
-        # Scale LDS regions use a separate swap mask computed in setup.
+        # DB step = total per-buffer size (data + scales).
+        # Uses ADD-based toggle (not XOR), so any step size works.
+        lds_scale_half = ctx._metadata.get("lds_scale_half", 0)
+        lds_half_total = lds_data_half + lds_scale_half
         ctx.alloc_sgpr_permanent(1, "s_lds_db_step")
         ctx.alloc_sgpr_permanent(1, "s_rd_db")
         ctx.s_mov(ctx.sreg("s_rd_db"), "0", comment="rd_db = 0 (read from buffer 0)")
-        ctx.s_mov(ctx.sreg("s_lds_db_step"), str(lds_data_half),
-                  comment=f"DB step = {lds_data_half}")
+        ctx.s_mov(ctx.sreg("s_lds_db_step"), str(lds_half_total),
+                  comment=f"DB step = {lds_half_total}")
         ctx.raw("")
 
         # Precompute offsets

@@ -123,12 +123,12 @@ class DTLLoader(GlobalLoader):
 
     def toggle_write(self) -> None:
         ctx = self.ctx
-        ctx.inst("s_xor_b32", ctx.sreg("s_lds_wr_a_sg"),
+        ctx.inst("s_add_u32", ctx.sreg("s_lds_wr_a_sg"),
                  ctx.sreg("s_lds_wr_a_sg"), ctx.sreg("s_lds_db_step"),
-                 comment="wr_a ^= db")
-        ctx.inst("s_xor_b32", ctx.sreg("s_lds_wr_b_sg"),
+                 comment="wr_a += db")
+        ctx.inst("s_add_u32", ctx.sreg("s_lds_wr_b_sg"),
                  ctx.sreg("s_lds_wr_b_sg"), ctx.sreg("s_lds_db_step"),
-                 comment="wr_b ^= db")
+                 comment="wr_b += db")
         if self._scale_loader is not None:
             self._scale_loader.toggle_write()
 
@@ -237,17 +237,17 @@ class BufferLoader(GlobalLoader):
         """
         ctx = self.ctx
         # Also toggle the scalar bases (for DTL compat if mixed)
-        ctx.inst("s_xor_b32", ctx.sreg("s_lds_wr_a_sg"),
+        ctx.inst("s_add_u32", ctx.sreg("s_lds_wr_a_sg"),
                  ctx.sreg("s_lds_wr_a_sg"), ctx.sreg("s_lds_db_step"),
-                 comment="wr_a ^= db")
-        ctx.inst("s_xor_b32", ctx.sreg("s_lds_wr_b_sg"),
+                 comment="wr_a += db")
+        ctx.inst("s_add_u32", ctx.sreg("s_lds_wr_b_sg"),
                  ctx.sreg("s_lds_wr_b_sg"), ctx.sreg("s_lds_db_step"),
-                 comment="wr_b ^= db")
+                 comment="wr_b += db")
         # Toggle the BUF db offset
         if ctx.has("s_buf_wr_db"):
-            ctx.inst("s_xor_b32", ctx.sreg("s_buf_wr_db"),
+            ctx.inst("s_add_u32", ctx.sreg("s_buf_wr_db"),
                      ctx.sreg("s_buf_wr_db"), ctx.sreg("s_lds_db_step"),
-                     comment="buf_wr_db ^= db")
+                     comment="buf_wr_db += db")
 
     def emit_sync(self) -> None:
         """Wait for LDS writes (issued during emit_produce), then barrier.

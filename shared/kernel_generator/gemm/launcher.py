@@ -396,13 +396,22 @@ class GemmLauncher:
             _check(hip.hipMalloc(ctypes.byref(d_scale_B), scale_b_bytes),
                    "hipMalloc scale_B")
             if self._scale_A is not None:
-                _check(hip.hipMemcpy(d_scale_A, self._scale_A.ctypes.data,
+                # Pad scale array to allocation size to avoid OOB reads
+                src_a = self._scale_A.ravel()
+                if len(src_a) < scale_a_bytes:
+                    src_a = np.pad(src_a, (0, scale_a_bytes - len(src_a)),
+                                  constant_values=0x7F)
+                _check(hip.hipMemcpy(d_scale_A, src_a.ctypes.data,
                                      scale_a_bytes, 1), "H2D scale_A")
             else:
                 _check(hip.hipMemset(d_scale_A, 0x7F, scale_a_bytes),
                        "memset scale_A=1.0")
             if self._scale_B is not None:
-                _check(hip.hipMemcpy(d_scale_B, self._scale_B.ctypes.data,
+                src_b = self._scale_B.ravel()
+                if len(src_b) < scale_b_bytes:
+                    src_b = np.pad(src_b, (0, scale_b_bytes - len(src_b)),
+                                  constant_values=0x7F)
+                _check(hip.hipMemcpy(d_scale_B, src_b.ctypes.data,
                                      scale_b_bytes, 1), "H2D scale_B")
             else:
                 _check(hip.hipMemset(d_scale_B, 0x7F, scale_b_bytes),

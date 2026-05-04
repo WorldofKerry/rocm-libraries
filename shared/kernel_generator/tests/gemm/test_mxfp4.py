@@ -443,8 +443,9 @@ class TestMXFP4RealScales:
         # Override scale buffers: scale_A=2.0 (0x80), scale_B=1.0 (0x7F)
         # E8M0: value = 2^(code - 127). 0x80 = 128, 2^(128-127) = 2^1 = 2.0
         mx_block = 32
-        launcher._scale_A = np.full(M * (K // mx_block), 0x80, dtype=np.uint8)
-        launcher._scale_B = np.full(N * (K // mx_block), 0x7F, dtype=np.uint8)
+        # Pad to 4096 to cover the full DTL read range
+        launcher._scale_A = np.full(max(M * (K // mx_block), 4096), 0x80, dtype=np.uint8)
+        launcher._scale_B = np.full(max(N * (K // mx_block), 4096), 0x7F, dtype=np.uint8)
 
         result = launcher.run_asm_kernel(
             co_path, kernel_name="gemm_kernel",

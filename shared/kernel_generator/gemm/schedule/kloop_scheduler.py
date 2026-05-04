@@ -254,7 +254,8 @@ class KLoopScheduler:
 
         # Phase 5: Auto-wait insertion
         waits = self._compute_waits(
-            mfma_order, side_ops, pre_body, preamble, mfma_positions)
+            mfma_order, side_ops, pre_body, preamble,
+            prologue_scale_ops, mfma_positions)
 
         return ScheduledKLoop(
             mfma_order=mfma_order,
@@ -273,6 +274,7 @@ class KLoopScheduler:
                        side_ops: List[List[KLoopOp]],
                        pre_body: List[KLoopOp],
                        preamble: List[KLoopOp],
+                       prologue_scale_ops: List[KLoopOp],
                        mfma_positions: Dict[str, int]) -> Dict[int, str]:
         """Compute where s_waitcnt lgkmcnt(N) needs to be inserted.
 
@@ -300,6 +302,9 @@ class KLoopScheduler:
         for op in preamble:
             if op.kind == OpKind.DS_READ:
                 read_issue_order.append(op.name)
+        for op in prologue_scale_ops:
+            if op.kind == OpKind.DS_READ:
+                read_issue_order.append(op.name)
         for i in range(len(mfma_order)):
             for op in side_ops[i]:
                 if op.kind == OpKind.DS_READ:
@@ -311,7 +316,7 @@ class KLoopScheduler:
 
         # Count reads issued before each MFMA position
         reads_before_mfma: Dict[int, int] = {}
-        n_preamble_reads = sum(1 for op in pre_body + preamble
+        n_preamble_reads = sum(1 for op in pre_body + preamble + prologue_scale_ops
                                if op.kind == OpKind.DS_READ)
         count = n_preamble_reads
         for i in range(len(mfma_order)):

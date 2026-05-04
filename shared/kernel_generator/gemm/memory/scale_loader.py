@@ -693,48 +693,74 @@ class LDSScaleLoader(ScaleLoader):
     # -- DTL emission -------------------------------------------------------
 
     def emit_dtl_loads(self) -> None:
-        """Emit DTL loads for pre-swizzled scale A and B into LDS."""
+        """Load scale data via buffer_load -> VGPR -> ds_write to LDS.
+
+        Uses a 2-step approach instead of DTL (buffer_load with lds flag)
+        to work around hardware issues with scale DTL on some configs.
+        Each thread loads and writes 16 bytes (4 dwords) to LDS.
+        """
         ctx = self._ctx
-        ctx.inst("s_mov_b32", "m0",
-                 ctx.sreg("s_lds_wr_scale_a"),
-                 comment="m0 = LDS scale A write base")
-        ctx.inst("buffer_load_dwordx4",
-                 ctx.vreg("v_dtl_off_scale_a_lds"),
-                 ctx.sreg("s_srd_scale_a", 0, 4),
-                 "0", "offen offset:0, lds",
-                 comment="DTL scale A (pre-swizzled)")
-        ctx.inst("s_mov_b32", "m0",
-                 ctx.sreg("s_lds_wr_scale_b"),
-                 comment="m0 = LDS scale B write base")
-        ctx.inst("buffer_load_dwordx4",
-                 ctx.vreg("v_dtl_off_scale_b_lds"),
-                 ctx.sreg("s_srd_scale_b", 0, 4),
-                 "0", "offen offset:0, lds",
-                 comment="DTL scale B (pre-swizzled)")
+        tmp = ctx.vreg("v_tmp0")  # temp for loaded data
+        # Scale A: 4 dwords per thread
+        for dw in range(4):
+            off = dw * 4
+            ctx.inst("buffer_load_dword", tmp,
+                     ctx.vreg("v_dtl_off_scale_a_lds"),
+                     ctx.sreg("s_srd_scale_a", 0, 4),
+                     "0", f"offen offset:{off}",
+                     comment=f"scale A dword {dw}")
+            ctx.s_waitcnt("vmcnt(0)", comment="wait")
+            ctx.v_add(ctx.vreg("v_tmp1"),
+                      ctx.vreg("v_dtl_off_scale_a_lds"),
+                      ctx.sreg("s_lds_wr_scale_a"),
+                      comment="LDS addr")
+            ctx.inst("ds_write_b32",
+                     ctx.vreg("v_tmp1"), tmp,
+                     f"offset:{off}",
+                     comment=f"scale A dw{dw} -> LDS")
+        ctx.s_waitcnt("lgkmcnt(0)", comment="wait scale A LDS writes")
+        # Scale B: 4 dwords per thread
+        for dw in range(4):
+            off = dw * 4
+            ctx.inst("buffer_load_dword", tmp,
+                     ctx.vreg("v_dtl_off_scale_b_lds"),
+                     ctx.sreg("s_srd_scale_b", 0, 4),
+                     "0", f"offen offset:{off}",
+                     comment=f"scale B dword {dw}")
+            ctx.s_waitcnt("vmcnt(0)", comment="wait")
+            ctx.v_add(ctx.vreg("v_tmp1"),
+                      ctx.vreg("v_dtl_off_scale_b_lds"),
+                      ctx.sreg("s_lds_wr_scale_b"),
+                      comment="LDS addr")
+            ctx.inst("ds_write_b32",
+                     ctx.vreg("v_tmp1"), tmp,
+                     f"offset:{off}",
+                     comment=f"scale B dw{dw} -> LDS")
+        ctx.s_waitcnt("lgkmcnt(0)", comment="wait scale B LDS writes")
 
     def toggle_write(self) -> None:
         """Toggle scale LDS write bases for double-buffering."""
         ctx = self._ctx
-        ctx.inst("s_xor_b32", ctx.sreg("s_lds_wr_scale_a"),
+        ctx.inst("s_add_u32", ctx.sreg("s_lds_wr_scale_a"),
                  ctx.sreg("s_lds_wr_scale_a"),
-                 ctx.sreg("s_scale_db_swap"),
-                 comment="wr_scale_a ^= swap")
-        ctx.inst("s_xor_b32", ctx.sreg("s_lds_wr_scale_b"),
+                 ctx.sreg("s_lds_db_step"),
+                 comment="wr_scale_a += db_step")
+        ctx.inst("s_add_u32", ctx.sreg("s_lds_wr_scale_b"),
                  ctx.sreg("s_lds_wr_scale_b"),
-                 ctx.sreg("s_scale_db_swap"),
-                 comment="wr_scale_b ^= swap")
+                 ctx.sreg("s_lds_db_step"),
+                 comment="wr_scale_b += db_step")
 
     def toggle_read(self) -> None:
         """Toggle scale ds_read base VGPRs for double-buffering."""
         ctx = self._ctx
-        ctx.inst("v_xor_b32", ctx.vreg("v_scale_rd_a"),
-                 ctx.sreg("s_scale_db_swap"),
-                 ctx.vreg("v_scale_rd_a"),
-                 comment="scale_rd_a ^= swap")
-        ctx.inst("v_xor_b32", ctx.vreg("v_scale_rd_b"),
-                 ctx.sreg("s_scale_db_swap"),
-                 ctx.vreg("v_scale_rd_b"),
-                 comment="scale_rd_b ^= swap")
+        ctx.v_add(ctx.vreg("v_scale_rd_a"),
+                  ctx.vreg("v_scale_rd_a"),
+                  ctx.sreg("s_lds_db_step"),
+                  comment="scale_rd_a += db_step")
+        ctx.v_add(ctx.vreg("v_scale_rd_b"),
+                  ctx.vreg("v_scale_rd_b"),
+                  ctx.sreg("s_lds_db_step"),
+                  comment="scale_rd_b += db_step")
 
     # -- ds_read emission ---------------------------------------------------
 

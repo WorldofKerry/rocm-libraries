@@ -487,27 +487,27 @@ class LDSReader:
         swz = self._swizzle
         if swz is not None and hasattr(swz, 'pair_factor'):
             if self._precomputed_swizzle:
-                # XOR all precomputed read address VGPRs with DB step
-                ctx.comment("Toggle all precomputed read addresses")
+                # ADD-based toggle: alternates +/- step via negate in loop tail
+                ctx.comment("Toggle all precomputed read addresses (ADD)")
                 for (mi, ki), name in self._a_rd_names.items():
-                    ctx.inst("v_xor_b32", ctx.vreg(name),
-                             ctx.sreg("s_lds_db_step"), ctx.vreg(name),
-                             comment=f"rd_a_m{mi}_k{ki} ^= db")
+                    ctx.v_add(ctx.vreg(name),
+                              ctx.vreg(name), ctx.sreg("s_lds_db_step"),
+                              comment=f"rd_a_m{mi}_k{ki} += db")
                 for (ni, ki), name in self._b_rd_names.items():
-                    ctx.inst("v_xor_b32", ctx.vreg(name),
-                             ctx.sreg("s_lds_db_step"), ctx.vreg(name),
-                             comment=f"rd_b_n{ni}_k{ki} ^= db")
+                    ctx.v_add(ctx.vreg(name),
+                              ctx.vreg(name), ctx.sreg("s_lds_db_step"),
+                              comment=f"rd_b_n{ni}_k{ki} += db")
             else:
-                # Scalar DB state for recompute path
-                ctx.inst("s_xor_b32", ctx.sreg("s_rd_db"),
+                # Scalar DB state for recompute path (ADD toggle)
+                ctx.inst("s_add_u32", ctx.sreg("s_rd_db"),
                          ctx.sreg("s_rd_db"), ctx.sreg("s_lds_db_step"),
-                         comment="s_rd_db ^= db_step (toggle read buffer)")
+                         comment="s_rd_db += db_step (toggle read buffer)")
         else:
             for matrix in ["a", "b"]:
                 base_name = f"v_lds_rd_{matrix}"
-                ctx.inst("v_xor_b32", ctx.vreg(base_name),
-                         ctx.sreg("s_lds_db_step"), ctx.vreg(base_name),
-                         comment=f"rd_{matrix} ^= db")
+                ctx.v_add(ctx.vreg(base_name),
+                          ctx.vreg(base_name), ctx.sreg("s_lds_db_step"),
+                          comment=f"rd_{matrix} += db")
                 if self._swizzle is not None and self.ki_count > 1:
                     from .swizzle import DataLayout as SwzLayout
                     swz_layout = SwzLayout(

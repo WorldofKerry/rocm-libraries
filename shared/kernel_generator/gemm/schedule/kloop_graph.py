@@ -377,9 +377,14 @@ class ScaleBlock(BuildingBlock):
         is_lds = isinstance(sl, _LDS)
         scale_op_kind = OpKind.DS_READ if is_lds else OpKind.SCALE_LOAD
 
-        # Register scale-A loads for each (mi, ki)
-        for mi in range(mr):
-            for ki in range(ki_count):
+        # Register scale-A loads.
+        # For LDS scales: one ds_read per 2-mi group covers all ki values,
+        # so only create ops for (even mi, ki=0) to avoid duplicate reads.
+        # For VMEM scales: one op per (mi, ki) as before.
+        mx_block = 2 if is_lds else 1  # LDS groups pair 2 mi values
+        a_ki_range = [0] if is_lds else list(range(ki_count))
+        for mi in range(0, mr, mx_block):
+            for ki in a_ki_range:
                 name = f"scale_a_m{mi}_k{ki}"
 
                 def _mk_emit_a(mi_=mi, ki_=ki):
@@ -395,14 +400,17 @@ class ScaleBlock(BuildingBlock):
                 # SYNC dep: must come after barrier (current iter data ready)
                 graph.add_dep("barrier", name, DepKind.SYNC)
 
-                # RAW dep: every MFMA using this scale depends on it
-                for ni in range(nr):
-                    mfma_name = f"mfma_m{mi}_n{ni}_k{ki}"
-                    graph.add_dep(name, mfma_name, DepKind.RAW)
+                # RAW dep: every MFMA in this group depends on it
+                for mi2 in range(mi, min(mi + mx_block, mr)):
+                    for ki2 in range(ki_count):
+                        for ni in range(nr):
+                            mfma_name = f"mfma_m{mi2}_n{ni}_k{ki2}"
+                            graph.add_dep(name, mfma_name, DepKind.RAW)
 
-        # Register scale-B loads for each (ni, ki)
-        for ni in range(nr):
-            for ki in range(ki_count):
+        # Register scale-B loads.
+        b_ki_range = [0] if is_lds else list(range(ki_count))
+        for ni in range(0, nr, mx_block):
+            for ki in b_ki_range:
                 name = f"scale_b_n{ni}_k{ki}"
 
                 def _mk_emit_b(ni_=ni, ki_=ki):
@@ -418,10 +426,12 @@ class ScaleBlock(BuildingBlock):
                 # SYNC dep: must come after barrier
                 graph.add_dep("barrier", name, DepKind.SYNC)
 
-                # RAW dep: every MFMA using this scale depends on it
-                for mi in range(mr):
-                    mfma_name = f"mfma_m{mi}_n{ni}_k{ki}"
-                    graph.add_dep(name, mfma_name, DepKind.RAW)
+                # RAW dep: every MFMA in this group depends on it
+                for ni2 in range(ni, min(ni + mx_block, nr)):
+                    for ki2 in range(ki_count):
+                        for mi in range(mr):
+                            mfma_name = f"mfma_m{mi}_n{ni2}_k{ki2}"
+                            graph.add_dep(name, mfma_name, DepKind.RAW)
 
         # Register scale SRD advance for next iteration (iteration=1)
         # Skip for LDS scales: DTLLoader.advance() handles scale SRD
@@ -474,6 +484,7 @@ class SuffixBlock(BuildingBlock):
                 from ..memory.scale_loader import LDSScaleLoader as _LDS
                 if isinstance(sl, _LDS):
                     sl.toggle_read()
+
 
         graph.add_op(KLoopOp(
             "suffix_vmcnt", OpKind.WAIT, _emit_vmcnt,

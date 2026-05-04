@@ -128,10 +128,9 @@ def pipeline_kloop_phase(level, ctx) -> None:
         if use_lds_scales:
             from ..memory.scale_loader import LDSScaleLoader
             lds_data_half = ctx._metadata.get("lds_data_half", 0)
-            # Scale LDS starts after BOTH data buffers
-            lds_data_total = lds_data_half * 2
+            # Scale LDS starts after data within each buffer
             scale_loader = LDSScaleLoader(ctx, tile,
-                                          lds_scale_offset=lds_data_total)
+                                          lds_scale_offset=lds_data_half)
         else:
             from ..memory.scale_loader import VMEMScaleLoader
             swizzled = ctx._metadata.get("swizzled_scales", False)
