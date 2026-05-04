@@ -231,51 +231,45 @@ class PipelineScheduler:
                     cur = read_war_after.get(dep.consumer, -1)
                     read_war_after[dep.consumer] = max(cur, pos)
 
-        # Place reads: sort by (war_after, earliest_needed).
-        DS_READ_LEAD = 5  # how many MFMAs before needing the data
-        reads_sorted = sorted(reads, key=lambda r: (
-            read_war_after.get(r.name, -1),
-            read_earliest.get(r.name, 0) - DS_READ_LEAD,
-            r.name,
-        ))
+        # Latency-driven interleaving.
+        # Walk the MFMA order and insert reads at the right points.
+        # Each read has a target position: the MFMA index AFTER which
+        # it should be placed (for WAR reads) or BEFORE which it
+        # should be placed (for preamble reads).
+        DS_READ_LEAD = 5
 
-        # Interleave reads into MFMA sequence respecting WAR deps.
-        # Preamble reads (no WAR dep): placed before all MFMAs.
-        # Deferred reads (WAR dep): placed after the WAR-dep MFMA,
-        # with DS_READ_LEAD MFMAs of lead time before consumption.
-        # At most 1 read per MFMA interval to spread load latency.
-        preamble_reads: List[KLoopOp] = []
-        deferred: List[tuple] = []  # (earliest_slot, read_op)
-
-        for r in reads_sorted:
+        # Compute target MFMA index for each read.
+        # target_mfma = the MFMA index after which the read is placed.
+        # -1 = preamble (before all MFMAs).
+        read_targets: Dict[str, int] = {}
+        for r in reads:
             war_pos = read_war_after.get(r.name, -1)
-            if war_pos < 0:
-                preamble_reads.append(r)
+            target = read_earliest.get(r.name, 0)
+            if war_pos >= 0:
+                # WAR-constrained: place right after the WAR MFMA
+                read_targets[r.name] = war_pos
             else:
-                target = read_earliest.get(r.name, len(mfma_order))
-                earliest_slot = max(war_pos + 1, target - DS_READ_LEAD)
-                earliest_slot = min(max(earliest_slot, 0), len(mfma_order))
-                deferred.append((earliest_slot, r))
+                # No WAR: place DS_READ_LEAD before consumer
+                place_before = max(target - DS_READ_LEAD, 0)
+                # "after MFMA[place_before - 1]" = "before MFMA[place_before]"
+                read_targets[r.name] = place_before - 1  # -1 = preamble
 
-        # Place deferred reads: 1 per MFMA slot, scanning forward
-        deferred.sort(key=lambda x: x[0])
-        slots: Dict[int, KLoopOp] = {}
-        used: set = set()
-        for earliest, r in deferred:
-            for pos in range(earliest, len(mfma_order) + 1):
-                if pos not in used:
-                    slots[pos] = r
-                    used.add(pos)
-                    break
+        # Group reads by their target MFMA position
+        reads_after: Dict[int, List[KLoopOp]] = {}
+        for r in reads:
+            pos = read_targets[r.name]
+            reads_after.setdefault(pos, []).append(r)
 
-        # Build interleaved result
-        result: List[KLoopOp] = list(preamble_reads)
+        # Sort reads within each group by their earliest consumer (urgency)
+        for pos in reads_after:
+            reads_after[pos].sort(key=lambda r: read_earliest.get(r.name, 999))
+
+        # Build result: preamble reads, then MFMA + interleaved reads
+        result: List[KLoopOp] = list(reads_after.get(-1, []))
         for i, mfma_op in enumerate(mfma_order):
-            if i in slots:
-                result.append(slots[i])
             result.append(mfma_op)
-        if len(mfma_order) in slots:
-            result.append(slots[len(mfma_order)])
+            for r in reads_after.get(i, []):
+                result.append(r)
         result.extend(suffix)
         return result
 
