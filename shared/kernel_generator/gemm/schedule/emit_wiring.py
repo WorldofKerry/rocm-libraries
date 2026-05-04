@@ -47,6 +47,18 @@ def wire_emit_callbacks(
         ctx: AsmContext for register resolution.
         scale_loader: Optional LDSScaleLoader for scale reads.
     """
+    def _advance_srd(ctx, srd_name, stride):
+        ctx.inst("s_add_u32", ctx.sreg(srd_name, 0, 1),
+                 ctx.sreg(srd_name, 0, 1), str(stride),
+                 comment=f"{srd_name} += {stride}")
+        ctx.inst("s_addc_u32", ctx.sreg(srd_name, 1, 1),
+                 ctx.sreg(srd_name, 1, 1), "0", comment="carry")
+
+    def _toggle_write_sg(ctx, sg_name):
+        ctx.inst("s_add_u32", ctx.sreg(sg_name),
+                 ctx.sreg(sg_name), ctx.sreg("s_lds_db_step"),
+                 comment=f"{sg_name} += db")
+
     tile = ctx._metadata["tile"]
     mr = tile.mfma_m_repeat
     nr = tile.mfma_n_repeat
@@ -58,19 +70,32 @@ def wire_emit_callbacks(
         # -- Producer ops --
         if op_name.startswith("advance_"):
             sname = op_name[len("advance_"):]
-            if sname in stream_map:
+            if sname == "data_a":
+                op.emit = lambda: _advance_srd(ctx, "s_srd_a", loader.k_stride)
+            elif sname == "data_b":
+                op.emit = lambda: _advance_srd(ctx, "s_srd_b", loader.k_stride)
+            elif sname in stream_map:
                 s = stream_map[sname]
                 op.emit = lambda s=s: s.advance(ctx)
 
         elif op_name.startswith("toggle_wr_"):
             sname = op_name[len("toggle_wr_"):]
-            if sname in stream_map:
+            if sname == "data_a":
+                op.emit = lambda: _toggle_write_sg(ctx, "s_lds_wr_a_sg")
+            elif sname == "data_b":
+                op.emit = lambda: _toggle_write_sg(ctx, "s_lds_wr_b_sg")
+            elif sname in stream_map:
                 s = stream_map[sname]
                 op.emit = lambda s=s: s.toggle_write(ctx)
 
         elif op_name.startswith("load_"):
             sname = op_name[len("load_"):]
-            if sname in stream_map:
+            # Wire to actual loader methods (streams are stubs for loads)
+            if sname == "data_a":
+                op.emit = lambda: loader._emit_dtl_loads_a()
+            elif sname == "data_b":
+                op.emit = lambda: loader._emit_dtl_loads_b()
+            elif sname in stream_map:
                 s = stream_map[sname]
                 op.emit = lambda s=s: s.emit_global_loads(ctx)
 
@@ -131,6 +156,12 @@ def wire_emit_callbacks(
         # -- Suffix toggles --
         elif op_name.startswith("toggle_rd_"):
             sname = op_name[len("toggle_rd_"):]
-            if sname in stream_map:
+            if sname == "data_a" or sname == "data_b":
+                # Only one toggle_read call covers both A and B
+                if sname == "data_a":
+                    op.emit = lambda: reader.toggle_read()
+                else:
+                    op.emit = None  # reader.toggle_read() handles both
+            elif sname in stream_map:
                 s = stream_map[sname]
                 op.emit = lambda s=s: s.toggle_read(ctx)

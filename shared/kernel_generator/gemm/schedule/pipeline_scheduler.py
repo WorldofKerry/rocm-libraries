@@ -239,12 +239,36 @@ class PipelineScheduler:
             r.name,
         ))
 
-        # Interleave reads into MFMA order.
-        # For simplicity in this first version: place all reads before
-        # MFMAs, grouped by their WAR-dep boundary.  A finer-grained
-        # interleaving (reads between MFMAs) would be a Phase 5
-        # enhancement.
-        result: List[KLoopOp] = list(reads_sorted) + list(mfma_order) + list(suffix)
+        # Interleave reads into MFMA sequence respecting WAR deps.
+        # Reads without WAR deps (or WAR after=-1) go in a preamble
+        # before MFMAs. Reads with WAR deps are placed after the
+        # required MFMA completes, with DS_READ_LEAD MFMAs of lead time.
+        preamble_reads: List[KLoopOp] = []
+        deferred_reads: Dict[int, List[KLoopOp]] = {}  # mfma_pos → reads
+
+        for r in reads_sorted:
+            war_pos = read_war_after.get(r.name, -1)
+            if war_pos < 0:
+                preamble_reads.append(r)
+            else:
+                # Place after the WAR-dep MFMA, with lead time
+                target = read_earliest.get(r.name, len(mfma_order))
+                place_at = max(war_pos + 1, target - DS_READ_LEAD)
+                place_at = min(place_at, len(mfma_order))
+                deferred_reads.setdefault(place_at, []).append(r)
+
+        # Build interleaved result
+        result: List[KLoopOp] = list(preamble_reads)
+        for i, mfma_op in enumerate(mfma_order):
+            # Insert deferred reads before this MFMA position
+            if i in deferred_reads:
+                result.extend(deferred_reads[i])
+            result.append(mfma_op)
+        # Any remaining deferred reads go after last MFMA
+        for pos in sorted(deferred_reads.keys()):
+            if pos >= len(mfma_order):
+                result.extend(deferred_reads[pos])
+        result.extend(suffix)
         return result
 
     # ── ramp-up ───────────────────────────────────────────────────
