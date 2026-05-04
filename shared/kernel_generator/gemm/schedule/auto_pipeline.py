@@ -432,11 +432,14 @@ class GlobalLoadStageEmitter(StageEmitter):
             from ..memory.scale_loader import LDSScaleLoader as _LDS
             is_lds_scale = isinstance(scale_loader, _LDS) if scale_loader else False
             if is_lds_scale:
-                # LDS scales: DTL loads include scale data.
-                # Wait for all DTL (data + scales) before barrier.
-                # Scale ds_reads happen in the consume phase.
+                # LDS scales: emit_dtl_loads() issued global loads.
+                # Wait for ALL loads (data DTL + scale), then write
+                # scales to LDS.
                 ctx.s_waitcnt("vmcnt(0)",
-                              comment="wait all DTL (data + scales)")
+                              comment="wait all loads (data DTL + scales)")
+                scale_loader.emit_scale_ds_writes()
+                ctx.s_waitcnt("lgkmcnt(0)",
+                              comment="wait scale LDS writes")
             elif schedule.prologue_scale_ops:
                 # VMEM scales: load into VGPRs, leave in-flight.
                 for op in schedule.prologue_scale_ops:

@@ -637,18 +637,37 @@ class LDSScaleLoader(ScaleLoader):
         ctx = self._ctx
         tile = self._tile
 
-        # DTL voffset: tid * 16
-        ctx.comment("Scale DTL voffset (pre-swizzled): tid * 16")
+        # DTL voffset: (tid % 16) * 16 + (tid / 16) * stride
+        # Each group of 16 threads reads 256 bytes contiguously, groups
+        # are spaced by the scale stride (matches pre-swizzled layout).
+        ctx.comment("Scale DTL voffset (strided): (tid%16)*16 + (tid/16)*stride")
         if not ctx.has("v_dtl_off_scale_a_lds"):
             ctx.alloc_vgpr_permanent(1, "v_dtl_off_scale_a_lds")
-        ctx.v_lshl(ctx.vreg("v_dtl_off_scale_a_lds"),
-                   ctx.vreg("v_tid"), 4,
-                   comment="scale DTL voff = tid * 16")
         if not ctx.has("v_dtl_off_scale_b_lds"):
             ctx.alloc_vgpr_permanent(1, "v_dtl_off_scale_b_lds")
-        ctx.inst("v_mov_b32", ctx.vreg("v_dtl_off_scale_b_lds"),
-                 ctx.vreg("v_dtl_off_scale_a_lds"),
-                 comment="scale B DTL voff = same")
+        # intra-group offset = (tid % 16) * 16
+        ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_tid"), "15",
+                  comment="tid % 16")
+        ctx.v_lshl(ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"), 4,
+                   comment="* 16 -> intra-group byte offset")
+        # inter-group offset = (tid / 16) * stride_scale_a
+        ctx.v_lshr(ctx.vreg("v_tmp1"), ctx.vreg("v_tid"), 4,
+                   comment="tid / 16 (group index)")
+        ctx.v_mul(ctx.vreg("v_tmp1"),
+                  ctx.sreg("s_stride_scale_a"), ctx.vreg("v_tmp1"),
+                  comment="* stride_scale_a")
+        ctx.v_add(ctx.vreg("v_dtl_off_scale_a_lds"),
+                  ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),
+                  comment="scale A voffset")
+        # scale B: same intra-group, different stride
+        ctx.v_lshr(ctx.vreg("v_tmp1"), ctx.vreg("v_tid"), 4,
+                   comment="tid / 16")
+        ctx.v_mul(ctx.vreg("v_tmp1"),
+                  ctx.sreg("s_stride_scale_b"), ctx.vreg("v_tmp1"),
+                  comment="* stride_scale_b")
+        ctx.v_add(ctx.vreg("v_dtl_off_scale_b_lds"),
+                  ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),
+                  comment="scale B voffset")
         ctx.raw("")
 
         # ds_read base: wave_partition * 1024 + laneId * 4 + lds_base
@@ -693,50 +712,45 @@ class LDSScaleLoader(ScaleLoader):
     # -- DTL emission -------------------------------------------------------
 
     def emit_dtl_loads(self) -> None:
-        """Load scale data via buffer_load -> VGPR -> ds_write to LDS.
+        """Issue global loads for scale data into VGPRs (async).
 
-        Uses a 2-step approach instead of DTL (buffer_load with lds flag)
-        to work around hardware issues with scale DTL on some configs.
-        Each thread loads and writes 16 bytes (4 dwords) to LDS.
+        Call emit_scale_ds_writes() after vmcnt(0) to write to LDS.
         """
         ctx = self._ctx
-        tmp = ctx.vreg("v_tmp0")  # temp for loaded data
-        # Scale A: 4 dwords per thread
         for dw in range(4):
-            off = dw * 4
-            ctx.inst("buffer_load_dword", tmp,
+            ctx.inst("buffer_load_dword", ctx.vreg(f"v_tmp{dw}"),
                      ctx.vreg("v_dtl_off_scale_a_lds"),
                      ctx.sreg("s_srd_scale_a", 0, 4),
-                     "0", f"offen offset:{off}",
+                     "0", f"offen offset:{dw * 4}",
                      comment=f"scale A dword {dw}")
-            ctx.s_waitcnt("vmcnt(0)", comment="wait")
-            ctx.v_add(ctx.vreg("v_tmp1"),
-                      ctx.vreg("v_dtl_off_scale_a_lds"),
-                      ctx.sreg("s_lds_wr_scale_a"),
-                      comment="LDS addr")
-            ctx.inst("ds_write_b32",
-                     ctx.vreg("v_tmp1"), tmp,
-                     f"offset:{off}",
-                     comment=f"scale A dw{dw} -> LDS")
-        ctx.s_waitcnt("lgkmcnt(0)", comment="wait scale A LDS writes")
-        # Scale B: 4 dwords per thread
         for dw in range(4):
-            off = dw * 4
-            ctx.inst("buffer_load_dword", tmp,
+            ctx.inst("buffer_load_dword", ctx.vreg(f"v_tmp{4 + dw}"),
                      ctx.vreg("v_dtl_off_scale_b_lds"),
                      ctx.sreg("s_srd_scale_b", 0, 4),
-                     "0", f"offen offset:{off}",
+                     "0", f"offen offset:{dw * 4}",
                      comment=f"scale B dword {dw}")
-            ctx.s_waitcnt("vmcnt(0)", comment="wait")
-            ctx.v_add(ctx.vreg("v_tmp1"),
-                      ctx.vreg("v_dtl_off_scale_b_lds"),
-                      ctx.sreg("s_lds_wr_scale_b"),
-                      comment="LDS addr")
+
+    def emit_scale_ds_writes(self) -> None:
+        """Write scale VGPRs to LDS. Must be called after vmcnt(0)."""
+        ctx = self._ctx
+        ctx.v_lshl(ctx.vreg("v_tmp8"), ctx.vreg("v_tid"), 4,
+                   comment="tid * 16 (LDS offset)")
+        ctx.v_add(ctx.vreg("v_tmp9"), ctx.vreg("v_tmp8"),
+                  ctx.sreg("s_lds_wr_scale_a"),
+                  comment="LDS addr A = wr_base_a + tid*16")
+        for dw in range(4):
             ctx.inst("ds_write_b32",
-                     ctx.vreg("v_tmp1"), tmp,
-                     f"offset:{off}",
+                     ctx.vreg("v_tmp9"), ctx.vreg(f"v_tmp{dw}"),
+                     f"offset:{dw * 4}",
+                     comment=f"scale A dw{dw} -> LDS")
+        ctx.v_add(ctx.vreg("v_tmp9"), ctx.vreg("v_tmp8"),
+                  ctx.sreg("s_lds_wr_scale_b"),
+                  comment="LDS addr B = wr_base_b + tid*16")
+        for dw in range(4):
+            ctx.inst("ds_write_b32",
+                     ctx.vreg("v_tmp9"), ctx.vreg(f"v_tmp{4 + dw}"),
+                     f"offset:{dw * 4}",
                      comment=f"scale B dw{dw} -> LDS")
-        ctx.s_waitcnt("lgkmcnt(0)", comment="wait scale B LDS writes")
 
     def toggle_write(self) -> None:
         """Toggle scale LDS write bases for double-buffering."""

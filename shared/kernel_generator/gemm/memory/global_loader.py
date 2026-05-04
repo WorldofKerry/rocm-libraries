@@ -139,17 +139,22 @@ class DTLLoader(GlobalLoader):
         before this. The barrier ensures all waves see the completed
         DTL writes before any wave starts reading from LDS.
 
-        In produce-first mode this is redundant with the loop-tail
-        barrier, but the cost (~10 cycles) is negligible.
+        For LDS scales: vmcnt(0) drains both data DTL and scale
+        buffer_loads. We then do ds_writes + lgkmcnt(0) before barrier.
         """
+        if self._scale_loader is not None:
+            from .scale_loader import LDSScaleLoader as _LDS
+            if isinstance(self._scale_loader, _LDS):
+                self._scale_loader.emit_scale_ds_writes()
+                self.ctx.s_waitcnt("lgkmcnt(0)",
+                                   comment="wait scale LDS writes")
         self.ctx.s_barrier(comment="sync DTL writes")
 
     @property
     def num_inflight(self) -> int:
-        n = self.num_loads_a + self.num_loads_b
-        if self._scale_loader is not None:
-            n += 2  # 1 DTL scale A + 1 DTL scale B
-        return n
+        # Scale loads complete synchronously (vmcnt+ds_write inside
+        # emit_dtl_loads), so they don't contribute to inflight count.
+        return self.num_loads_a + self.num_loads_b
 
     def _emit_dtl_loads_a(self) -> None:
         ctx, tile = self.ctx, self.tile
