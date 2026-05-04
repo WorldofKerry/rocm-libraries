@@ -1,0 +1,284 @@
+"""Pipeline emitter: assembly code generation from a ScheduledPipeline.
+
+Takes a ``ScheduledPipeline`` (from ``pipeline_scheduler.py``) and emits
+the complete K-loop assembly: ramp-up prologue, steady-state body loop,
+and drain epilogue.
+
+Key design properties:
+  - No ``isinstance`` checks -- works purely from the scheduled op list.
+  - Waitcnts come from the scheduler, not manually computed here.
+  - Produce-first vs consume-first structure is implicit in the body
+    op ordering (determined by the scheduler).
+  - Ops with ``emit=None`` are skipped with a comment (placeholder for
+    Phase 4b wiring of actual codegen callbacks).
+"""
+from __future__ import annotations
+
+from typing import List, Optional, TYPE_CHECKING
+
+from .kloop_graph import KLoopOp, OpKind
+from .pipeline_scheduler import ScheduledPipeline
+
+if TYPE_CHECKING:
+    from ..emit.context import AsmContext
+    from ..memory.lds_stream import LDSBufferManager
+
+__all__ = ["PipelineEmitter"]
+
+
+class PipelineEmitter:
+    """Emits assembly for a K-loop from a ``ScheduledPipeline``.
+
+    The emitter is a thin code-generation layer.  All scheduling
+    decisions (op ordering, waitcnt values, produce-first vs
+    consume-first) are determined by the ``ScheduledPipeline``.
+
+    Args:
+        pipeline: Scheduled pipeline from ``PipelineScheduler``.
+        buffer_mgr: LDS buffer manager (for barrier / negate helpers).
+        ctx: Assembly emission context.
+    """
+
+    def __init__(
+        self,
+        pipeline: ScheduledPipeline,
+        buffer_mgr: 'LDSBufferManager',
+        ctx: 'AsmContext',
+    ) -> None:
+        self.pipeline = pipeline
+        self.buffer_mgr = buffer_mgr
+        self.ctx = ctx
+
+    # ── public ────────────────────────────────────────────────────
+
+    def emit(self) -> None:
+        """Emit the complete K-loop: ramp-up, body, drain."""
+        self._emit_ramp_up()
+        self._emit_body()
+        # Drain iterations are handled by the body's skip-check
+        # (producers are skipped when k_tiles is exhausted).
+        # Explicit drain stages are only needed for PGR >= 2 where
+        # the body loop exits early and extra consumer-only
+        # iterations remain.
+        if self.pipeline.drain:
+            self._emit_drain()
+
+    # ── ramp-up ───────────────────────────────────────────────────
+
+    def _emit_ramp_up(self) -> None:
+        """Emit prologue stages that prefetch tiles before the loop."""
+        ctx = self.ctx
+        pgr = self.pipeline.pgr
+        stages = self.pipeline.ramp_up
+
+        for stage_idx, stage_ops in enumerate(stages):
+            is_first = stage_idx == 0
+            is_last = stage_idx == pgr - 1
+            ctx.comment(f"Pipeline ramp-up stage {stage_idx}/{pgr}")
+
+            if is_first:
+                self._emit_ramp_up_first(stage_ops)
+            else:
+                self._emit_ramp_up_subsequent(stage_ops, stage_idx, is_last)
+
+            ctx.raw("")
+
+    def _emit_ramp_up_first(self, ops: List[KLoopOp]) -> None:
+        """Stage 0: load first tile, wait, barrier."""
+        ctx = self.ctx
+        has_writes = False
+
+        for op in ops:
+            if op.kind == OpKind.BARRIER:
+                # Drain loads before barrier.
+                ctx.s_waitcnt("vmcnt(0)", comment="wait all loads")
+                if has_writes:
+                    ctx.s_waitcnt("lgkmcnt(0)",
+                                 comment="wait LDS writes")
+                ctx.s_barrier(comment="sync tile 0")
+                continue
+            if op.kind == OpKind.DS_WRITE:
+                has_writes = True
+            self._emit_op(op)
+
+    def _emit_ramp_up_subsequent(
+        self,
+        ops: List[KLoopOp],
+        stage_idx: int,
+        is_last: bool,
+    ) -> None:
+        """Stage s > 0: guarded prefetch of next tile."""
+        ctx = self.ctx
+        skip_label = f"pgr_skip_{stage_idx}"
+
+        # Guard: skip if not enough K-tiles.
+        ctx.inst("s_cmp_le_u32", ctx.sreg("s_k_tiles"),
+                 str(stage_idx),
+                 comment=f"skip if k_tiles <= {stage_idx}")
+        ctx.inst("s_cbranch_scc1", skip_label,
+                 comment=f"not enough tiles for stage {stage_idx}")
+
+        has_writes = False
+        for op in ops:
+            if op.kind == OpKind.BARRIER:
+                # Drain loads before barrier (not for last stage in
+                # consume-first mode where body starts with barrier).
+                ctx.s_waitcnt("vmcnt(0)", comment="wait loads")
+                if has_writes:
+                    ctx.s_waitcnt("lgkmcnt(0)",
+                                 comment="wait LDS writes")
+                ctx.s_barrier(comment=f"sync tile {stage_idx}")
+                continue
+            if op.kind == OpKind.DS_WRITE:
+                has_writes = True
+            self._emit_op(op)
+
+        ctx.label(skip_label)
+
+    # ── body ──────────────────────────────────────────────────────
+
+    def _emit_body(self) -> None:
+        """Emit the steady-state K-loop body."""
+        ctx = self.ctx
+        pipeline = self.pipeline
+        body = pipeline.body
+        pgr = pipeline.pgr
+
+        ctx.label("k_loop")
+        ctx.raw("")
+
+        if pipeline.is_consume_first:
+            self._emit_body_consume_first(body, pgr)
+        else:
+            self._emit_body_produce_first(body, pgr)
+
+    def _emit_body_produce_first(
+        self, body: List[KLoopOp], pgr: int
+    ) -> None:
+        """Produce-first body: skip-check → producers → barrier → consumers.
+
+        The barrier is part of the body op list.  Producer ops
+        (iteration > 0) are wrapped in a skip-check so they're
+        elided during drain iterations.
+        """
+        ctx = self.ctx
+        waitcnts = self.pipeline.waitcnts
+
+        # k_tiles-- and skip check.
+        ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
+                  comment="k_tiles--")
+        ctx.inst("s_cmp_gt_u32", ctx.sreg("s_k_tiles"),
+                 str(pgr - 1),
+                 comment=f"k_tiles > {pgr - 1}?")
+        ctx.inst("s_cbranch_scc0", "load_skip_all",
+                 comment="skip producers (drain)")
+
+        # Emit all body ops.  Producer ops come first (before barrier)
+        # in produce-first order.
+        in_producers = True
+        for i, op in enumerate(body):
+            # Insert waitcnt if scheduled at this position.
+            if i in waitcnts:
+                ctx.s_waitcnt(waitcnts[i],
+                              comment=f"auto-wait at pos {i}")
+
+            # Emit the skip label right before the barrier (end of
+            # producer section).
+            if op.kind == OpKind.BARRIER and in_producers:
+                ctx.raw("")
+                ctx.label("load_skip_all")
+                in_producers = False
+
+            self._emit_op(op)
+
+        # If no barrier was found, emit the skip label at the end.
+        if in_producers:
+            ctx.raw("")
+            ctx.label("load_skip_all")
+
+        # Loop tail: negate DB step + branch.
+        self._emit_loop_tail()
+
+    def _emit_body_consume_first(
+        self, body: List[KLoopOp], pgr: int
+    ) -> None:
+        """Consume-first body: barrier → consumers → skip-check → producers.
+
+        Barrier is at the top of the loop, syncing loads from the
+        previous iteration.  Producers are at the bottom, wrapped
+        in a skip-check.
+        """
+        ctx = self.ctx
+        waitcnts = self.pipeline.waitcnts
+
+        # Find where producers start (first op with iteration > 0).
+        producer_start = len(body)
+        for i, op in enumerate(body):
+            if op.iteration > 0:
+                producer_start = i
+                break
+
+        # Emit consumer ops (barrier + reads + MFMAs + toggles).
+        for i in range(producer_start):
+            op = body[i]
+            if i in waitcnts:
+                ctx.s_waitcnt(waitcnts[i],
+                              comment=f"auto-wait at pos {i}")
+            self._emit_op(op)
+
+        # k_tiles-- and skip check before producers.
+        ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
+                  comment="k_tiles--")
+        ctx.inst("s_cmp_gt_u32", ctx.sreg("s_k_tiles"),
+                 str(pgr - 1),
+                 comment=f"k_tiles > {pgr - 1}?")
+        ctx.inst("s_cbranch_scc0", "load_skip_all",
+                 comment="skip producers (drain)")
+
+        # Emit producer ops.
+        for i in range(producer_start, len(body)):
+            op = body[i]
+            if i in waitcnts:
+                ctx.s_waitcnt(waitcnts[i],
+                              comment=f"auto-wait at pos {i}")
+            self._emit_op(op)
+
+        ctx.raw("")
+        ctx.label("load_skip_all")
+
+        # Loop tail.
+        self._emit_loop_tail()
+
+    # ── drain ─────────────────────────────────────────────────────
+
+    def _emit_drain(self) -> None:
+        """Emit drain iterations (consumer-only, no producers)."""
+        ctx = self.ctx
+        for d_idx, drain_ops in enumerate(self.pipeline.drain):
+            ctx.comment(f"Drain stage {d_idx}")
+            for op in drain_ops:
+                self._emit_op(op)
+            ctx.raw("")
+
+    # ── helpers ───────────────────────────────────────────────────
+
+    def _emit_op(self, op: KLoopOp) -> None:
+        """Emit a single op. Handles None callbacks gracefully."""
+        ctx = self.ctx
+        if op.kind == OpKind.BARRIER:
+            ctx.s_barrier(comment=op.comment or "barrier")
+            return
+        if op.emit is not None:
+            op.emit()
+        else:
+            # Placeholder: op not yet wired to codegen.
+            ctx.comment(f"[TODO] {op.name} ({op.kind.value})")
+
+    def _emit_loop_tail(self) -> None:
+        """Negate DB step and branch back to k_loop."""
+        ctx = self.ctx
+        self.buffer_mgr.emit_negate_step(ctx)
+        ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
+                 comment="more?")
+        ctx.inst("s_cbranch_scc1", "k_loop", comment="loop")
+        ctx.raw("")
