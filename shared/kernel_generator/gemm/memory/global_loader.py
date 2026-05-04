@@ -116,8 +116,16 @@ class DTLLoader(GlobalLoader):
                  comment="wr_b ^= db")
 
     def emit_sync(self) -> None:
-        # DTL writes to OTHER buffer; preamble reads from CURRENT.
-        pass
+        """Barrier after DTL writes land.
+
+        In consume-first mode, the caller already emits vmcnt(0)
+        before this. The barrier ensures all waves see the completed
+        DTL writes before any wave starts reading from LDS.
+
+        In produce-first mode this is redundant with the loop-tail
+        barrier, but the cost (~10 cycles) is negligible.
+        """
+        self.ctx.s_barrier(comment="sync DTL writes")
 
     @property
     def num_inflight(self) -> int:

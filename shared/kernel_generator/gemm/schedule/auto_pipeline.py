@@ -447,14 +447,11 @@ class GlobalLoadStageEmitter(StageEmitter):
             loader.advance()
             loader.toggle_write()
             loader.emit_loads()
-            if (schedule.scale_advance_op
-                    and schedule.scale_advance_op.emit):
-                schedule.scale_advance_op.emit()
-            if (schedule.prologue_scale_ops and scale_loader
-                    and not scale_loader.has_cross_iter_prefetch):
-                for op in schedule.prologue_scale_ops:
-                    if op.emit:
-                        op.emit()
+            # Do NOT advance or reload scales here.  Stage 0 loaded
+            # scales for tile 0; the produce phase of each K-loop
+            # iteration will advance the scale SRD and reload scales,
+            # keeping them aligned with the consume order.  Loading
+            # scales here would overwrite tile 0's values prematurely.
             ctx.label(f"pgr_skip_{stage_index}")
 
     def emit_produce(self, ctx):
