@@ -2,9 +2,6 @@
 
 Separates work distribution, compute, and output into independent
 components following the CK/TensileLite/Triton pattern.
-
-The K-loop compute is handled by AutoPipelinedCompute (see
-auto_pipeline.py), composed via KernelPipeline.
 """
 from __future__ import annotations
 
@@ -107,20 +104,7 @@ class KernelPipeline:
 
 
 def pipeline_kloop_phase(level, ctx) -> None:
-    """Phase function using KernelPipeline architecture.
-
-    Default pipeline routes through v2 (unified stream architecture).
-    Pass ``pipeline_strategy="v1"`` or ``AutoPipelinedCompute`` to
-    use the legacy v1 path.
-    """
-    strategy = ctx._metadata.get("pipeline_strategy")
-
-    # Explicit v1 request
-    from .auto_pipeline import AutoPipelinedCompute
-    if strategy == "v1" or strategy is AutoPipelinedCompute:
-        return _v1_kloop_phase(level, ctx)
-
-    # Default: v2 (unified stream architecture)
+    """Phase function: unified stream architecture K-loop."""
     return pipeline_v2_kloop_phase(level, ctx)
 
 
@@ -168,19 +152,6 @@ def _build_loader_reader_scale(ctx):
             loader.attach_scale_loader(scale_loader)
 
     return loader, reader, scale_loader, pgr, use_lds_scales
-
-
-def _v1_kloop_phase(level, ctx) -> None:
-    """Legacy v1 path using AutoPipelinedCompute."""
-    from .auto_pipeline import AutoPipelinedCompute
-
-    loader, reader, scale_loader, pgr, _ = _build_loader_reader_scale(ctx)
-    compute = AutoPipelinedCompute(loader, reader, scale_loader, pgr=pgr)
-    pipeline = KernelPipeline(
-        partitioner=GridPartitioner(),
-        compute=compute,
-    )
-    pipeline.emit(ctx)
 
 
 # ===================================================================
