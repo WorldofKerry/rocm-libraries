@@ -22,6 +22,7 @@ __all__ = [
 class OpKind(Enum):
     MFMA = "mfma"
     DS_READ = "ds_read"
+    DS_WRITE = "ds_write"
     GLOBAL_LOAD = "global_load"
     BARRIER = "barrier"
     SCALAR = "scalar"
@@ -50,7 +51,7 @@ class KLoopOp:
 
     def __post_init__(self):
         if self.hw_counter is None:
-            if self.kind == OpKind.DS_READ:
+            if self.kind in (OpKind.DS_READ, OpKind.DS_WRITE):
                 self.hw_counter = "lgkmcnt"
             elif self.kind in (OpKind.GLOBAL_LOAD, OpKind.SCALE_LOAD):
                 self.hw_counter = "vmcnt"
