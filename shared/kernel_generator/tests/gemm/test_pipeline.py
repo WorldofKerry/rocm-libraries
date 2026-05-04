@@ -136,11 +136,11 @@ class TestPhaseReplacement:
 
     def test_replace_scheduled_k_loop(self):
         """Replace the scheduled_k_loop phase with a marker."""
-        from kernel_generator.gemm.schedule.kloop_scheduler import scheduled_kloop_phase
+        from kernel_generator.gemm.schedule.pipeline import pipeline_kloop_phase
 
         def custom_kloop(level, ctx):
             ctx.comment("CUSTOM_MARKER")
-            scheduled_kloop_phase(level, ctx)
+            pipeline_kloop_phase(level, ctx)
 
         kernel = GemmKernel.build(GemmProblem(256, 256, 64))
         kernel.tile_tree = kernel.tile_tree.replace_phase(

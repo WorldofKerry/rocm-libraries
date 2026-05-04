@@ -109,12 +109,28 @@ class KernelPipeline:
 def pipeline_kloop_phase(level, ctx) -> None:
     """Phase function using KernelPipeline architecture.
 
-    Drop-in replacement for scheduled_kloop_phase.
-    Dispatches to v2 path when pipeline_strategy="v2".
+    Default pipeline routes through v2 (unified stream architecture).
+    Pass ``pipeline_strategy="v1"`` or ``AutoPipelinedCompute`` to
+    use the legacy v1 path.
     """
-    if ctx._metadata.get("pipeline_strategy") == "v2":
-        return pipeline_v2_kloop_phase(level, ctx)
+    strategy = ctx._metadata.get("pipeline_strategy")
 
+    # Explicit v1 request
+    from .auto_pipeline import AutoPipelinedCompute
+    if strategy == "v1" or strategy is AutoPipelinedCompute:
+        return _v1_kloop_phase(level, ctx)
+
+    # Default: v2 (unified stream architecture)
+    return pipeline_v2_kloop_phase(level, ctx)
+
+
+# ── Shared helpers ────────────────────────────────────────────────
+
+def _build_loader_reader_scale(ctx):
+    """Construct the loader, reader, and scale_loader from ctx metadata.
+
+    Returns (loader, reader, scale_loader, pgr, use_lds_scales).
+    """
     tile = ctx._metadata["tile"]
     problem = ctx._metadata["problem"]
     use_dtl = ctx._metadata.get("use_dtl", True)
@@ -132,7 +148,6 @@ def pipeline_kloop_phase(level, ctx) -> None:
         if use_lds_scales:
             from ..memory.scale_loader import LDSScaleLoader
             lds_data_half = ctx._metadata.get("lds_data_half", 0)
-            # Scale LDS starts after data within each buffer
             scale_loader = LDSScaleLoader(ctx, tile,
                                           lds_scale_offset=lds_data_half)
         else:
@@ -142,8 +157,7 @@ def pipeline_kloop_phase(level, ctx) -> None:
 
     pgr_raw = ctx._metadata.get("pgr", None)
     if pgr_raw is None:
-        pgr2 = ctx._metadata.get("pgr2", False)
-        pgr = 2 if pgr2 else 1
+        pgr = 2 if ctx._metadata.get("pgr2", False) else 1
     else:
         pgr = int(pgr_raw)
 
@@ -153,9 +167,15 @@ def pipeline_kloop_phase(level, ctx) -> None:
         if isinstance(loader, _DTL):
             loader.attach_scale_loader(scale_loader)
 
-    from .auto_pipeline import AutoPipelinedCompute
-    compute = AutoPipelinedCompute(loader, reader, scale_loader, pgr=pgr)
+    return loader, reader, scale_loader, pgr, use_lds_scales
 
+
+def _v1_kloop_phase(level, ctx) -> None:
+    """Legacy v1 path using AutoPipelinedCompute."""
+    from .auto_pipeline import AutoPipelinedCompute
+
+    loader, reader, scale_loader, pgr, _ = _build_loader_reader_scale(ctx)
+    compute = AutoPipelinedCompute(loader, reader, scale_loader, pgr=pgr)
     pipeline = KernelPipeline(
         partitioner=GridPartitioner(),
         compute=compute,
@@ -364,48 +384,13 @@ class StreamKPartitioner(TilePartitioner):
 def pipeline_v2_kloop_phase(level, ctx) -> None:
     """Phase function using the new unified stream architecture.
 
-    Uses LDSStream + LDSBufferManager + PipelineScheduler + PipelineEmitter
-    instead of the old AutoPipelinedCompute + SoftwarePipeline.
-
-    Set ``ctx._metadata["pipeline_v2"] = True`` to activate.
+    Default pipeline strategy. Uses LDSStream + LDSBufferManager +
+    PipelineScheduler + PipelineEmitter.
     """
     tile = ctx._metadata["tile"]
-    problem = ctx._metadata["problem"]
-    use_dtl = ctx._metadata.get("use_dtl", True)
 
-    # Build old-style loader/reader (still needed for actual codegen)
-    loader_cls = ctx._metadata.get("loader_cls",
-                                   DTLLoader if use_dtl else BufferLoader)
-    loader = loader_cls(ctx, tile, problem)
-    swizzle = ctx._metadata.get("swizzle", None)
-    reader = LDSReader(ctx, tile, problem, swizzle=swizzle)
-
-    # Build scale loader (old-style, for codegen delegation)
-    scale_loader = None
-    use_real_scales = ctx._metadata.get("use_real_scales", False)
-    use_lds_scales = ctx._metadata.get("use_lds_scales", False)
-    if use_real_scales and tile.mfma.is_mx:
-        if use_lds_scales:
-            from ..memory.scale_loader import LDSScaleLoader
-            lds_data_half = ctx._metadata.get("lds_data_half", 0)
-            scale_loader = LDSScaleLoader(ctx, tile,
-                                          lds_scale_offset=lds_data_half)
-        else:
-            from ..memory.scale_loader import VMEMScaleLoader
-            swizzled = ctx._metadata.get("swizzled_scales", False)
-            scale_loader = VMEMScaleLoader(ctx, tile, swizzled=swizzled)
-
-    pgr_raw = ctx._metadata.get("pgr", None)
-    if pgr_raw is None:
-        pgr = 2 if ctx._metadata.get("pgr2", False) else 1
-    else:
-        pgr = int(pgr_raw)
-
-    # Attach scale loader for integrated loads (same as v1)
-    if use_lds_scales and scale_loader is not None:
-        from ..memory.global_loader import DTLLoader as _DTL
-        if isinstance(loader, _DTL):
-            loader.attach_scale_loader(scale_loader)
+    loader, reader, scale_loader, pgr, use_lds_scales = \
+        _build_loader_reader_scale(ctx)
 
     # --- New architecture ---
     from ..memory.streams import DTLDataStream, ScaleStream
@@ -415,6 +400,8 @@ def pipeline_v2_kloop_phase(level, ctx) -> None:
     from .pipeline_emitter import PipelineEmitter
     from .emit_wiring import wire_emit_callbacks
     from ..memory.mfma_emitter import MFMAEmitter
+
+    problem = ctx._metadata["problem"]
 
     # Scale streams first so scale loads issue before DTL loads.
     # This avoids vmcnt(0) stalls before scale ds_writes:

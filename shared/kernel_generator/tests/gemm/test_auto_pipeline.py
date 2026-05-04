@@ -101,7 +101,7 @@ class TestAutoVsManualAssembly:
     def test_pgr1_identical(self, dtype):
         p = GemmProblem(4096, 4096, 4096, dtype=dtype)
         auto = GemmKernel.build(p, pipeline_strategy=AutoPipelinedCompute, pgr=1)
-        manual = GemmKernel.build(p, pgr=1)
+        manual = GemmKernel.build(p, pipeline_strategy='v1', pgr=1)
 
         auto_inst = _strip_instructions(auto.emit().asm_text)
         manual_inst = _strip_instructions(manual.emit().asm_text)
@@ -112,7 +112,7 @@ class TestAutoVsManualAssembly:
     def test_pgr2_identical(self, dtype):
         p = GemmProblem(4096, 4096, 4096, dtype=dtype)
         auto = GemmKernel.build(p, pipeline_strategy=AutoPipelinedCompute, pgr=2)
-        manual = GemmKernel.build(p, pgr=2)
+        manual = GemmKernel.build(p, pipeline_strategy='v1', pgr=2)
 
         auto_inst = _strip_instructions(auto.emit().asm_text)
         manual_inst = _strip_instructions(manual.emit().asm_text)
@@ -124,7 +124,7 @@ class TestAutoVsManualAssembly:
         p = GemmProblem(128, 128, 256, dtype=DataType.MXFP4)
         auto = GemmKernel.build(p, tiling=tiling,
                                 pipeline_strategy=AutoPipelinedCompute)
-        manual = GemmKernel.build(p, tiling=tiling)
+        manual = GemmKernel.build(p, tiling=tiling, pipeline_strategy='v1')
 
         auto_inst = _strip_instructions(auto.emit().asm_text)
         manual_inst = _strip_instructions(manual.emit().asm_text)
@@ -135,7 +135,7 @@ class TestAutoVsManualAssembly:
         p = GemmProblem(4096, 4096, 4096, dtype=DataType.MXFP4)
         auto = GemmKernel.build(p, tiling=tiling,
                                 pipeline_strategy=AutoPipelinedCompute)
-        manual = GemmKernel.build(p, tiling=tiling)
+        manual = GemmKernel.build(p, tiling=tiling, pipeline_strategy='v1')
 
         auto_inst = _strip_instructions(auto.emit().asm_text)
         manual_inst = _strip_instructions(manual.emit().asm_text)

@@ -212,6 +212,14 @@ class PipelineEmitter:
                               comment=f"auto-wait at pos {i}")
             # Before barrier: drain any LDS writes from producers
             if body[i].kind == OpKind.BARRIER:
+                # DTL loads must complete before barrier so LDS
+                # data is visible to all waves after sync.
+                has_global_loads = any(
+                    op.kind == OpKind.GLOBAL_LOAD
+                    for op in body[pre_body_count:barrier_pos])
+                if has_global_loads:
+                    ctx.s_waitcnt("vmcnt(0)",
+                                  comment="wait DTL loads")
                 has_ds_writes = any(
                     op.kind == OpKind.DS_WRITE
                     for op in body[pre_body_count:barrier_pos])
