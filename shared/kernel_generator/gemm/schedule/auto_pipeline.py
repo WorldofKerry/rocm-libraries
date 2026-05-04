@@ -273,8 +273,14 @@ class SoftwarePipeline:
         self._emit_loop_tail(ctx, emitters)
 
     def _emit_body_consume_first(self, ctx, emitters, pgr):
-        """Body: barrier -> pre-body -> R+M -> lgkmcnt(0) -> G."""
-        # Barrier first
+        """Body: barrier -> pre-body -> R+M -> lgkmcnt(0) -> G.
+
+        The barrier at the top syncs DTL loads from the previous
+        iteration. The producer (DTL loads) at the bottom overlaps
+        with the barrier stall at the top of the next iteration.
+        No barrier is needed at the bottom.
+        """
+        # Barrier first (syncs loads from previous iteration)
         self._emit_sync(ctx, emitters)
 
         # Pre-body ops from consumer (early B reads)
@@ -313,7 +319,16 @@ class SoftwarePipeline:
         self._emit_loop_tail(ctx, emitters)
 
     def _emit_sync(self, ctx, emitters):
-        """Emit barrier between producer and consumer stages."""
+        """Emit barrier between producer and consumer stages.
+
+        In consume-first mode (loads_before_reads=False), this runs at
+        the top of the loop and must wait for DTL loads from the
+        previous iteration to complete (vmcnt) before the barrier.
+        """
+        if not self.loads_before_reads:
+            # Consume-first: vmcnt(0) to drain DTL loads from prev iter
+            ctx.s_waitcnt("vmcnt(0)",
+                          comment="wait DTL loads from prev iteration")
         # Check if any emitter has a custom sync; otherwise s_barrier
         for s in self.producer_stages:
             if s.name in emitters:
@@ -326,8 +341,11 @@ class SoftwarePipeline:
     def _emit_loop_tail(self, ctx, emitters=None):
         """Emit loop branch back.
 
-        If any producer emitter has cross_iter_prefetch, use an
-        exit-branch pattern to skip prefetch on the last iteration.
+        In consume-first mode (loads_before_reads=False), the barrier
+        is at the top of the loop, so we skip it here to avoid
+        double-barrier overhead. The DTL loads issued at the end of
+        this iteration will be synced by the barrier at the top of
+        the next iteration.
         """
         has_cross_iter_pf = False
         if emitters:
@@ -339,7 +357,8 @@ class SoftwarePipeline:
                         has_cross_iter_pf = True
                         break
 
-        ctx.s_barrier(comment="sync")
+        if self.loads_before_reads:
+            ctx.s_barrier(comment="sync")
         ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
                  comment="more?")
         if has_cross_iter_pf:
