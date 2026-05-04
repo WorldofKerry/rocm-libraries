@@ -156,10 +156,11 @@ class TestMXFP4Kernel:
         kernel = self._build_mxfp4_kernel()
         result = kernel.emit()
         # 128x128x256 tile, 0.5 bytes/elem, double-buffered
-        # lds_half = (128+128) * 256 * 0.5 = 32768
-        # lds_total = 32768 * 2 = 65536
-        # 65536 data + 4096 scale (2x 1024 per half-buffer, doubled)
-        assert result.lds_bytes == 65536
+        # lds_data_half = (128+128) * 256 * 0.5 = 32768
+        # lds_scale_half = 4096 (scale A) + 4096 (scale B) = 8192
+        # lds_half_total = 32768 + 8192 = 40960
+        # lds_total = 40960 * 2 = 81920 (with DTL scale LDS regions)
+        assert result.lds_bytes == 81920
 
     def test_accumulators(self):
         """Accumulator count matches tile config."""

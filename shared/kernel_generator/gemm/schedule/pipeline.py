@@ -123,10 +123,19 @@ def pipeline_kloop_phase(level, ctx) -> None:
 
     scale_loader = None
     use_real_scales = ctx._metadata.get("use_real_scales", False)
+    use_lds_scales = ctx._metadata.get("use_lds_scales", False)
     if use_real_scales and tile.mfma.is_mx:
-        from ..memory.scale_loader import VMEMScaleLoader
-        swizzled = ctx._metadata.get("swizzled_scales", False)
-        scale_loader = VMEMScaleLoader(ctx, tile, swizzled=swizzled)
+        if use_lds_scales:
+            from ..memory.scale_loader import LDSScaleLoader
+            lds_data_half = ctx._metadata.get("lds_data_half", 0)
+            # Scale LDS starts after BOTH data buffers
+            lds_data_total = lds_data_half * 2
+            scale_loader = LDSScaleLoader(ctx, tile,
+                                          lds_scale_offset=lds_data_total)
+        else:
+            from ..memory.scale_loader import VMEMScaleLoader
+            swizzled = ctx._metadata.get("swizzled_scales", False)
+            scale_loader = VMEMScaleLoader(ctx, tile, swizzled=swizzled)
 
     pgr_raw = ctx._metadata.get("pgr", None)
     if pgr_raw is None:
@@ -134,6 +143,12 @@ def pipeline_kloop_phase(level, ctx) -> None:
         pgr = 2 if pgr2 else 1
     else:
         pgr = int(pgr_raw)
+
+    # Attach LDS scale loader to DTL loader for integrated DTL loads
+    if use_lds_scales and scale_loader is not None:
+        from ..memory.global_loader import DTLLoader as _DTL
+        if isinstance(loader, _DTL):
+            loader.attach_scale_loader(scale_loader)
 
     from .auto_pipeline import AutoPipelinedCompute
     compute = AutoPipelinedCompute(loader, reader, scale_loader, pgr=pgr)

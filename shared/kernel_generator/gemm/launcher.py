@@ -387,6 +387,10 @@ class GemmLauncher:
             scale_b_cols = p.k // mx_block
             scale_a_bytes = p.m * scale_a_cols
             scale_b_bytes = p.n * scale_b_cols
+            # Pad to DTL load coverage (256 threads × 16 bytes = 4096)
+            # to avoid OOB reads when scale data < 4096 bytes.
+            scale_a_bytes = max(scale_a_bytes, 4096)
+            scale_b_bytes = max(scale_b_bytes, 4096)
             _check(hip.hipMalloc(ctypes.byref(d_scale_A), scale_a_bytes),
                    "hipMalloc scale_A")
             _check(hip.hipMalloc(ctypes.byref(d_scale_B), scale_b_bytes),

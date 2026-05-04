@@ -329,8 +329,9 @@ class GlobalLoadBlock(BuildingBlock):
 class ScaleBlock(BuildingBlock):
     """Declares MX scale load operations as individual graph ops.
 
-    Registers ``scale_a_m{mi}_k{ki}`` and ``scale_b_n{ni}_k{ki}`` ops
-    of kind ``SCALE_LOAD`` with proper dependencies:
+    Registers ``scale_a_m{mi}_k{ki}`` and ``scale_b_n{ni}_k{ki}`` ops.
+    Kind is ``SCALE_LOAD`` (vmcnt) for VMEMScaleLoader or
+    ``DS_READ`` (lgkmcnt) for LDSScaleLoader, with proper dependencies:
 
     - RAW dep: each scale load -> every MFMA that consumes it.
       (``scale_a_m{mi}_k{ki}`` -> ``mfma_m{mi}_n{*}_k{ki}``)
@@ -371,6 +372,11 @@ class ScaleBlock(BuildingBlock):
         ki_count = tile.k_iterations
         partition_m = min(self.partition_m, mr)
 
+        # Detect LDS-based scale loader (ds_read instead of buffer_load)
+        from ..memory.scale_loader import LDSScaleLoader as _LDS
+        is_lds = isinstance(sl, _LDS)
+        scale_op_kind = OpKind.DS_READ if is_lds else OpKind.SCALE_LOAD
+
         # Register scale-A loads for each (mi, ki)
         for mi in range(mr):
             for ki in range(ki_count):
@@ -382,7 +388,7 @@ class ScaleBlock(BuildingBlock):
                     return emit
 
                 graph.add_op(KLoopOp(
-                    name=name, kind=OpKind.SCALE_LOAD,
+                    name=name, kind=scale_op_kind,
                     emit=_mk_emit_a(),
                     comment=f"scale_load A mi={mi} ki={ki}"))
 
@@ -405,7 +411,7 @@ class ScaleBlock(BuildingBlock):
                     return emit
 
                 graph.add_op(KLoopOp(
-                    name=name, kind=OpKind.SCALE_LOAD,
+                    name=name, kind=scale_op_kind,
                     emit=_mk_emit_b(),
                     comment=f"scale_load B ni={ni} ki={ki}"))
 
@@ -418,7 +424,9 @@ class ScaleBlock(BuildingBlock):
                     graph.add_dep(name, mfma_name, DepKind.RAW)
 
         # Register scale SRD advance for next iteration (iteration=1)
-        if hasattr(sl, 'advance'):
+        # Skip for LDS scales: DTLLoader.advance() handles scale SRD
+        # advance as part of the global load advance.
+        if hasattr(sl, 'advance') and not is_lds:
             def _emit_scale_advance():
                 sl.advance()
 
@@ -427,11 +435,6 @@ class ScaleBlock(BuildingBlock):
                 _emit_scale_advance, iteration=1,
                 comment="advance scale SRDs"))
 
-            # Scale advance must happen before next-iter scale loads,
-            # but we don't register next-iter scale loads separately --
-            # they reuse the same scale_a/b ops on the next iteration.
-            # The advance just needs to happen before the barrier that
-            # gates the next iteration's scale loads.
             graph.add_dep("advance_scale", "barrier", DepKind.SYNC)
 
 
@@ -466,6 +469,11 @@ class SuffixBlock(BuildingBlock):
 
         def _emit_toggle():
             reader.toggle_read()
+            # Also toggle scale LDS read bases if using LDS scales
+            if sl is not None:
+                from ..memory.scale_loader import LDSScaleLoader as _LDS
+                if isinstance(sl, _LDS):
+                    sl.toggle_read()
 
         graph.add_op(KLoopOp(
             "suffix_vmcnt", OpKind.WAIT, _emit_vmcnt,

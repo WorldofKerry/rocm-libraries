@@ -168,6 +168,7 @@ class GemmKernel:
         )
         # Derive real scales from data type (MX types always need scales)
         k.use_real_scales = problem.dtype.value == 'mxfp4'
+        k.use_lds_scales = k.use_real_scales and use_dtl  # DTL scales when using DTL data
         k.use_dtl = use_dtl
         k.pgr2 = pgr2
         k.pgr = pgr if pgr > 1 else (2 if pgr2 else 1)
@@ -202,13 +203,26 @@ class GemmKernel:
         else:
             lds_half = int((tile.wg_m + tile.wg_n) * lds_row_stride * elem)
 
-        # No scale LDS regions needed -- scales loaded directly from global memory
-        lds_scale_half = 0
+        # Scale LDS regions: when using DTL scales, allocate LDS for
+        # scale A and scale B (each padded to 4096 for full DTL coverage).
+        use_lds_scales = getattr(self, 'use_lds_scales', False)
+        if use_lds_scales and tile.mfma.is_mx:
+            mx_block = tile.mfma.mx_block
+            # Pad to 256 threads × 16 bytes = 4096
+            scale_a_lds = max(tile.wg_m * (tile.unroll_k // mx_block), 4096)
+            scale_b_lds = max(tile.wg_n * (tile.unroll_k // mx_block), 4096)
+            lds_scale_half = scale_a_lds + scale_b_lds
+        else:
+            lds_scale_half = 0
 
-        # Double LDS for double-buffered mode
+        # Double-buffered LDS: data uses power-of-2 DB step,
+        # scale regions appended after BOTH data buffers.
         is_db = any(p.name in ("scheduled_k_loop",)
                      for p in self.tile_tree.prologue_phases)
-        lds_total = lds_half * 2 if is_db else lds_half
+        lds_data_total = lds_half * 2 if is_db else lds_half
+        # Scale LDS: 2 copies (double-buffered) after data
+        lds_scale_total = lds_scale_half * 2 if (is_db and lds_scale_half > 0) else lds_scale_half
+        lds_total = lds_data_total + lds_scale_total
 
         ctx = AsmContext()
         ctx._metadata = {
@@ -218,8 +232,9 @@ class GemmKernel:
             "kernel": self,
             "use_dtl": getattr(self, 'use_dtl', True),
             "use_real_scales": getattr(self, 'use_real_scales', False),
+            "use_lds_scales": getattr(self, 'use_lds_scales', False),
             "lds_scale_half": lds_scale_half,
-            "lds_data_half": lds_half - lds_scale_half,
+            "lds_data_half": lds_half,  # data portion (scales appended after)
             "use_1d_grid": getattr(self, "use_1d_grid", False),
             "swizzled_scales": getattr(self, "swizzled_scales", False),
             "pgr2": getattr(self, "pgr2", False),

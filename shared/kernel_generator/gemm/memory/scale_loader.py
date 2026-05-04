@@ -529,3 +529,314 @@ class VMEMScaleLoader(ScaleLoader):
                      ctx.vreg(sa_name), ctx.vreg(sb_name),
                      f"cbsz:{mfma.cbsz} blgp:{mfma.blgp}",
                      comment=f"MFMA m{mi}_n{ni}_k{ki}")
+
+
+# ---------------------------------------------------------------------------
+# LDS-based (DTL) implementation
+# ---------------------------------------------------------------------------
+
+class LDSScaleLoader(ScaleLoader):
+    """Loads pre-swizzled MX scales via DTL into LDS, reads via ds_read_b32.
+
+    Uses the AITER pre-swizzled scale layout (``--mx-scale-format 1``).
+    Scale data is packed into 256-byte groups:
+
+        group[g] = 256 bytes = 64 lanes × 4 bytes/lane
+        byte layout per lane: [mi_even_ki0, mi_odd_ki0, mi_even_ki1, mi_odd_ki1]
+
+    Per matrix: 4 groups (g0..g3 covering mi=0..7 or ni=0..7).
+    Per wave partition: 1024 bytes (4 groups × 256).
+
+    DTL loads 4096 bytes per matrix (1 load, 256 threads × 16 bytes).
+    ds_read_b32 reads 4 bytes per group (4 reads per matrix = 8 total).
+    MFMA uses op_sel/op_sel_hi to select the correct byte.
+
+    Args:
+        ctx: AsmContext for register allocation and emission.
+        tile: TileConfig describing the macro-tile geometry.
+        lds_scale_offset: Byte offset of scale A region within one
+            LDS buffer (typically = lds_data_half).
+    """
+
+    def __init__(self, ctx: AsmContext, tile: TileConfig,
+                 lds_scale_offset: int = 0) -> None:
+        self._ctx = ctx
+        self._tile = tile
+        self._mfma = tile.mfma
+        self._mr = tile.mfma_m_repeat
+        self._nr = tile.mfma_n_repeat
+        self._ki_count = tile.k_iterations
+        self._mx_block = self._mfma.mx_block
+
+        # Scale region sizes (4096 bytes each, matching DTL coverage)
+        self._scale_a_lds_size = 4096
+        self._scale_b_lds_size = 4096
+        self._scale_a_lds_off = lds_scale_offset
+        self._scale_b_lds_off = lds_scale_offset + self._scale_a_lds_size
+
+        # K-stride for SRD advance: pre-swizzled layout uses 256 bytes
+        # per d3 stride (see AITER e8m0_shuffle format)
+        self._scale_k_stride = 256
+
+        # Scale VGPR names: 2 groups per matrix (g0, g1 for A; g0, g1 for B)
+        # Each group covers 2 mi (or ni) values × 2 ki values = 4 bytes
+        self._scale_a_names: Dict[tuple, str] = {}
+        self._scale_b_names: Dict[tuple, str] = {}
+        self._num_groups = (self._mr + 1) // 2  # groups for A
+
+    @property
+    def scale_lds_size(self) -> int:
+        """Total LDS bytes for scales (A + B), one buffer."""
+        return self._scale_a_lds_size + self._scale_b_lds_size
+
+    @property
+    def scale_k_stride(self) -> int:
+        return self._scale_k_stride
+
+    @property
+    def scale_names_a(self) -> dict:
+        return dict(self._scale_a_names)
+
+    @property
+    def scale_names_b(self) -> dict:
+        return dict(self._scale_b_names)
+
+    def alloc_registers(self) -> None:
+        """Allocate VGPRs: 1 per group (2 mi/ni per group)."""
+        ctx = self._ctx
+        mr, nr, ki_count = self._mr, self._nr, self._ki_count
+        num_groups_a = (mr + 1) // 2
+        num_groups_b = (nr + 1) // 2
+
+        for g in range(num_groups_a):
+            name = f"v_scale_a_g{g}"
+            if not ctx.has(name):
+                ctx.alloc_vgpr_permanent(1, name)
+            for mi_in_g in range(2):
+                mi = g * 2 + mi_in_g
+                if mi < mr:
+                    for ki in range(ki_count):
+                        self._scale_a_names[(mi, ki)] = name
+
+        for g in range(num_groups_b):
+            name = f"v_scale_b_g{g}"
+            if not ctx.has(name):
+                ctx.alloc_vgpr_permanent(1, name)
+            for ni_in_g in range(2):
+                ni = g * 2 + ni_in_g
+                if ni < nr:
+                    for ki in range(ki_count):
+                        self._scale_b_names[(ni, ki)] = name
+
+    def emit_setup(self) -> None:
+        """Set up scale DTL voffsets and ds_read base VGPRs.
+
+        DTL voffset: tid * 16 (contiguous read from pre-swizzled buffer).
+        ds_read base: wave_partition_offset + laneId * 4 + lds_scale_base.
+        """
+        ctx = self._ctx
+        tile = self._tile
+
+        # DTL voffset: tid * 16
+        ctx.comment("Scale DTL voffset (pre-swizzled): tid * 16")
+        if not ctx.has("v_dtl_off_scale_a_lds"):
+            ctx.alloc_vgpr_permanent(1, "v_dtl_off_scale_a_lds")
+        ctx.v_lshl(ctx.vreg("v_dtl_off_scale_a_lds"),
+                   ctx.vreg("v_tid"), 4,
+                   comment="scale DTL voff = tid * 16")
+        if not ctx.has("v_dtl_off_scale_b_lds"):
+            ctx.alloc_vgpr_permanent(1, "v_dtl_off_scale_b_lds")
+        ctx.inst("v_mov_b32", ctx.vreg("v_dtl_off_scale_b_lds"),
+                 ctx.vreg("v_dtl_off_scale_a_lds"),
+                 comment="scale B DTL voff = same")
+        ctx.raw("")
+
+        # ds_read base: wave_partition * 1024 + laneId * 4 + lds_base
+        ctx.comment("Scale ds_read base (pre-swizzled LDS)")
+        if not ctx.has("v_scale_rd_a"):
+            ctx.alloc_vgpr_permanent(1, "v_scale_rd_a")
+        if not ctx.has("v_scale_rd_b"):
+            ctx.alloc_vgpr_permanent(1, "v_scale_rd_b")
+
+        # laneId = serial % 64
+        ctx.inst("v_and_b32", ctx.vreg("v_tmp0"),
+                 ctx.vreg("v_lane_id"), "63",
+                 comment="laneId = lane_id & 63")
+        ctx.v_lshl(ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"), 2,
+                    comment="laneId * 4")
+
+        # wave_m partition: waveId_m * 1024
+        ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_wave_m"), 10,
+                    comment="wave_m * 1024 (partition offset)")
+        ctx.v_add(ctx.vreg("v_scale_rd_a"), ctx.vreg("v_tmp0"),
+                  ctx.vreg("v_tmp1"),
+                  comment="laneId*4 + partition_m")
+        ctx.s_mov(ctx.sreg("s_tmp0"), str(self._scale_a_lds_off),
+                  comment=f"scale_a_lds_off = {self._scale_a_lds_off}")
+        ctx.v_add(ctx.vreg("v_scale_rd_a"), ctx.vreg("v_scale_rd_a"),
+                  ctx.sreg("s_tmp0"),
+                  comment="+ lds_base_a")
+
+        # wave_n partition: waveId_n * 1024
+        ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_wave_n"), 10,
+                    comment="wave_n * 1024 (partition offset)")
+        ctx.v_add(ctx.vreg("v_scale_rd_b"), ctx.vreg("v_tmp0"),
+                  ctx.vreg("v_tmp1"),
+                  comment="laneId*4 + partition_n")
+        ctx.s_mov(ctx.sreg("s_tmp0"), str(self._scale_b_lds_off),
+                  comment=f"scale_b_lds_off = {self._scale_b_lds_off}")
+        ctx.v_add(ctx.vreg("v_scale_rd_b"), ctx.vreg("v_scale_rd_b"),
+                  ctx.sreg("s_tmp0"),
+                  comment="+ lds_base_b")
+        ctx.raw("")
+
+    # -- DTL emission -------------------------------------------------------
+
+    def emit_dtl_loads(self) -> None:
+        """Emit DTL loads for pre-swizzled scale A and B into LDS."""
+        ctx = self._ctx
+        ctx.inst("s_mov_b32", "m0",
+                 ctx.sreg("s_lds_wr_scale_a"),
+                 comment="m0 = LDS scale A write base")
+        ctx.inst("buffer_load_dwordx4",
+                 ctx.vreg("v_dtl_off_scale_a_lds"),
+                 ctx.sreg("s_srd_scale_a", 0, 4),
+                 "0", "offen offset:0, lds",
+                 comment="DTL scale A (pre-swizzled)")
+        ctx.inst("s_mov_b32", "m0",
+                 ctx.sreg("s_lds_wr_scale_b"),
+                 comment="m0 = LDS scale B write base")
+        ctx.inst("buffer_load_dwordx4",
+                 ctx.vreg("v_dtl_off_scale_b_lds"),
+                 ctx.sreg("s_srd_scale_b", 0, 4),
+                 "0", "offen offset:0, lds",
+                 comment="DTL scale B (pre-swizzled)")
+
+    def toggle_write(self) -> None:
+        """Toggle scale LDS write bases for double-buffering."""
+        ctx = self._ctx
+        ctx.inst("s_xor_b32", ctx.sreg("s_lds_wr_scale_a"),
+                 ctx.sreg("s_lds_wr_scale_a"),
+                 ctx.sreg("s_scale_db_swap"),
+                 comment="wr_scale_a ^= swap")
+        ctx.inst("s_xor_b32", ctx.sreg("s_lds_wr_scale_b"),
+                 ctx.sreg("s_lds_wr_scale_b"),
+                 ctx.sreg("s_scale_db_swap"),
+                 comment="wr_scale_b ^= swap")
+
+    def toggle_read(self) -> None:
+        """Toggle scale ds_read base VGPRs for double-buffering."""
+        ctx = self._ctx
+        ctx.inst("v_xor_b32", ctx.vreg("v_scale_rd_a"),
+                 ctx.sreg("s_scale_db_swap"),
+                 ctx.vreg("v_scale_rd_a"),
+                 comment="scale_rd_a ^= swap")
+        ctx.inst("v_xor_b32", ctx.vreg("v_scale_rd_b"),
+                 ctx.sreg("s_scale_db_swap"),
+                 ctx.vreg("v_scale_rd_b"),
+                 comment="scale_rd_b ^= swap")
+
+    # -- ds_read emission ---------------------------------------------------
+
+    def emit_read_a(self, mi: int, ki: int) -> None:
+        """Emit ds_read_b32 for scale A group containing (mi, ki)."""
+        # Only emit for primary mi in each group (mi % 2 == 0)
+        if mi % 2 != 0:
+            return
+        group = mi // 2
+        ctx = self._ctx
+        offset = group * 256
+        name = f"v_scale_a_g{group}"
+        ctx.ds_read(ctx.vreg(name), ctx.vreg("v_scale_rd_a"),
+                    offset=offset, width=1,
+                    comment=f"scale A group{group} (mi={mi},{mi+1})")
+
+    def emit_read_b(self, ni: int, ki: int) -> None:
+        """Emit ds_read_b32 for scale B group containing (ni, ki)."""
+        if ni % 2 != 0:
+            return
+        group = ni // 2
+        ctx = self._ctx
+        offset = group * 256
+        name = f"v_scale_b_g{group}"
+        ctx.ds_read(ctx.vreg(name), ctx.vreg("v_scale_rd_b"),
+                    offset=offset, width=1,
+                    comment=f"scale B group{group} (ni={ni},{ni+1})")
+
+    # -- SRD advance --------------------------------------------------------
+
+    def advance(self) -> None:
+        """Advance both scale SRDs by scale_k_stride bytes."""
+        ctx = self._ctx
+        stride = self._scale_k_stride
+        for srd_name in ["s_srd_scale_a", "s_srd_scale_b"]:
+            ctx.inst("s_add_u32", ctx.sreg(srd_name, 0, 1),
+                     ctx.sreg(srd_name, 0, 1), str(stride),
+                     comment=f"{srd_name} += {stride}")
+            ctx.inst("s_addc_u32", ctx.sreg(srd_name, 1, 1),
+                     ctx.sreg(srd_name, 1, 1), "0", comment="carry")
+
+    # -- per-index stubs (for ScaleBlock compat) ----------------------------
+
+    def emit_load_a(self, mi: int, ki: int) -> None:
+        self.emit_read_a(mi, ki)
+
+    def emit_load_b(self, ni: int, ki: int) -> None:
+        self.emit_read_b(ni, ki)
+
+    # -- composable K-loop integration -------------------------------------
+
+    @property
+    def has_scales(self) -> bool:
+        return True
+
+    @property
+    def has_cross_iter_prefetch(self) -> bool:
+        return False
+
+    def precompute_soffsets(self) -> None:
+        self.alloc_registers()
+        self.emit_setup()
+
+    def num_initial_inflight(self, partition_m: int) -> int:
+        return 2  # 1 DTL scale A + 1 DTL scale B
+
+    def cross_iter_inflight(self, partition_m: int, nr: int) -> int:
+        return 0
+
+    def emit_scale_wait(self, loader: 'GlobalLoader') -> None:
+        pass  # Scales read via lgkmcnt, not vmcnt
+
+    def emit_subtile_wait(self, loader: 'GlobalLoader', st_idx: int) -> None:
+        pass  # Scales read via lgkmcnt
+
+    def emit_mfma(self, ctx: AsmContext, mfma: MfmaConfig, acc: str,
+                  a_reg: str, b_reg: str,
+                  mi: int, ni: int, ki: int) -> None:
+        """Emit MFMA with op_sel for pre-swizzled scale bytes."""
+        sa_name = self._scale_a_names.get((mi, ki))
+        sb_name = self._scale_b_names.get((ni, ki))
+        if sa_name is None or sb_name is None:
+            ctx.inst(mfma.instruction_name, acc, a_reg, b_reg, acc,
+                     ctx.vreg("v_mxscale"), ctx.vreg("v_mxscale"),
+                     f"cbsz:{mfma.cbsz} blgp:{mfma.blgp}",
+                     comment=f"MFMA m{mi}_n{ni}_k{ki}")
+            return
+
+        a_sel = mi % 2
+        b_sel = ni % 2
+        hi_a = ki
+        hi_b = ki
+        ctx.inst(mfma.instruction_name, acc, a_reg, b_reg, acc,
+                 ctx.vreg(sa_name), ctx.vreg(sb_name),
+                 f"op_sel:[{a_sel},{b_sel}] op_sel_hi:[{hi_a},{hi_b}]"
+                 f" cbsz:{mfma.cbsz} blgp:{mfma.blgp}",
+                 comment=f"MFMA m{mi}_n{ni}_k{ki}")
+
+    # -- Compatibility stubs -----------------------------------------------
+
+    def emit_initial_loads(self, partition_m: int) -> None:
+        pass  # DTL handled by DTLLoader
+
+    def emit_loop_loads(self) -> None:
+        pass  # DTL handled by DTLLoader

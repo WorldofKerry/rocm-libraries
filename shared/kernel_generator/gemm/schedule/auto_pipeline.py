@@ -424,7 +424,16 @@ class GlobalLoadStageEmitter(StageEmitter):
 
         if is_first:
             loader.emit_loads()
-            if schedule.prologue_scale_ops:
+            from ..memory.scale_loader import LDSScaleLoader as _LDS
+            is_lds_scale = isinstance(scale_loader, _LDS) if scale_loader else False
+            if is_lds_scale:
+                # LDS scales: DTL loads include scale data.
+                # Wait for all DTL (data + scales) before barrier.
+                # Scale ds_reads happen in the consume phase.
+                ctx.s_waitcnt("vmcnt(0)",
+                              comment="wait all DTL (data + scales)")
+            elif schedule.prologue_scale_ops:
+                # VMEM scales: load into VGPRs, leave in-flight.
                 for op in schedule.prologue_scale_ops:
                     if op.emit:
                         op.emit()
@@ -463,7 +472,12 @@ class GlobalLoadStageEmitter(StageEmitter):
                 op.emit()
         if schedule.scale_advance_op and schedule.scale_advance_op.emit:
             schedule.scale_advance_op.emit()
-        if scale_loader and not scale_loader.has_cross_iter_prefetch:
+        # For VMEM scales: reload from global in produce phase.
+        # For LDS scales: scale loads are ds_reads in the consume phase
+        # (already handled by the MFMA body scheduler), not here.
+        from ..memory.scale_loader import LDSScaleLoader as _LDS
+        if (scale_loader and not isinstance(scale_loader, _LDS)
+                and not scale_loader.has_cross_iter_prefetch):
             for op in schedule.prologue_scale_ops:
                 if op.emit:
                     op.emit()
@@ -549,10 +563,21 @@ class ReadComputeStageEmitter(StageEmitter):
                       comment="wait B[ki=0] + A[m0,k0]")
 
         if schedule.prologue_scale_ops:
-            num_dtl = (loader.num_inflight
-                       if hasattr(loader, "num_inflight") else 0)
-            ctx.s_waitcnt(f"vmcnt({num_dtl})",
-                          comment=f"wait scales (leave {num_dtl} DTL)")
+            from ..memory.scale_loader import LDSScaleLoader as _LDS
+            if isinstance(scale_loader, _LDS):
+                # LDS scales: emit ds_reads for first-subtile scales
+                # from LDS. These are lgkmcnt-tracked alongside data reads.
+                ctx.comment("Scale reads from LDS (first subtile)")
+                for op in schedule.prologue_scale_ops:
+                    if op.emit:
+                        op.emit()
+                # lgkmcnt for these will be handled by the MFMA body waits
+            else:
+                # VMEM scales: wait for scale buffer_load_dword (vmcnt)
+                num_dtl = (loader.num_inflight
+                           if hasattr(loader, "num_inflight") else 0)
+                ctx.s_waitcnt(f"vmcnt({num_dtl})",
+                              comment=f"wait scales (leave {num_dtl} DTL)")
         ctx.raw("")
 
         reader.emit_recompute_ki_bases()
@@ -563,6 +588,9 @@ class ReadComputeStageEmitter(StageEmitter):
         # Only emit s_waitcnt when the required count is tighter
         # than what the current state guarantees.
         inflight_lgkm = preamble_inflight
+        from ..memory.scale_loader import LDSScaleLoader as _LDS2
+        if isinstance(scale_loader, _LDS2) and schedule.prologue_scale_ops:
+            inflight_lgkm += len(schedule.prologue_scale_ops)
         mfma_count = 0
 
         for i, mfma_op in enumerate(schedule.mfma_order):
@@ -580,16 +608,20 @@ class ReadComputeStageEmitter(StageEmitter):
                 inflight_lgkm = required_lgkm
 
             if schedule.prologue_scale_ops:
-                mps = partition_m * mfmas_per_mi
-                n_st = mr // partition_m
-                if mfma_count > 0 and mfma_count % mps == 0:
-                    st_idx = mfma_count // mps
-                    if st_idx < n_st:
-                        num_dtl = (loader.num_inflight
-                                   if hasattr(loader, "num_inflight") else 0)
-                        ctx.s_waitcnt(
-                            f"vmcnt({num_dtl})",
-                            comment=f"wait scale_a subtile {st_idx}")
+                from ..memory.scale_loader import LDSScaleLoader as _LDS
+                is_lds_s = isinstance(scale_loader, _LDS) if scale_loader else False
+                if not is_lds_s:
+                    # VMEM scales: subtile vmcnt wait
+                    mps = partition_m * mfmas_per_mi
+                    n_st = mr // partition_m
+                    if mfma_count > 0 and mfma_count % mps == 0:
+                        st_idx = mfma_count // mps
+                        if st_idx < n_st:
+                            num_dtl = (loader.num_inflight
+                                       if hasattr(loader, "num_inflight") else 0)
+                            ctx.s_waitcnt(
+                                f"vmcnt({num_dtl})",
+                                comment=f"wait scale_a subtile {st_idx}")
 
             if mfma_count % (partition_m * mfmas_per_mi) == 0:
                 ctx.comment(
@@ -678,7 +710,8 @@ class AutoPipelinedCompute(ComputePipeline):
         # Precompute swizzled read addresses (before DB step setup)
         reader.precompute_swizzle_addresses()
 
-        # DB step register
+        # DB step = lds_data_half (must be power of 2 for XOR toggle).
+        # Scale LDS regions use a separate swap mask computed in setup.
         ctx.alloc_sgpr_permanent(1, "s_lds_db_step")
         ctx.alloc_sgpr_permanent(1, "s_rd_db")
         ctx.s_mov(ctx.sreg("s_rd_db"), "0", comment="rd_db = 0 (read from buffer 0)")

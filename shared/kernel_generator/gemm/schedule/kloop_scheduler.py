@@ -98,7 +98,9 @@ class KLoopScheduler:
             if name == "advance_scale":
                 scale_advance_op = op
                 continue
-            if op.kind == OpKind.SCALE_LOAD:
+            if op.kind == OpKind.SCALE_LOAD or (
+                    op.kind == OpKind.DS_READ
+                    and name.startswith(("scale_a_m", "scale_b_n"))):
                 if name.startswith("scale_a_m"):
                     parts = name.replace("scale_a_m", "").replace("_k", " ").split()
                     scale_a_ops[(int(parts[0]), int(parts[1]))] = op
@@ -140,71 +142,12 @@ class KLoopScheduler:
         placed_reads = set()
         for op in pre_body + preamble:
             placed_reads.add(op.name)
+        # NOTE: prologue_scale_ops are added to placed_reads later
+        # (after they're built in Phase 4a) to prevent double-placement.
 
-        # Remaining ds_reads: A-prefetch for mi=1..mr-1
-        # These get placed between MFMAs (forward from their WAR dep)
-        remaining_reads = []
-        for name, op in g.ops.items():
-            if op.kind == OpKind.DS_READ and name not in placed_reads:
-                remaining_reads.append(op)
-
-        # For each remaining read, compute earliest MFMA position
-        # based on WAR deps (must come after prior mi's last MFMA)
-        read_earliest = {}
-        for op in remaining_reads:
-            war_deps = [d for d in g.deps
-                        if d.consumer == op.name and d.kind == DepKind.WAR]
-            earliest = 0
-            for dep in war_deps:
-                if dep.producer in mfma_positions:
-                    earliest = max(earliest, mfma_positions[dep.producer] + 1)
-            read_earliest[op.name] = earliest
-
-        # For each remaining read, compute latest MFMA position
-        # (must be placed before consuming MFMA minus latency lead)
-        read_latest = {}
-        for op in remaining_reads:
-            consumers = [d.consumer for d in g.deps
-                         if d.producer == op.name and d.kind == DepKind.RAW]
-            latest = n_mfma - 1
-            for c in consumers:
-                if c in mfma_positions:
-                    lead = DS_READ_LEAD_MFMAS
-                    latest = min(latest, mfma_positions[c] - lead)
-            read_latest[op.name] = max(latest, 0)
-
-        # Build suffix: vmcnt wait + toggle (reader suffix ops)
-        # These will be placed backward from the end of the MFMA body
-        # For now, suffix ops are declared by the reader (not in the graph yet)
-        # The graph-based scheduler will add them in a future iteration.
-
-        # Phase 4: Place remaining reads into MFMA intervals
-        # Each MFMA position has a list of side ops placed before it
+        # Phase 4: Place reads into MFMA intervals
         side_ops: List[List[KLoopOp]] = [[] for _ in range(n_mfma)]
-        reads_per_interval = {}  # interval -> count (max 1 ds_read)
-
-        # Sort remaining reads by earliest position (greedy forward placement)
-        remaining_reads.sort(key=lambda op: read_earliest[op.name])
-
-        for op in remaining_reads:
-            earliest = read_earliest[op.name]
-            latest = read_latest.get(op.name, n_mfma - 1)
-            target = max(earliest, 0)
-
-            placed = False
-            for pos in range(target, min(latest + 1, n_mfma)):
-                interval = pos
-                if reads_per_interval.get(interval, 0) < 1:
-                    side_ops[pos].append(op)
-                    reads_per_interval[interval] = (
-                        reads_per_interval.get(interval, 0) + 1)
-                    placed = True
-                    break
-            if not placed:
-                # Fallback: place at latest even if constraint violated
-                for pos in range(min(latest, n_mfma - 1), -1, -1):
-                    side_ops[pos].append(op)
-                    break
+        reads_per_interval = {}
 
         # Phase 4a: Place scale load ops
         # Group scale ops into subtiles: first subtile goes to prologue,
@@ -240,7 +183,60 @@ class KLoopScheduler:
                                 op = scale_a_ops[(mi, ki)]
                                 side_ops[target_pos].insert(0, op)
 
-        # Phase 4b: Place suffix ops backward from end
+        # Phase 4b: Build remaining_reads now that prologue_scale_ops is known
+        for op in prologue_scale_ops:
+            placed_reads.add(op.name)
+        # Also mark subtile scale ops as placed
+        for mfma_pos_ops in side_ops:
+            for op in mfma_pos_ops:
+                if op.name.startswith(("scale_a_m", "scale_b_n")):
+                    placed_reads.add(op.name)
+        remaining_reads = []
+        for name, op in g.ops.items():
+            if op.kind == OpKind.DS_READ and name not in placed_reads:
+                remaining_reads.append(op)
+
+        # For each remaining read, compute earliest MFMA position
+        read_earliest = {}
+        for op in remaining_reads:
+            war_deps = [d for d in g.deps
+                        if d.consumer == op.name and d.kind == DepKind.WAR]
+            earliest = 0
+            for dep in war_deps:
+                if dep.producer in mfma_positions:
+                    earliest = max(earliest, mfma_positions[dep.producer] + 1)
+            read_earliest[op.name] = earliest
+
+        read_latest = {}
+        for op in remaining_reads:
+            consumers = [d.consumer for d in g.deps
+                         if d.producer == op.name and d.kind == DepKind.RAW]
+            latest = n_mfma - 1
+            for c in consumers:
+                if c in mfma_positions:
+                    lead = DS_READ_LEAD_MFMAS
+                    latest = min(latest, mfma_positions[c] - lead)
+            read_latest[op.name] = max(latest, 0)
+
+        remaining_reads.sort(key=lambda op: read_earliest[op.name])
+        for op in remaining_reads:
+            earliest = read_earliest[op.name]
+            latest = read_latest.get(op.name, n_mfma - 1)
+            target = max(earliest, 0)
+            placed = False
+            for pos in range(target, min(latest + 1, n_mfma)):
+                if reads_per_interval.get(pos, 0) < 1:
+                    side_ops[pos].append(op)
+                    reads_per_interval[pos] = (
+                        reads_per_interval.get(pos, 0) + 1)
+                    placed = True
+                    break
+            if not placed:
+                for pos in range(min(latest, n_mfma - 1), -1, -1):
+                    side_ops[pos].append(op)
+                    break
+
+        # Phase 4c: Place suffix ops backward from end
         suffix_names = ["suffix_vmcnt", "suffix_toggle"]
         suffix_ops_list = [g.ops[n] for n in suffix_names if n in g.ops]
         epilogue_ops: List[KLoopOp] = []
