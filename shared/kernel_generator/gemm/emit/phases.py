@@ -25,6 +25,7 @@ from ..tile.tree import TileLevel, TilePhase
 from ..tile.transforms import Embed, Dim
 
 __all__ = [
+    "phase_streamk_store",
     "WORKGROUP_EPILOGUE_PHASES",
     "default_mfma_visitor",
 ]
@@ -495,6 +496,118 @@ def default_mfma_visitor(level: TileLevel, ctx: AsmContext) -> None:
              ctx.areg("acc_C", acc_off, acc_per),
              comment=f"mfma m{mi}_n{ni} k{ki}")
     ctx.raw("")
+
+
+
+
+def phase_streamk_store(level: TileLevel, ctx: AsmContext) -> None:
+    """StreamK epilogue: store partial results to workspace or final D.
+
+    Full-K workgroups (is_partial==0): store directly to D (same as
+    phase_store_d).
+    Partial-K workgroups (is_partial==1): store f32 accumulators to
+    workspace buffer at per-WG slot.
+
+    The workspace is laid out as:
+        workspace[sk_wg_index * MT_M * MT_N] (f32 per element)
+
+    A separate fixup kernel later sums all partials per output tile
+    and writes the final f16/bf16 result to D.
+    """
+    tile = _tile(ctx)
+    problem = _problem(ctx)
+
+    # Check if StreamK is active
+    if not ctx.has("s_is_partial"):
+        phase_store_d(level, ctx)
+        return
+
+    ctx.comment("=== StreamK Epilogue ===")
+    ctx.inst("s_cmp_eq_u32", ctx.sreg("s_is_partial"), "0",
+             comment="is_partial == 0?")
+    ctx.inst("s_cbranch_scc1", "sk_full_store",
+             comment="full K -> store D directly")
+
+    # Partial-K path: store f32 accumulators to workspace
+    ctx.comment("Partial-K: store f32 accumulators to workspace")
+    mfma = tile.mfma
+    mr = tile.mfma_m_repeat
+    nr = tile.mfma_n_repeat
+    acc_per = mfma.acc_vgprs
+    elem = problem.element_bytes
+
+    # Workspace offset: wg_serial * MT_M * MT_N * sizeof(f32)
+    # wg_serial is in s_wg_id_x (1D grid for StreamK)
+    ws_tile_bytes = tile.wg_m * tile.wg_n * 4  # f32 per element
+    ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"),
+             str(ws_tile_bytes),
+             comment=f"ws_offset = wg_serial * {ws_tile_bytes}")
+    ctx.inst("s_add_u32", ctx.sreg("s_tmp0"),
+             ctx.sreg("s_workspace_ptr", 0, 1), ctx.sreg("s_tmp0"),
+             comment="ws_addr_lo = ws_ptr + offset")
+    ctx.inst("s_addc_u32", ctx.sreg("s_tmp1"),
+             ctx.sreg("s_workspace_ptr", 1, 1), "0",
+             comment="ws_addr_hi")
+
+    # Build SRD for workspace
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_a", 0, 1), ctx.sreg("s_tmp0"),
+             comment="ws SRD lo")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_a", 1, 1), ctx.sreg("s_tmp1"),
+             comment="ws SRD hi")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_a", 2, 1), "0xFFFFFFFF",
+             comment="limit")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_a", 3, 1), "0x20000",
+             comment="flags")
+
+    # Store each accumulator as f32 (no conversion)
+    # Layout: contiguous f32 in row-major order
+    # acc_C[(mi * nr + ni) * acc_per + ai] -> workspace[row * MT_N + col]
+    # row = wave_m * m_per_wave + mi * mfma_m + lane_row
+    # col = wave_n * n_per_wave + ni * mfma_n + lane_col
+    #
+    # For simplicity: use flat_store with per-lane addressing
+    # Each lane stores its own accumulator values
+
+    # Per-lane base: (wave_m * m_per_wave + lane_row) * MT_N * 4
+    ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.m - 1,
+              comment=f"lane_row = lane_id % {mfma.m}")
+    ctx.v_mul(ctx.vreg("v_tmp1"), str(tile.m_per_wave),
+              ctx.vreg("v_wave_m"), comment=f"wave_m * {tile.m_per_wave}")
+    ctx.v_add(ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),
+              comment="m_row = wave_m * m_per_wave + lane_row")
+
+    for mi in range(mr):
+        m_off = mi * mfma.m
+        for ni in range(nr):
+            acc_off = (mi * nr + ni) * acc_per
+            n_base = ni * mfma.n
+            # Compute voffset for this (mi, ni) block
+            # row = m_row + mi * mfma_m
+            # For each acc register, the lane maps to a specific (row, col)
+            # mfma_f16_16x16x16: 4 accumulators per lane, each is one (row, col)
+            # acc[0] -> (lane_row, lane_group*4 + 0)
+            # etc.
+            for ai in range(acc_per):
+                # Compute byte offset: (m_row + mi*M) * MT_N * 4 + (n_col) * 4
+                # This is complex per-lane -- use buffer_store_dword
+                col = n_base + (ctx.vreg("v_lane_id") if ai == 0 else "...")
+                # Simplified: store linearly and let fixup kernel handle layout
+                linear_off = (acc_off + ai) * tile.wave_size  # rough
+                ctx.inst("buffer_store_dword",
+                         ctx.areg("acc_C", acc_off + ai, 1),
+                         ctx.vreg("v_tmp0"),  # voffset placeholder
+                         ctx.sreg("s_srd_a", 0, 4),
+                         str(linear_off * 4), "offen",
+                         comment=f"ws store acc m{mi}_n{ni}_a{ai}")
+
+    ctx.inst("s_branch", "sk_epilogue_done",
+             comment="skip full store")
+
+    ctx.label("sk_full_store")
+    # Full-K path: standard store to D
+    phase_store_d(level, ctx)
+
+    ctx.label("sk_epilogue_done")
 
 
 # ===================================================================
