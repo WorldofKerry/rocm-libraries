@@ -451,8 +451,16 @@ class VMEMScaleLoader(ScaleLoader):
 
     @property
     def has_cross_iter_prefetch(self) -> bool:
-        """True if linear mode uses cross-iteration prefetch."""
-        return not self._swizzled
+        """Cross-iteration scale prefetch is not yet implemented.
+
+        When True, the suffix uses vmcnt(N>0) assuming N prefetch
+        loads are in-flight, and emit_produce skips scale re-emission.
+        Since no code actually emits those prefetch loads, this causes:
+        - DTL: vmcnt too high -> read toggle before DTL completes
+        - Both: scale VGPRs never reloaded after iteration 0
+        Disabled until the prefetch emission is implemented.
+        """
+        return False
 
     def precompute_soffsets(self) -> None:
         """Alias for emit_setup() -- called by ComposableKLoop."""
