@@ -355,3 +355,115 @@ class StreamKPartitioner(TilePartitioner):
             "iters_per_sk_cta": iters_per_cta,
             "extra_iters": extra,
         }
+
+
+def pipeline_v2_kloop_phase(level, ctx) -> None:
+    """Phase function using the new unified stream architecture.
+
+    Uses LDSStream + LDSBufferManager + PipelineScheduler + PipelineEmitter
+    instead of the old AutoPipelinedCompute + SoftwarePipeline.
+
+    Set ``ctx._metadata["pipeline_v2"] = True`` to activate.
+    """
+    tile = ctx._metadata["tile"]
+    problem = ctx._metadata["problem"]
+    use_dtl = ctx._metadata.get("use_dtl", True)
+
+    # Build old-style loader/reader (still needed for actual codegen)
+    loader_cls = ctx._metadata.get("loader_cls",
+                                   DTLLoader if use_dtl else BufferLoader)
+    loader = loader_cls(ctx, tile, problem)
+    swizzle = ctx._metadata.get("swizzle", None)
+    reader = LDSReader(ctx, tile, problem, swizzle=swizzle)
+
+    # Build scale loader (old-style, for codegen delegation)
+    scale_loader = None
+    use_real_scales = ctx._metadata.get("use_real_scales", False)
+    use_lds_scales = ctx._metadata.get("use_lds_scales", False)
+    if use_real_scales and tile.mfma.is_mx:
+        if use_lds_scales:
+            from ..memory.scale_loader import LDSScaleLoader
+            lds_data_half = ctx._metadata.get("lds_data_half", 0)
+            scale_loader = LDSScaleLoader(ctx, tile,
+                                          lds_scale_offset=lds_data_half)
+        else:
+            from ..memory.scale_loader import VMEMScaleLoader
+            swizzled = ctx._metadata.get("swizzled_scales", False)
+            scale_loader = VMEMScaleLoader(ctx, tile, swizzled=swizzled)
+
+    pgr_raw = ctx._metadata.get("pgr", None)
+    if pgr_raw is None:
+        pgr = 2 if ctx._metadata.get("pgr2", False) else 1
+    else:
+        pgr = int(pgr_raw)
+
+    # Attach scale loader for integrated loads (same as v1)
+    if use_lds_scales and scale_loader is not None:
+        from ..memory.global_loader import DTLLoader as _DTL
+        if isinstance(loader, _DTL):
+            loader.attach_scale_loader(scale_loader)
+
+    # --- New architecture ---
+    from ..memory.streams import DTLDataStream, ScaleStream
+    from ..memory.lds_stream import LDSBufferManager
+    from .graph_builder import build_kloop_graph
+    from .pipeline_scheduler import PipelineScheduler
+    from .pipeline_emitter import PipelineEmitter
+    from .emit_wiring import wire_emit_callbacks
+    from ..memory.mfma_emitter import MFMAEmitter
+
+    streams = [
+        DTLDataStream("a", tile, problem),
+        DTLDataStream("b", tile, problem),
+    ]
+    if use_lds_scales and scale_loader is not None:
+        streams.append(ScaleStream("a", tile))
+        streams.append(ScaleStream("b", tile))
+
+    num_buffers = 2 if pgr >= 1 else 1
+    buffer_mgr = LDSBufferManager(streams, num_buffers=num_buffers)
+    buffer_mgr.compute_layout()
+
+    graph = build_kloop_graph(streams, tile, pgr=pgr,
+                              num_buffers=num_buffers, problem=problem)
+
+    # Create MFMAEmitter
+    if scale_loader is not None and hasattr(scale_loader, 'scale_names_a'):
+        names_a = scale_loader.scale_names_a
+        names_b = scale_loader.scale_names_b
+        emitter = (MFMAEmitter.for_lds_scales(tile.mfma, names_a, names_b)
+                   if use_lds_scales
+                   else MFMAEmitter.for_vmem_scales(tile.mfma, names_a, names_b))
+    elif tile.mfma.is_mx:
+        emitter = MFMAEmitter.for_mx_constant(tile.mfma)
+    else:
+        emitter = MFMAEmitter.for_non_mx(tile.mfma)
+
+    # Wire emit callbacks
+    wire_emit_callbacks(graph, streams, buffer_mgr, loader, reader,
+                        emitter, ctx, scale_loader=scale_loader)
+
+    scheduled = PipelineScheduler(graph).schedule()
+
+    # Setup: soffsets, swizzle, DB step
+    loader.precompute_soffsets()
+    if scale_loader is not None and hasattr(scale_loader, 'precompute_soffsets'):
+        scale_loader.precompute_soffsets()
+    reader.precompute_swizzle_addresses()
+
+    ctx.alloc_sgpr_permanent(1, "s_lds_db_step")
+    lds_scale_half = ctx._metadata.get("lds_scale_half", 0)
+    lds_data_half = ctx._metadata.get("lds_data_half", 0)
+    lds_half_total = lds_data_half + lds_scale_half
+    if not ctx.has("s_rd_db"):
+        ctx.alloc_sgpr_permanent(1, "s_rd_db")
+    ctx.s_mov(ctx.sreg("s_rd_db"), "0", comment="rd_db = 0")
+    ctx.s_mov(ctx.sreg("s_lds_db_step"), str(lds_half_total),
+              comment=f"DB step = {lds_half_total}")
+    ctx.raw("")
+
+    # K-tile count
+    GridPartitioner().emit(ctx)
+
+    # Emit K-loop
+    PipelineEmitter(scheduled, buffer_mgr, ctx).emit()
