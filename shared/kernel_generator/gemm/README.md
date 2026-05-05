@@ -11,6 +11,7 @@ optimized GCN assembly with dependency-driven instruction scheduling.
 - Ping-pong A buffers with automatic partition scheduling
 - MX scale loading (linear and pre-swizzled)
 - TensileLite custom kernel export
+- StreamK work decomposition (K-splitting with GPU-side reduction)
 
 ## Quick Start
 
@@ -59,6 +60,35 @@ p = GemmProblem(4096, 4096, 4096, dtype=DataType.MXFP4)
 k = GemmKernel.build(p, tiling=t)
 co = k.emit().assemble()
 ```
+
+## StreamK
+
+Toggle StreamK with `streamk=True` on `GemmKernel.build`. The kernel
+swaps its epilogue to a 3-way conditional store that supports both
+data-parallel (DP) and K-split modes from the same code object.
+
+```python
+from kernel_generator.gemm.problem import GemmProblem, DataType
+from kernel_generator.gemm.kernel import GemmKernel
+from kernel_generator.gemm.launcher import GemmLauncher
+
+p = GemmProblem(4096, 4096, 4096, dtype=DataType.F16)
+k = GemmKernel.build(p, streamk=True)
+co = k.emit().assemble()
+
+launcher = GemmLauncher(p, k.tile, seed=42)
+# DP mode (num_partitions=1): each WG computes full K
+r = launcher.run_streamk(co, num_partitions=1)
+# K-split mode: each tile's K is split across partitions
+r = launcher.run_streamk(co, num_partitions=2)
+```
+
+StreamK epilogue paths:
+1. **Sole owner** (is_partial=0): direct store to D
+2. **Non-owner partial** (is_partial=1, iter_start>0): store f32 to workspace, set flag
+3. **Owner partial** (is_partial=1, iter_start=0): poll flags, load partials, accumulate, store to D
+
+Multi-partition launches use separate HIP streams for concurrent execution.
 
 ## Tests
 
