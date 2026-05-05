@@ -158,7 +158,7 @@ k_loop:
 skip_G:
   s_barrier                ; consumer.wait()
 
-  ; R+M body (from KLoopScheduler)
+  ; R+M body (from PipelineScheduler)
   ds_read ... ; v_mfma ...
   ...
 
@@ -177,7 +177,7 @@ k_loop:
   ; Early B reads
   ds_read early_B ...
 
-  ; R+M body (from KLoopScheduler)
+  ; R+M body (from PipelineScheduler)
   ds_read ... ; v_mfma ...
   ...
 
@@ -254,14 +254,14 @@ orthogonal:
 # Regular GEMM
 pipeline = KernelPipeline(
     partitioner=GridPartitioner(),
-    compute=ScheduledCompute(loader, reader, scale_loader, pgr=1),
+    compute=compute_pipeline,
     epilogue=DirectEpilogue(),
 )
 
 # StreamK
 pipeline = KernelPipeline(
     partitioner=StreamKPartitioner(num_cus=304),
-    compute=ScheduledCompute(loader, reader, scale_loader, pgr=1),  # SAME
+    compute=compute_pipeline,  # SAME
     epilogue=ConditionalEpilogue(direct=..., atomic=...),
 )
 ```
@@ -296,39 +296,6 @@ class PipelineState:
 
 This tracks the same state as CUTLASS's `PipelineState(index, phase)`
 but uses byte offsets directly (matching our LDS addressing).
-
-## Integration with KLoopGraph
-
-The `KLoopGraph` already has `iteration` tags on ops:
-- `iteration=0`: R+M ops (current tile)
-- `iteration=1`: G ops (next tile, prefetch)
-
-The pipeline framework sets these tags based on stage distance:
-- Stage G with `distance=1` -> `iteration=1`
-- Stage R with `distance=0` -> `iteration=0`
-- Stage M with `distance=0` -> `iteration=0`
-
-The `KLoopScheduler` sorts ops by iteration, placing `iteration=1`
-ops in the prefetch section. Extending to `iteration=N` (for higher
-PGR or multi-distance stages) is a natural generalization.
-
-## Implementation Status
-
-### Done
-- `ScheduledCompute` with `pgr` parameter and `loads_before_reads` property
-- Generic prologue with `PGR` ramp-up stages
-- Generic load condition `k_tiles > PGR-1`
-- Load-before-read path (PGR=1 with 2 buffers) -- verified correct
-- Read-before-write path (PGR=2 with 2 buffers) -- verified correct
-- `BranchDriver` and `PredicateDriver` prototypes in `pipeline_drivers.py`
-- `PipelineStage`/`StageDep` abstractions in `pipeline_prototype.py`
-
-### Remaining
-- Triple buffering (num_buffers=3, mod-3 rotation)
-- Formalize `SoftwarePipeline.from_stages()` to auto-derive structure
-- Wire `PipelineState` to replace raw offset tracking
-- LDS swizzle fix (address mismatch between write and read sides)
-- Compare Branch vs Predicate output, benchmark, pick winner
 
 ## Design Decisions
 

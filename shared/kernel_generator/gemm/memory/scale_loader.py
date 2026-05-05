@@ -20,16 +20,13 @@ from abc import ABC, abstractmethod
 from typing import Dict
 
 from ..emit.context import AsmContext
-from ..problem import TileConfig, MfmaConfig
-
-from typing import TYPE_CHECKING
-if TYPE_CHECKING:
-    from .global_loader import GlobalLoader
+from ..problem import TileConfig
 
 __all__ = [
     "ScaleLoader",
     "NullScaleLoader",
     "VMEMScaleLoader",
+    "LDSScaleLoader",
 ]
 
 
@@ -47,14 +44,6 @@ class ScaleLoader(ABC):
     @abstractmethod
     def emit_setup(self) -> None:
         """Set up scale SRDs, voffsets, soffsets."""
-
-    @abstractmethod
-    def emit_initial_loads(self, partition_m: int) -> None:
-        """Load scales for the first subtile + all B scales (prologue)."""
-
-    @abstractmethod
-    def emit_loop_loads(self) -> None:
-        """Issue scale loads within the K-loop (after SRD advance)."""
 
     @abstractmethod
     def advance(self) -> None:
@@ -84,11 +73,6 @@ class NullScaleLoader(ScaleLoader):
     def emit_setup(self) -> None:
         pass
 
-    def emit_initial_loads(self, partition_m: int) -> None:
-        pass
-
-    def emit_loop_loads(self) -> None:
-        pass
 
     def advance(self) -> None:
         pass
@@ -101,42 +85,13 @@ class NullScaleLoader(ScaleLoader):
     def scale_names_b(self) -> dict:
         return {}
 
-    def emit_load_a(self, mi: int, ki: int) -> None:
-        """No-op: emit a single scale-A load for (mi, ki)."""
-        pass
-
-    def emit_load_b(self, ni: int, ki: int) -> None:
-        """No-op: emit a single scale-B load for (ni, ki)."""
-        pass
-
-
 
 # ---------------------------------------------------------------------------
-    @property
-    def has_scales(self) -> bool:
-        return False
 
-    @property
-    def has_cross_iter_prefetch(self) -> bool:
-        return False
 
     def precompute_soffsets(self) -> None:
         pass
 
-    def num_initial_inflight(self, partition_m: int) -> int:
-        return 0
-
-    def cross_iter_inflight(self, partition_m: int, nr: int) -> int:
-        return 0
-
-    def emit_scale_wait(self, loader: GlobalLoader) -> None:
-        pass
-
-    def emit_subtile_wait(self, loader: GlobalLoader, st_idx: int) -> None:
-        pass
-
-    def emit_mfma(self, ctx: AsmContext, mfma: MfmaConfig, acc: str, a_reg: str, b_reg: str, mi: int, ni: int, ki: int) -> None:
-        pass
 
 # VMEM (buffer_load_dword) implementation
 # ---------------------------------------------------------------------------
@@ -276,99 +231,6 @@ class VMEMScaleLoader(ScaleLoader):
                       comment=f"soff_b[{ni_}] = stride * {ni_ * mfma.n}")
         ctx.raw("")
 
-    # -- initial (prologue) loads -------------------------------------------
-
-    def emit_initial_loads(self, partition_m: int) -> None:
-        """Issue ``buffer_load_dword`` for the first subtile of A + all B."""
-        ctx = self._ctx
-        nr = self._nr
-
-        if self._swizzled:
-            ctx.comment("Load swizzled scales A (2 groups)")
-            ctx.inst("buffer_load_dword", ctx.vreg("v_scale_a_g0"),
-                     ctx.vreg("v_dtl_off_scale_a"),
-                     ctx.sreg("s_srd_scale_a", 0, 4),
-                     ctx.sreg("s_scale_soff_a0"), "offen",
-                     comment="scaleA group0 (mi=0,1)")
-            ctx.inst("buffer_load_dword", ctx.vreg("v_scale_a_g1"),
-                     ctx.vreg("v_dtl_off_scale_a"),
-                     ctx.sreg("s_srd_scale_a", 0, 4),
-                     ctx.sreg("s_scale_soff_a1"), "offen",
-                     comment="scaleA group1 (mi=2,3)")
-            ctx.comment("Load swizzled scales B (2 groups)")
-            ctx.inst("buffer_load_dword", ctx.vreg("v_scale_b_g0"),
-                     ctx.vreg("v_dtl_off_scale_b"),
-                     ctx.sreg("s_srd_scale_b", 0, 4),
-                     ctx.sreg("s_scale_soff_b0"), "offen",
-                     comment="scaleB group0 (ni=0,1)")
-            ctx.inst("buffer_load_dword", ctx.vreg("v_scale_b_g1"),
-                     ctx.vreg("v_dtl_off_scale_b"),
-                     ctx.sreg("s_srd_scale_b", 0, 4),
-                     ctx.sreg("s_scale_soff_b1"), "offen",
-                     comment="scaleB group1 (ni=2,3)")
-        else:
-            ki_count = self._ki_count
-            ki_bytes = self._mfma.k // self._mx_block  # bytes per ki step
-            ctx.comment("Load scales A subtile 0 (direct VGPR)")
-            for mi_ in range(partition_m):
-                for ki_ in range(ki_count):
-                    soff = "0" if mi_ == 0 else ctx.sreg(f"s_soff_sa_{mi_}")
-                    off = ki_ * ki_bytes
-                    off_str = f" offset:{off}" if off > 0 else ""
-                    ctx.inst("buffer_load_dword",
-                             ctx.vreg(f"v_scale_a_m{mi_}k{ki_}"),
-                             ctx.vreg("v_dtl_off_scale_a"),
-                             ctx.sreg("s_srd_scale_a", 0, 4),
-                             soff, f"offen{off_str}",
-                             comment=f"scale A mi={mi_} ki={ki_}")
-            ctx.comment("Load scales B (direct VGPR)")
-            for ni_ in range(nr):
-                for ki_ in range(ki_count):
-                    soff = "0" if ni_ == 0 else ctx.sreg(f"s_soff_sb_{ni_}")
-                    off = ki_ * ki_bytes
-                    off_str = f" offset:{off}" if off > 0 else ""
-                    ctx.inst("buffer_load_dword",
-                             ctx.vreg(f"v_scale_b_n{ni_}k{ki_}"),
-                             ctx.vreg("v_dtl_off_scale_b"),
-                             ctx.sreg("s_srd_scale_b", 0, 4),
-                             soff, f"offen{off_str}",
-                             comment=f"scale B ni={ni_} ki={ki_}")
-
-    # -- in-loop loads (after SRD advance) ----------------------------------
-
-    def emit_loop_loads(self) -> None:
-        """Issue scale loads inside the K-loop body.
-
-        Swizzled mode reloads all groups every iteration.  Linear mode
-        relies on cross-iteration prefetch (see ``make_prefetch_ops``),
-        so this is a no-op for linear.
-        """
-        if not self._swizzled:
-            return
-
-        ctx = self._ctx
-        ctx.comment("Load swizzled scales A (2 groups)")
-        ctx.inst("buffer_load_dword", ctx.vreg("v_scale_a_g0"),
-                 ctx.vreg("v_dtl_off_scale_a"),
-                 ctx.sreg("s_srd_scale_a", 0, 4),
-                 ctx.sreg("s_scale_soff_a0"), "offen",
-                 comment="scaleA group0 (mi=0,1)")
-        ctx.inst("buffer_load_dword", ctx.vreg("v_scale_a_g1"),
-                 ctx.vreg("v_dtl_off_scale_a"),
-                 ctx.sreg("s_srd_scale_a", 0, 4),
-                 ctx.sreg("s_scale_soff_a1"), "offen",
-                 comment="scaleA group1 (mi=2,3)")
-        ctx.comment("Load swizzled scales B (2 groups)")
-        ctx.inst("buffer_load_dword", ctx.vreg("v_scale_b_g0"),
-                 ctx.vreg("v_dtl_off_scale_b"),
-                 ctx.sreg("s_srd_scale_b", 0, 4),
-                 ctx.sreg("s_scale_soff_b0"), "offen",
-                 comment="scaleB group0 (ni=0,1)")
-        ctx.inst("buffer_load_dword", ctx.vreg("v_scale_b_g1"),
-                 ctx.vreg("v_dtl_off_scale_b"),
-                 ctx.sreg("s_srd_scale_b", 0, 4),
-                 ctx.sreg("s_scale_soff_b1"), "offen",
-                 comment="scaleB group1 (ni=2,3)")
 
     # -- SRD advance --------------------------------------------------------
 
@@ -383,152 +245,11 @@ class VMEMScaleLoader(ScaleLoader):
             ctx.inst("s_addc_u32", ctx.sreg(srd_name, 1, 1),
                      ctx.sreg(srd_name, 1, 1), "0", comment="carry")
 
-    # -- per-index emission (for ScaleBlock integration) --------------------
-
-    def emit_load_a(self, mi: int, ki: int) -> None:
-        """Emit a single ``buffer_load_dword`` for scale A at (mi, ki).
-
-        Swizzled mode emits per-group loads; linear mode emits
-        per-(mi,ki) loads.
-        """
-        ctx = self._ctx
-        if self._swizzled:
-            group = mi // 2
-            gname = f"v_scale_a_g{group}"
-            soff_name = f"s_scale_soff_a{group}"
-            ctx.inst("buffer_load_dword", ctx.vreg(gname),
-                     ctx.vreg("v_dtl_off_scale_a"),
-                     ctx.sreg("s_srd_scale_a", 0, 4),
-                     ctx.sreg(soff_name), "offen",
-                     comment=f"scaleA group{group} (mi={mi} ki={ki})")
-        else:
-            ki_bytes = self._mfma.k // self._mx_block
-            soff = "0" if mi == 0 else ctx.sreg(f"s_soff_sa_{mi}")
-            off = ki * ki_bytes
-            off_str = f" offset:{off}" if off > 0 else ""
-            ctx.inst("buffer_load_dword",
-                     ctx.vreg(f"v_scale_a_m{mi}k{ki}"),
-                     ctx.vreg("v_dtl_off_scale_a"),
-                     ctx.sreg("s_srd_scale_a", 0, 4),
-                     soff, f"offen{off_str}",
-                     comment=f"scale A mi={mi} ki={ki}")
-
-    def emit_load_b(self, ni: int, ki: int) -> None:
-        """Emit a single ``buffer_load_dword`` for scale B at (ni, ki).
-
-        Swizzled mode emits per-group loads; linear mode emits
-        per-(ni,ki) loads.
-        """
-        ctx = self._ctx
-        if self._swizzled:
-            group = ni // 2
-            gname = f"v_scale_b_g{group}"
-            soff_name = f"s_scale_soff_b{group}"
-            ctx.inst("buffer_load_dword", ctx.vreg(gname),
-                     ctx.vreg("v_dtl_off_scale_b"),
-                     ctx.sreg("s_srd_scale_b", 0, 4),
-                     ctx.sreg(soff_name), "offen",
-                     comment=f"scaleB group{group} (ni={ni} ki={ki})")
-        else:
-            ki_bytes = self._mfma.k // self._mx_block
-            soff = "0" if ni == 0 else ctx.sreg(f"s_soff_sb_{ni}")
-            off = ki * ki_bytes
-            off_str = f" offset:{off}" if off > 0 else ""
-            ctx.inst("buffer_load_dword",
-                     ctx.vreg(f"v_scale_b_n{ni}k{ki}"),
-                     ctx.vreg("v_dtl_off_scale_b"),
-                     ctx.sreg("s_srd_scale_b", 0, 4),
-                     soff, f"offen{off_str}",
-                     comment=f"scale B ni={ni} ki={ki}")
-
-
-    # -- composable K-loop integration -------------------------------------
-
-    @property
-    def has_scales(self) -> bool:
-        """True if this loader provides scale operands for MFMAs."""
-        return True
-
-    @property
-    def has_cross_iter_prefetch(self) -> bool:
-        """Cross-iteration scale prefetch is not yet implemented.
-
-        When True, the suffix uses vmcnt(N>0) assuming N prefetch
-        loads are in-flight, and emit_produce skips scale re-emission.
-        Since no code actually emits those prefetch loads, this causes:
-        - DTL: vmcnt too high -> read toggle before DTL completes
-        - Both: scale VGPRs never reloaded after iteration 0
-        Disabled until the prefetch emission is implemented.
-        """
-        return False
 
     def precompute_soffsets(self) -> None:
         """Alias for emit_setup() -- called by ComposableKLoop."""
         self.alloc_registers()
         self.emit_setup()
-
-    def num_initial_inflight(self, partition_m: int) -> int:
-        """Number of vmcnt-tracked scale loads after emit_initial_loads."""
-        if self._swizzled:
-            return 4  # 2 groups A + 2 groups B
-        return (partition_m + self._nr) * self._ki_count
-
-    def cross_iter_inflight(self, partition_m: int, nr: int) -> int:
-        """Number of prefetch loads in-flight at end of iteration."""
-        if self._swizzled:
-            return 0
-        return (partition_m + nr) * self._ki_count
-
-    def emit_scale_wait(self, loader: GlobalLoader) -> None:
-        """Emit vmcnt wait for scale loads after preamble reads.
-
-        For linear mode with DTL, leaves DTL loads in-flight.
-        For swizzled mode, waits for all vmcnt.
-        """
-        ctx = self._ctx
-        if not self._swizzled:
-            num_dtl = loader.num_inflight
-            ctx.s_waitcnt(f"vmcnt({num_dtl})",
-                          comment=f"wait scales (leave {num_dtl} DTL in-flight)")
-        else:
-            ctx.s_waitcnt("vmcnt(0)", comment="wait scale VGPR loads")
-
-    def emit_subtile_wait(self, loader: GlobalLoader, st_idx: int) -> None:
-        """Emit vmcnt wait at subtile boundary for prefetched scale_a."""
-        if self._swizzled:
-            return
-        ctx = self._ctx
-        num_dtl = loader.num_inflight
-        ctx.s_waitcnt(f"vmcnt({num_dtl})",
-                      comment=f"wait scale_a subtile {st_idx} (leave DTL)")
-
-    def emit_mfma(self, ctx: AsmContext, mfma: MfmaConfig, acc: str, a_reg: str, b_reg: str, mi: int, ni: int, ki: int) -> None:
-        """Emit MFMA instruction with proper scale operands."""
-        sa_name = self._scale_a_names.get((mi, ki))
-        sb_name = self._scale_b_names.get((ni, ki))
-        if sa_name is None or sb_name is None:
-            # Fallback: constant scale
-            ctx.inst(mfma.instruction_name, acc, a_reg, b_reg, acc,
-                     ctx.vreg("v_mxscale"), ctx.vreg("v_mxscale"),
-                     f"cbsz:{mfma.cbsz} blgp:{mfma.blgp}",
-                     comment=f"MFMA m{mi}_n{ni}_k{ki}")
-            return
-
-        if self._swizzled:
-            a_sel = mi % 2
-            b_sel = ni % 2
-            hi_a = ki
-            hi_b = ki
-            ctx.inst(mfma.instruction_name, acc, a_reg, b_reg, acc,
-                     ctx.vreg(sa_name), ctx.vreg(sb_name),
-                     f"op_sel:[{a_sel},{b_sel}] op_sel_hi:[{hi_a},{hi_b}]"
-                     f" cbsz:{mfma.cbsz} blgp:{mfma.blgp}",
-                     comment=f"MFMA m{mi}_n{ni}_k{ki}")
-        else:
-            ctx.inst(mfma.instruction_name, acc, a_reg, b_reg, acc,
-                     ctx.vreg(sa_name), ctx.vreg(sb_name),
-                     f"cbsz:{mfma.cbsz} blgp:{mfma.blgp}",
-                     comment=f"MFMA m{mi}_n{ni}_k{ki}")
 
 
 # ---------------------------------------------------------------------------
@@ -816,67 +537,8 @@ class LDSScaleLoader(ScaleLoader):
             ctx.inst("s_addc_u32", ctx.sreg(srd_name, 1, 1),
                      ctx.sreg(srd_name, 1, 1), "0", comment="carry")
 
-    # -- per-index stubs (for ScaleBlock compat) ----------------------------
-
-    def emit_load_a(self, mi: int, ki: int) -> None:
-        self.emit_read_a(mi, ki)
-
-    def emit_load_b(self, ni: int, ki: int) -> None:
-        self.emit_read_b(ni, ki)
-
-    # -- composable K-loop integration -------------------------------------
-
-    @property
-    def has_scales(self) -> bool:
-        return True
-
-    @property
-    def has_cross_iter_prefetch(self) -> bool:
-        return False
 
     def precompute_soffsets(self) -> None:
         self.alloc_registers()
         self.emit_setup()
 
-    def num_initial_inflight(self, partition_m: int) -> int:
-        return 2  # 1 DTL scale A + 1 DTL scale B
-
-    def cross_iter_inflight(self, partition_m: int, nr: int) -> int:
-        return 0
-
-    def emit_scale_wait(self, loader: 'GlobalLoader') -> None:
-        pass  # Scales read via lgkmcnt, not vmcnt
-
-    def emit_subtile_wait(self, loader: 'GlobalLoader', st_idx: int) -> None:
-        pass  # Scales read via lgkmcnt
-
-    def emit_mfma(self, ctx: AsmContext, mfma: MfmaConfig, acc: str,
-                  a_reg: str, b_reg: str,
-                  mi: int, ni: int, ki: int) -> None:
-        """Emit MFMA with op_sel for pre-swizzled scale bytes."""
-        sa_name = self._scale_a_names.get((mi, ki))
-        sb_name = self._scale_b_names.get((ni, ki))
-        if sa_name is None or sb_name is None:
-            ctx.inst(mfma.instruction_name, acc, a_reg, b_reg, acc,
-                     ctx.vreg("v_mxscale"), ctx.vreg("v_mxscale"),
-                     f"cbsz:{mfma.cbsz} blgp:{mfma.blgp}",
-                     comment=f"MFMA m{mi}_n{ni}_k{ki}")
-            return
-
-        a_sel = mi % 2
-        b_sel = ni % 2
-        hi_a = ki
-        hi_b = ki
-        ctx.inst(mfma.instruction_name, acc, a_reg, b_reg, acc,
-                 ctx.vreg(sa_name), ctx.vreg(sb_name),
-                 f"op_sel:[{a_sel},{b_sel}] op_sel_hi:[{hi_a},{hi_b}]"
-                 f" cbsz:{mfma.cbsz} blgp:{mfma.blgp}",
-                 comment=f"MFMA m{mi}_n{ni}_k{ki}")
-
-    # -- Compatibility stubs -----------------------------------------------
-
-    def emit_initial_loads(self, partition_m: int) -> None:
-        pass  # DTL handled by DTLLoader
-
-    def emit_loop_loads(self) -> None:
-        pass  # DTL handled by DTLLoader

@@ -1,153 +1,114 @@
-# Kernel Generator -- Architecture
+# GEMM Kernel Generator -- Architecture
 
-## Overview
+Python-based assembly generator for GEMM kernels targeting AMD gfx950
+(MI355X). Produces `.s` assembly that assembles to `.co` code objects
+loadable via hipModule.
 
-Python-based GEMM kernel generator targeting MI355X (gfx950). Produces
-GCN assembly (`.s`) from a dependency graph of K-loop operations. No IR --
-assembly is emitted as text by callback functions, then assembled by
-`amdclang`.
-
-Supported data types: FP16, BF16, MXFP4 (with real scale loading).
-
-## Pipeline
+## Pipeline Overview
 
 ```
-GemmKernel.build(problem, tiling)
-    |
-GemmTiling.build_tile_tree()     -- tile hierarchy with phase callbacks
-    |
-KLoopGraph                       -- ops + dependencies (DAG)
-    |
-KLoopScheduler.schedule()        -- MFMA backbone + side-op placement
-    |
-scheduled_kloop_phase()          -- emit assembly from schedule
-    |
-AsmContext -> .s -> amdclang -> .co
+GemmProblem + GemmTiling
+        |
+   GemmKernel.build()       # kernel.py, tiling.py
+        |
+   TileTree walker           # tile/tree.py -- emits prologue phases
+        |
+   pipeline_kloop_phase()    # schedule/pipeline.py -- K-loop entry point
+        |
+   +-- _build_loader_reader_scale()   # shared setup
+   |
+   +-- build_kloop_graph()            # schedule/graph_builder.py
+   |       builds KLoopGraph from LDSStream declarations
+   |
+   +-- PipelineScheduler.schedule()   # schedule/pipeline_scheduler.py
+   |       derives body order, ramp-up, drain, waitcnts
+   |
+   +-- wire_emit_callbacks()          # schedule/emit_wiring.py
+   |       connects graph ops to codegen primitives
+   |
+   +-- PipelineEmitter.emit()         # schedule/pipeline_emitter.py
+           emits ramp-up + body loop + drain as assembly
 ```
 
-## Dependency-Driven Scheduling
-
-Building blocks declare operations and their dependencies into a
-`KLoopGraph`. The `KLoopScheduler` produces an instruction sequence.
-
-**Building blocks:**
-- `MFMABlock`: mr * nr * ki MFMAs with RAW deps on A/B operands
-- `DSReadBlock`: ds_reads with SYNC on barrier + WAR for A ping-pong
-- `GlobalLoadBlock`: next-iter DTL loads (iteration=1, conditional skip)
-- `SuffixBlock`: vmcnt wait, toggle, negate (placed backward)
-
-**Key insight:** WAR deps on A ping-pong buffers automatically create
-the partition structure. `read_a(mi=2, buf=0)` can't issue until
-`mfma(mi=0, ..., last)` finishes, so the scheduler groups MFMAs by mi
-with A-prefetch interleaving -- no magic constants.
-
-**Scheduling phases:**
-1. MFMA backbone ordered by (mi, ki, ni)
-2. Side ops classified (pre-body B reads, preamble, prefetch, body reads)
-3. Forward placement of A-prefetch reads respecting WAR deps
-4. Backward placement of suffix ops (maximize overlap)
-5. Auto-wait insertion from dependency distances
-
-See `schedule/DESIGN_SCHEDULER.md` for the full design.
-
-## K-loop Structure
-
-```
-Prologue:
-  DTL load tile 0 -> vmcnt(0) -> barrier
-
-k_loop:
-  B[ki=0] reads (overlap with arriving loads)
-  conditional: advance + toggle + DTL load next tile
-  barrier
-  preamble: A[m0,k0] + B[ki=1] + A[m0,k1]
-  lgkmcnt(N)
-
-  [scheduled MFMA body with interleaved ds_reads + suffix]
-    for each MFMA:
-      side ops (A-prefetch reads, suffix vmcnt/toggle/negate)
-      MFMA instruction
-      auto-wait at mi boundaries
-
-  barrier
-  branch k_loop
-```
-
-## Memory Architecture
-
-**Global -> LDS:** Direct-To-LDS (`buffer_load ... ,lds`) bypasses
-VGPRs. Double-buffered LDS with XOR toggle.
-
-**LDS -> VGPRs:** Swizzle-aware `ds_read_b128` with per-ki XOR offsets
-to avoid bank conflicts. A operands use ping-pong buffers (2 slots).
-B operands are single-buffered (loaded in preamble).
-
-**Scales (MXFP4):** Loaded directly from global memory into VGPRs via
-`buffer_load_dword`. Subtile-level prefetch hides latency. Supports
-both linear and pre-swizzled (AITER) addressing.
-
-## File Map
+## Directory Layout
 
 ```
 gemm/
-  kernel.py              GemmKernel.build() + emit() entry point
-  problem.py             GemmProblem, TileConfig, MfmaConfig, DataType
-  tiling.py              GemmTiling, TileDim chains, build_tile_tree()
-  launcher.py            HIP ctypes launcher + correctness + timing
-  benchmark.py           Benchmark harness (ours vs hipblaslt-bench)
-  export_tensilelite.py  Export as TensileLite custom kernel
+  kernel.py          Top-level build + emit entry point
+  problem.py         GemmProblem, TileConfig, MfmaConfig, DataType
+  tiling.py          GemmTiling: composable tile hierarchy
+  launcher.py        GPU launch + correctness checking
+  benchmark.py       Performance measurement
+  export_tensilelite.py  TensileLite ABI-compatible export
 
-  emit/
-    context.py           AsmContext -- register naming + instruction emit
-    emitter.py           assemble_kernel() (amdclang), emit_header()
-    layouts.py           emit_affine(), GemmLayouts (coordinate transforms)
-    phases.py            Prologue phases + store epilogue
+  emit/              Assembly emission primitives
+    context.py       AsmContext: register allocation, instruction emit
+    emitter.py       Kernel metadata (.amdhsa_kernel, .amdgpu_metadata)
+    layouts.py       LDS layout computation
+    phases.py        Tile tree phase functions (setup, store)
 
-  tile/
-    tree.py              TileLevel, TilePhase, walk_tile_tree()
-    transforms.py        Dim, Tile, Flatten, Pad, Embed, Xor
-    context.py           TileContext -- scoped register allocator
+  tile/              Tile tree (hierarchical code generation)
+    tree.py          TileLevel, TilePhase -- walk and emit
+    transforms.py    Dim, Tile, TileDescriptor, Embed
+    context.py       Thread/wave index computation
 
-  kloop/
-    setup.py             DTL/wave-ABI setup phases + phase_mx_scale_setup
+  kloop/             K-loop setup helpers
+    setup.py         DTL interleaved setup, wave ABI, scale setup
 
-  schedule/
-    kloop_graph.py       KLoopGraph, KLoopOp, Dep, building blocks
-    kloop_scheduler.py   KLoopScheduler + scheduled_kloop_phase (emitter)
-    slot_placer.py       SlotPlacer -- instruction interleaving engine
+  memory/            Data movement codegen
+    global_loader.py DTLLoader (direct-to-LDS), BufferLoader (VGPR path)
+    lds_reader.py    Swizzle-aware ds_read for A/B operands
+    lds_stream.py    LDSStream ABC + LDSBufferManager
+    streams.py       DTLDataStream, ScaleStream, NullStream
+    mfma_emitter.py  Unified MFMA emission (all scale variants)
+    scale_loader.py  LDSScaleLoader, VMEMScaleLoader (MX scale handling)
+    swizzle.py       Bank-conflict-free LDS swizzle framework
 
-  memory/
-    global_loader.py     DTLLoader, BufferLoader (global -> LDS)
-    lds_reader.py        LDSReader (LDS -> VGPRs, swizzle-aware)
-    scale_loader.py      VMEMScaleLoader, NullScaleLoader (MX scales)
-    swizzle.py           RotationSwizzle, XorSwizzle, IdentitySwizzle
+  schedule/          K-loop scheduling
+    kloop_graph.py   OpKind, DepKind, KLoopOp, Dep, KLoopGraph
+    graph_builder.py build_kloop_graph() from LDSStream list
+    pipeline_scheduler.py  PipelineScheduler -> ScheduledPipeline
+    pipeline_emitter.py    PipelineEmitter: assembly from schedule
+    emit_wiring.py   Connects graph ops to codegen callbacks
+    pipeline.py      Entry point + TilePartitioner + StreamKPartitioner
 ```
 
-## Usage
+## K-Loop Scheduling
 
-```python
-from kernel_generator.gemm.problem import GemmProblem, DataType, MfmaConfig
-from kernel_generator.gemm.tiling import GemmTiling
-from kernel_generator.gemm.kernel import GemmKernel
+The scheduler works in three layers:
 
-# FP16
-p = GemmProblem(4096, 4096, 4096)
-k = GemmKernel.build(p)
-asm = k.emit()
-co = asm.assemble()
+1. **Graph construction** (`graph_builder.py`): Declares ops (global_load,
+   ds_write, barrier, ds_read, mfma, toggle) and dependencies (RAW, WAR,
+   SYNC) from LDSStream metadata. No codegen at this stage.
 
-# MXFP4
-mx = MfmaConfig.mxfp4_16x16x128()
-t = GemmTiling.high_perf(wg_m=256, wg_n=256, unroll_k=256, mfma=mx)
-p = GemmProblem(4096, 4096, 4096, dtype=DataType.MXFP4)
-k = GemmKernel.build(p, tiling=t)
-asm = k.emit()
-co = asm.assemble()
-```
+2. **Scheduling** (`pipeline_scheduler.py`): Derives loop structure from
+   the graph:
+   - Pre-body reads (B ki=0) placed before skip-check for latency hiding
+   - Produce-first vs consume-first order from PGR depth
+   - Ramp-up / drain stages from max iteration distance
+   - Waitcnts computed from counter tracking + RAW deps
 
-## Tests
+3. **Emission** (`pipeline_emitter.py`): Walks the `ScheduledPipeline`
+   and emits assembly. The emitter is a thin layer -- all scheduling
+   decisions come from the scheduler.
 
-```bash
-cd kernel-generator
-PYTHONPATH=shared pytest shared/kernel_generator/tests/gemm/ -q
-```
+Op-to-instruction mapping is handled by `emit_wiring.py`, which connects
+each graph op's `emit` callback to the actual codegen method on
+`GlobalLoader`, `LDSReader`, `MFMAEmitter`, or `ScaleStream`.
+
+## Double Buffering
+
+LDS is split into two equal buffers. The `LDSBufferManager` owns layout
+and toggle. ADD-based toggle (negate step each iteration) supports
+non-power-of-2 buffer sizes needed for scale data alongside matrix data.
+
+A-matrix uses ping-pong within each buffer (2 VGPR sets for even/odd mi).
+B-matrix reads are not ping-ponged.
+
+## Supported Configurations
+
+- **Data types**: FP16, BF16, MXFP4
+- **PGR**: 0 (no prefetch), 1 (produce-first), 2 (consume-first)
+- **Tile sizes**: 256x256 default; configurable via GemmTiling
+- **LDS swizzle**: RowRotation, PairedRowRotation, XOR, Identity
+- **Scale loading**: LDS-based (DTL + ds_write), VMEM-based (buffer_load)

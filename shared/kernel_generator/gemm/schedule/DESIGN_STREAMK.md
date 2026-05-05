@@ -16,7 +16,7 @@ It changes HOW work is distributed, not WHAT computation happens.
 KernelPipeline = TilePartitioner + ComputePipeline + Epilogue
                   ^^^^^^^^^^^^^                       ^^^^^^^^
                   StreamK changes these two.
-                  ComputePipeline (AutoPipelinedCompute) is unchanged.
+                  ComputePipeline (PipelineScheduler + PipelineEmitter) is unchanged.
 ```
 
 ### Components

@@ -65,18 +65,7 @@ class DTLLoader(GlobalLoader):
     Data goes directly from global memory to LDS without touching VGPRs.
     Requires SRDs (s_srd_a, s_srd_b) and per-thread LDS write offsets
     set up by the setup phase. Uses vmcnt for synchronization.
-
-    When a scale_loader (LDSScaleLoader) is attached, also emits DTL
-    loads for MX scale data into dedicated LDS scale regions.
     """
-
-    def __init__(self, ctx, tile, problem):
-        super().__init__(ctx, tile, problem)
-        self._scale_loader = None
-
-    def attach_scale_loader(self, scale_loader):
-        """Attach an LDSScaleLoader for DTL scale loading."""
-        self._scale_loader = scale_loader
 
     def precompute_soffsets(self) -> None:
         """Precompute DTL scalar offsets to avoid cumulative s_add in K-loop."""
@@ -107,8 +96,6 @@ class DTLLoader(GlobalLoader):
     def emit_loads(self) -> None:
         self._emit_dtl_loads_a()
         self._emit_dtl_loads_b()
-        if self._scale_loader is not None:
-            self._scale_loader.emit_dtl_loads()
 
     def advance(self) -> None:
         ctx = self.ctx
@@ -118,8 +105,6 @@ class DTLLoader(GlobalLoader):
                      comment=f"{srd} += {self.k_stride}")
             ctx.inst("s_addc_u32", ctx.sreg(srd, 1, 1),
                      ctx.sreg(srd, 1, 1), "0", comment="carry")
-        if self._scale_loader is not None:
-            self._scale_loader.advance()
 
     def toggle_write(self) -> None:
         ctx = self.ctx
@@ -129,25 +114,8 @@ class DTLLoader(GlobalLoader):
         ctx.inst("s_add_u32", ctx.sreg("s_lds_wr_b_sg"),
                  ctx.sreg("s_lds_wr_b_sg"), ctx.sreg("s_lds_db_step"),
                  comment="wr_b += db")
-        if self._scale_loader is not None:
-            self._scale_loader.toggle_write()
 
     def emit_sync(self) -> None:
-        """Barrier after DTL writes land.
-
-        In consume-first mode, the caller already emits vmcnt(0)
-        before this. The barrier ensures all waves see the completed
-        DTL writes before any wave starts reading from LDS.
-
-        For LDS scales: vmcnt(0) drains both data DTL and scale
-        buffer_loads. We then do ds_writes + lgkmcnt(0) before barrier.
-        """
-        if self._scale_loader is not None:
-            from .scale_loader import LDSScaleLoader as _LDS
-            if isinstance(self._scale_loader, _LDS):
-                self._scale_loader.emit_scale_ds_writes()
-                self.ctx.s_waitcnt("lgkmcnt(0)",
-                                   comment="wait scale LDS writes")
         self.ctx.s_barrier(comment="sync DTL writes")
 
     @property
