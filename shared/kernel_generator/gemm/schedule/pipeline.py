@@ -227,8 +227,11 @@ class StreamKPartitioner(TilePartitioner):
                  comment="num_partitions (header[0])")
         ctx.inst("s_load_dwordx2", ctx.sreg("s_workspace_ptr"), karg,
                  "40", comment="workspace ptr (C slot)")
+        # flags_ptr location depends on kernarg layout:
+        # FP16: offset 64 (strideD0/D1), MX: offset 80 (strideD0/D1)
+        flags_offset = "80" if tile.mfma.is_mx else "64"
         ctx.inst("s_load_dwordx2", ctx.sreg("s_flags_ptr"), karg,
-                 "64", comment="flags ptr (stride D slot)")
+                 flags_offset, comment="flags ptr (strideD slot)")
         ctx.s_waitcnt("lgkmcnt(0)", comment="wait SK kernargs")
         ctx.raw("")
 
@@ -358,13 +361,62 @@ class StreamKPartitioner(TilePartitioner):
                  "0x20000", comment="flags")
         ctx.raw("")
 
+        # Recompute scale SRDs for MX types
+        if tile.mfma.is_mx and ctx.has("s_srd_scale_a"):
+            use_swizzled = ctx._metadata.get("swizzled_scales", False)
+            ctx.comment("Recompute scale SRD A/B for corrected tile coords")
+            if use_swizzled:
+                ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"),
+                          str(tile.wg_m // 32),
+                          comment=f"tile_m * {tile.wg_m // 32}")
+            else:
+                ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"),
+                          str(tile.wg_m),
+                          comment=f"tile_m * {tile.wg_m}")
+            ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+                     ctx.sreg("s_stride_scale_a"),
+                     comment="* stride_scale_a")
+            ctx.inst("s_add_u32", ctx.sreg("s_srd_scale_a", 0, 1),
+                     ctx.sreg("s_ptr_scale_a", 0, 1), ctx.sreg("s_tmp0"),
+                     comment="SRD_scaleA lo")
+            ctx.inst("s_addc_u32", ctx.sreg("s_srd_scale_a", 1, 1),
+                     ctx.sreg("s_ptr_scale_a", 1, 1), "0",
+                     comment="SRD_scaleA hi")
+            ctx.inst("s_mov_b32", ctx.sreg("s_srd_scale_a", 2, 1),
+                     "0xFFFFFFFF", comment="limit")
+            ctx.inst("s_mov_b32", ctx.sreg("s_srd_scale_a", 3, 1),
+                     "0x20000", comment="flags")
+
+            if use_swizzled:
+                ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"),
+                          str(tile.wg_n // 32),
+                          comment=f"tile_n * {tile.wg_n // 32}")
+            else:
+                ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"),
+                          str(tile.wg_n),
+                          comment=f"tile_n * {tile.wg_n}")
+            ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+                     ctx.sreg("s_stride_scale_b"),
+                     comment="* stride_scale_b")
+            ctx.inst("s_add_u32", ctx.sreg("s_srd_scale_b", 0, 1),
+                     ctx.sreg("s_ptr_scale_b", 0, 1), ctx.sreg("s_tmp0"),
+                     comment="SRD_scaleB lo")
+            ctx.inst("s_addc_u32", ctx.sreg("s_srd_scale_b", 1, 1),
+                     ctx.sreg("s_ptr_scale_b", 1, 1), "0",
+                     comment="SRD_scaleB hi")
+            ctx.inst("s_mov_b32", ctx.sreg("s_srd_scale_b", 2, 1),
+                     "0xFFFFFFFF", comment="limit")
+            ctx.inst("s_mov_b32", ctx.sreg("s_srd_scale_b", 3, 1),
+                     "0x20000", comment="flags")
+            ctx.raw("")
+
         # Now apply K-offset if iter_start > 0 (separate pass since
         # we just rebuilt the SRD bases)
         ctx.inst("s_cmp_eq_u32", ctx.sreg("s_iter_start"), "0",
                  comment="skip K-offset if iter_start == 0")
         ctx.inst("s_cbranch_scc1", "sk_no_k_offset2",
                  comment="no K-offset needed")
-        k_bytes_per_tile_iter = tile.unroll_k * elem
+        k_bytes_per_tile_iter = int(tile.unroll_k * elem)
         ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_iter_start"),
                   str(k_bytes_per_tile_iter),
                   comment=f"k_offset = iter_start * {k_bytes_per_tile_iter}")
@@ -378,6 +430,24 @@ class StreamKPartitioner(TilePartitioner):
                  comment="SRD_B += k_offset")
         ctx.inst("s_addc_u32", ctx.sreg("s_srd_b", 1, 1),
                  ctx.sreg("s_srd_b", 1, 1), "0", comment="carry")
+        # Scale SRD K-offset: scale stride is K/mx_block, so
+        # k_offset_scale = iter_start * (unroll_k / mx_block) * 1 byte
+        if tile.mfma.is_mx and ctx.has("s_srd_scale_a"):
+            mx_block = tile.mfma.mx_block
+            scale_k_bytes = tile.unroll_k // mx_block  # 1 byte per scale
+            ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_iter_start"),
+                      str(scale_k_bytes),
+                      comment=f"scale_k_offset = iter_start * {scale_k_bytes}")
+            ctx.inst("s_add_u32", ctx.sreg("s_srd_scale_a", 0, 1),
+                     ctx.sreg("s_srd_scale_a", 0, 1), ctx.sreg("s_tmp0"),
+                     comment="SRD_scaleA += scale_k_offset")
+            ctx.inst("s_addc_u32", ctx.sreg("s_srd_scale_a", 1, 1),
+                     ctx.sreg("s_srd_scale_a", 1, 1), "0", comment="carry")
+            ctx.inst("s_add_u32", ctx.sreg("s_srd_scale_b", 0, 1),
+                     ctx.sreg("s_srd_scale_b", 0, 1), ctx.sreg("s_tmp0"),
+                     comment="SRD_scaleB += scale_k_offset")
+            ctx.inst("s_addc_u32", ctx.sreg("s_srd_scale_b", 1, 1),
+                     ctx.sreg("s_srd_scale_b", 1, 1), "0", comment="carry")
         ctx.label("sk_no_k_offset2")
         ctx.raw("")
 

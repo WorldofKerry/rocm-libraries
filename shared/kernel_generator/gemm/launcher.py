@@ -614,6 +614,7 @@ class GemmLauncher:
 
         All WGs launch in one grid. Each WG derives its tile and
         K-partition from its flat workgroup ID on the GPU side.
+        Supports both FP16 and MXFP4 data types.
 
         Args:
             num_partitions: K-splits per tile (1 = DP, >1 = StreamK).
@@ -628,7 +629,8 @@ class GemmLauncher:
 
         p = self.problem
         tile = self.tile
-        elem = 2  # FP16
+        is_mx = hasattr(tile, 'mfma') and getattr(tile.mfma, 'is_mx', False)
+        elem = 2  # output is always fp16 (2 bytes)
         k_tiles = p.k // tile.unroll_k
         tiles_m = p.m // tile.wg_m
         tiles_n = p.n // tile.wg_n
@@ -648,6 +650,36 @@ class GemmLauncher:
         _check(hip.hipMemcpy(d_B, B.ctypes.data, B.nbytes, 1), "H2D B")
         _check(hip.hipMemset(d_D, 0, p.m * p.n * elem), "memset D")
 
+        # Scale buffers for MX types
+        d_scale_A, d_scale_B = ctypes.c_void_p(0), ctypes.c_void_p(0)
+        scale_a_cols = scale_b_cols = 0
+        if is_mx:
+            mx_block = tile.mfma.mx_block
+            scale_a_cols = p.k // mx_block
+            scale_b_cols = p.k // mx_block
+            scale_a_bytes = max(p.m * scale_a_cols, 4096)
+            scale_b_bytes = max(p.n * scale_b_cols, 4096)
+            _check(hip.hipMalloc(ctypes.byref(d_scale_A), scale_a_bytes), "malloc scaleA")
+            _check(hip.hipMalloc(ctypes.byref(d_scale_B), scale_b_bytes), "malloc scaleB")
+            if self._scale_A is not None:
+                src_a = self._scale_A.ravel()
+                if len(src_a) < scale_a_bytes:
+                    src_a = np.pad(src_a, (0, scale_a_bytes - len(src_a)),
+                                  constant_values=0x7F)
+                _check(hip.hipMemcpy(d_scale_A, src_a.ctypes.data,
+                                     scale_a_bytes, 1), "H2D scaleA")
+            else:
+                _check(hip.hipMemset(d_scale_A, 0x7F, scale_a_bytes), "memset scaleA")
+            if self._scale_B is not None:
+                src_b = self._scale_B.ravel()
+                if len(src_b) < scale_b_bytes:
+                    src_b = np.pad(src_b, (0, scale_b_bytes - len(src_b)),
+                                  constant_values=0x7F)
+                _check(hip.hipMemcpy(d_scale_B, src_b.ctypes.data,
+                                     scale_b_bytes, 1), "H2D scaleB")
+            else:
+                _check(hip.hipMemset(d_scale_B, 0x7F, scale_b_bytes), "memset scaleB")
+
         # Workspace + flags (only needed when num_partitions > 1)
         d_ws, d_flags = ctypes.c_void_p(0), ctypes.c_void_p(0)
         if num_partitions > 1:
@@ -666,38 +698,73 @@ class GemmLauncher:
         # Single-launch grid: total_tiles * num_partitions WGs in 1D
         grid_x = total_tiles * num_partitions
 
-        # Build kernarg via void** matching TensileLite FP16 22-arg layout.
-        # Header slots carry StreamK params instead of the usual metadata.
         ws_val = d_ws.value if d_ws.value else 0
         flags_val = d_flags.value if d_flags.value else 0
         flags_lo = flags_val & 0xFFFFFFFF
         flags_hi = (flags_val >> 32) & 0xFFFFFFFF
 
-        refs = [
-            ctypes.c_uint32(num_partitions),  # header[0]: num_partitions
-            ctypes.c_uint32(0),               # header[1]: unused
-            ctypes.c_uint32(0),               # header[2]: unused
-            ctypes.c_uint32(grid_x),          # header[3]: total_wgs (WGMXCC)
-            ctypes.c_uint32(p.m),             # M
-            ctypes.c_uint32(p.n),             # N
-            ctypes.c_uint32(1),               # batch
-            ctypes.c_uint32(p.k),             # K
-            ctypes.c_void_p(d_D.value),       # D ptr
-            ctypes.c_void_p(ws_val),          # workspace ptr (C slot)
-            ctypes.c_void_p(d_A.value),       # A ptr
-            ctypes.c_void_p(d_B.value),       # B ptr
-            ctypes.c_uint32(flags_lo),        # strideD0 -> flags_ptr lo
-            ctypes.c_uint32(flags_hi),        # strideD1 -> flags_ptr hi
-            ctypes.c_uint32(0),               # strideC0 -> unused
-            ctypes.c_uint32(0),               # strideC1 -> unused
-            ctypes.c_uint32(p.k),             # strideA0
-            ctypes.c_uint32(p.m * p.k),       # strideA1
-            ctypes.c_uint32(p.k),             # strideB0
-            ctypes.c_uint32(p.n * p.k),       # strideB1
-            ctypes.c_float(1.0),              # alpha
-            ctypes.c_float(0.0),              # beta
-        ]
-        assert len(refs) == 22, f"Expected 22 args, got {len(refs)}"
+        if is_mx:
+            # MXFP4 TensileLite kernarg (136 bytes, 30 void** entries).
+            # StreamK fields: num_partitions in header[0], workspace in C slot,
+            # flags_ptr in strideD0/D1 (offsets 80-87).
+            refs = [
+                ctypes.c_uint32(num_partitions),      # header[0]: num_partitions
+                ctypes.c_uint32(0),                   # header[1]
+                ctypes.c_uint32(0),                   # header[2]
+                ctypes.c_uint32(grid_x),              # header[3]: total_wgs
+                ctypes.c_uint32(p.m),                 # M
+                ctypes.c_uint32(p.n),                 # N
+                ctypes.c_uint32(1),                   # batch
+                ctypes.c_uint32(p.k),                 # K
+                ctypes.c_void_p(d_D.value),           # D ptr
+                ctypes.c_void_p(ws_val),              # workspace ptr (C slot)
+                ctypes.c_void_p(d_A.value),           # A ptr
+                ctypes.c_void_p(d_scale_A.value),     # MXSA ptr
+                ctypes.c_void_p(d_B.value),           # B ptr
+                ctypes.c_void_p(d_scale_B.value),     # MXSB ptr
+                ctypes.c_uint32(flags_lo),            # strideD0 -> flags lo
+                ctypes.c_uint32(flags_hi),            # strideD1 -> flags hi
+                ctypes.c_uint32(0),                   # strideC0
+                ctypes.c_uint32(0),                   # strideC1
+                ctypes.c_uint32(p.k),                 # strideA0
+                ctypes.c_uint32(p.m * p.k),           # strideA1
+                ctypes.c_uint32(scale_a_cols),        # strideMXSA0
+                ctypes.c_uint32(p.m * scale_a_cols),  # strideMXSA1
+                ctypes.c_uint32(p.k),                 # strideB0
+                ctypes.c_uint32(p.n * p.k),           # strideB1
+                ctypes.c_uint32(scale_b_cols),        # strideMXSB0
+                ctypes.c_uint32(p.n * scale_b_cols),  # strideMXSB1
+                ctypes.c_float(1.0),                  # alpha
+                ctypes.c_float(0.0),                  # beta
+            ]
+            assert len(refs) == 28, f"Expected 28 MX args, got {len(refs)}"
+        else:
+            # FP16 TensileLite kernarg (104 bytes, 22 void** entries).
+            refs = [
+                ctypes.c_uint32(num_partitions),  # header[0]: num_partitions
+                ctypes.c_uint32(0),               # header[1]: unused
+                ctypes.c_uint32(0),               # header[2]: unused
+                ctypes.c_uint32(grid_x),          # header[3]: total_wgs
+                ctypes.c_uint32(p.m),             # M
+                ctypes.c_uint32(p.n),             # N
+                ctypes.c_uint32(1),               # batch
+                ctypes.c_uint32(p.k),             # K
+                ctypes.c_void_p(d_D.value),       # D ptr
+                ctypes.c_void_p(ws_val),          # workspace ptr (C slot)
+                ctypes.c_void_p(d_A.value),       # A ptr
+                ctypes.c_void_p(d_B.value),       # B ptr
+                ctypes.c_uint32(flags_lo),        # strideD0 -> flags lo
+                ctypes.c_uint32(flags_hi),        # strideD1 -> flags hi
+                ctypes.c_uint32(0),               # strideC0
+                ctypes.c_uint32(0),               # strideC1
+                ctypes.c_uint32(p.k),             # strideA0
+                ctypes.c_uint32(p.m * p.k),       # strideA1
+                ctypes.c_uint32(p.k),             # strideB0
+                ctypes.c_uint32(p.n * p.k),       # strideB1
+                ctypes.c_float(1.0),              # alpha
+                ctypes.c_float(0.0),              # beta
+            ]
+            assert len(refs) == 22, f"Expected 22 args, got {len(refs)}"
         args = (ctypes.c_void_p * len(refs))()
         for i, v in enumerate(refs):
             args[i] = ctypes.c_void_p(ctypes.addressof(v))
@@ -740,6 +807,9 @@ class GemmLauncher:
         hip.hipFree(d_A)
         hip.hipFree(d_B)
         hip.hipFree(d_D)
+        if is_mx:
+            hip.hipFree(d_scale_A)
+            hip.hipFree(d_scale_B)
         if num_partitions > 1:
             hip.hipFree(d_ws)
             hip.hipFree(d_flags)
