@@ -159,6 +159,7 @@ def emit_descriptor(ctx: AsmContext, kernel_name: str,
     else:
         kernarg_size = 104  # TensileLite non-MX layout
 
+
     ctx.raw("")
     ctx.raw(".rodata")
     ctx.raw(".p2align 6")

@@ -90,15 +90,15 @@ def _load_hip() -> ctypes.CDLL:
     # hipModuleLaunchKernel -- same sig but uses extra for flat kernarg
     hip.hipExtModuleLaunchKernel.argtypes = [
         VP,   # function
-        INT, INT, INT,  # grid dims
-        INT, INT, INT,  # block dims
-        INT,  # shared mem bytes
+        ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,  # globalWorkSize
+        ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,  # localWorkSize
+        ctypes.c_size_t,  # shared mem bytes
         VP,   # stream
         VP,   # kernelParams (void**, unused when extra is set)
         VP,   # extra (void** with LAUNCH_PARAM entries)
         VP,   # startEvent
         VP,   # stopEvent
-        INT,  # flags
+        ctypes.c_uint,  # flags
     ]
     hip.hipExtModuleLaunchKernel.restype = INT
 
@@ -611,8 +611,9 @@ class GemmLauncher:
     ) -> GemmResult:
         """Launch a StreamK GEMM kernel in DP mode (full K per WG).
 
-        Phase 1: all WGs run full K range (is_partial=0). Validates
-        the StreamK partitioner + conditional epilogue.
+        SK fields are packed into the TensileLite kernarg header
+        (offsets 0-12) which is normally unused by the kernel.
+        Workspace pointer reuses the C slot (offset 40).
         """
         import time
 
@@ -628,7 +629,6 @@ class GemmLauncher:
         grid_m, grid_n = p.grid_dims(tile)
         total_wgs = grid_m * grid_n
         block_size = tile.block_size
-        tiles_m = p.m // tile.wg_m
 
         A, B, _ = self.generate_inputs()
         _, _, _, D_ref = self.reference_numpy()
@@ -649,40 +649,28 @@ class GemmLauncher:
                                         kernel_name.encode()),
                "hipModuleGetFunction")
 
-        # Build void** args matching kernel's flat kernarg layout.
-        # Base FP16 (104 bytes) + pad to 128 + SK fields (32 bytes) = 160 bytes.
-        # Each arg contributes its sizeof to the flat layout.
-        _header = [ctypes.c_uint32(0), ctypes.c_uint32(0),
-                   ctypes.c_uint32(0), ctypes.c_uint32(total_wgs)]     # 16B
+        # Build void** args with SK fields in header slots.
+        # Header (offsets 0-15): iter_start, iter_end, is_partial, partition_idx
+        _header = [ctypes.c_uint32(0),       # offset 0: iter_start = 0
+                   ctypes.c_uint32(k_tiles), # offset 4: iter_end = full K
+                   ctypes.c_uint32(0),       # offset 8: is_partial = 0
+                   ctypes.c_uint32(0)]       # offset 12: partition_idx = 0
         _sizes = [ctypes.c_uint32(p.m), ctypes.c_uint32(p.n),
-                  ctypes.c_uint32(1), ctypes.c_uint32(p.k)]             # 16B
-        _ptrs = [ctypes.c_void_p(d_D.value), ctypes.c_void_p(d_D.value),
-                 ctypes.c_void_p(d_A.value), ctypes.c_void_p(d_B.value)] # 32B
+                  ctypes.c_uint32(1), ctypes.c_uint32(p.k)]
+        # D ptr at offset 32, C ptr (=workspace) at offset 40
+        _ptrs = [ctypes.c_void_p(d_D.value),   # D ptr (offset 32)
+                 ctypes.c_void_p(0),            # C/workspace ptr (offset 40) = NULL for DP
+                 ctypes.c_void_p(d_A.value),    # A ptr (offset 48)
+                 ctypes.c_void_p(d_B.value)]    # B ptr (offset 56)
         _strides = [
             ctypes.c_uint32(p.n), ctypes.c_uint32(p.m * p.n),
             ctypes.c_uint32(p.n), ctypes.c_uint32(p.m * p.n),
             ctypes.c_uint32(p.k), ctypes.c_uint32(p.m * p.k),
-            ctypes.c_uint32(p.k), ctypes.c_uint32(p.n * p.k)]           # 32B
-        _alpha_beta = [ctypes.c_float(1.0), ctypes.c_float(0.0)]         # 8B
-        # Total so far: 104 bytes
-
-        # Pad to offset 128: need 24 bytes = 6 x uint32
-        _pad = [ctypes.c_uint32(0)] * 6                                   # 24B
-
-        # SK fields at offset 128:
-        # workspace_ptr (8B), iter_start(4B), iter_end(4B),
-        # k_tiles_per_tile(4B), num_m_tiles(4B), is_partial(4B), partition_idx(4B)
-        _sk = [
-            ctypes.c_void_p(0),              # workspace_ptr (128-135)
-            ctypes.c_uint32(0),              # iter_start (136)
-            ctypes.c_uint32(k_tiles),        # iter_end (140) = full K
-            ctypes.c_uint32(k_tiles),        # k_tiles_per_tile (144)
-            ctypes.c_uint32(tiles_m),        # num_m_tiles (148)
-            ctypes.c_uint32(0),              # is_partial (152) = not partial
-            ctypes.c_uint32(0),              # partition_idx (156)
+            ctypes.c_uint32(p.k), ctypes.c_uint32(p.n * p.k),
         ]
+        _alpha_beta = [ctypes.c_float(1.0), ctypes.c_float(0.0)]
 
-        _all_args = _header + _sizes + _ptrs + _strides + _alpha_beta + _pad + _sk
+        _all_args = _header + _sizes + _ptrs + _strides + _alpha_beta
         args = (ctypes.c_void_p * len(_all_args))()
         for i, v in enumerate(_all_args):
             args[i] = ctypes.cast(ctypes.pointer(v), ctypes.c_void_p)
@@ -695,17 +683,16 @@ class GemmLauncher:
         _check(hip.hipDeviceSynchronize(), "sync warmup")
 
         ev_start, ev_stop = ctypes.c_void_p(), ctypes.c_void_p()
-        _check(hip.hipEventCreate(ctypes.byref(ev_start)), "create event")
-        _check(hip.hipEventCreate(ctypes.byref(ev_stop)), "create event")
-
-        _check(hip.hipEventRecord(ev_start, None), "record start")
+        _check(hip.hipEventCreate(ctypes.byref(ev_start)), "event")
+        _check(hip.hipEventCreate(ctypes.byref(ev_stop)), "event")
+        _check(hip.hipEventRecord(ev_start, None), "record")
         for _ in range(num_iters):
             _check(hip.hipModuleLaunchKernel(
                 func, grid_m, grid_n, 1,
                 block_size, 1, 1, 0, None, args, None),
-                "launch timed")
-        _check(hip.hipEventRecord(ev_stop, None), "record stop")
-        _check(hip.hipEventSynchronize(ev_stop), "sync stop")
+                "launch")
+        _check(hip.hipEventRecord(ev_stop, None), "record")
+        _check(hip.hipEventSynchronize(ev_stop), "sync")
 
         elapsed_ms = ctypes.c_float()
         _check(hip.hipEventElapsedTime(ctypes.byref(elapsed_ms),
@@ -713,13 +700,10 @@ class GemmLauncher:
         avg_time = elapsed_ms.value / 1000.0 / num_iters
 
         D_out = np.zeros((p.m, p.n), dtype=np.float16)
-        _check(hip.hipMemcpy(D_out.ctypes.data, d_D, p.m * p.n * elem, 2), "D2H D")
+        _check(hip.hipMemcpy(D_out.ctypes.data, d_D, p.m * p.n * elem, 2), "D2H")
 
-        hip.hipEventDestroy(ev_start)
-        hip.hipEventDestroy(ev_stop)
-        hip.hipFree(d_A)
-        hip.hipFree(d_B)
-        hip.hipFree(d_D)
+        hip.hipEventDestroy(ev_start); hip.hipEventDestroy(ev_stop)
+        hip.hipFree(d_A); hip.hipFree(d_B); hip.hipFree(d_D)
         hip.hipModuleUnload(module)
 
         max_err = float(np.max(np.abs(D_out.astype(np.float32) - D_ref.astype(np.float32))))

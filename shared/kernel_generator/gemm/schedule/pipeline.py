@@ -201,25 +201,28 @@ class StreamKPartitioner(TilePartitioner):
         ctx.alloc_sgpr_permanent(2, "s_workspace_ptr")
         ctx.alloc_sgpr_permanent(1, "s_iter_start")
         ctx.alloc_sgpr_permanent(1, "s_iter_end")
-        ctx.alloc_sgpr_permanent(1, "s_k_tiles_per_tile")
-        ctx.alloc_sgpr_permanent(1, "s_num_m_tiles")
         ctx.alloc_sgpr_permanent(1, "s_is_partial")
         ctx.alloc_sgpr_permanent(1, "s_partition_idx")
 
-        ctx.inst("s_load_dwordx2", ctx.sreg("s_workspace_ptr"), karg, "128",
-                 comment="workspace ptr")
-        ctx.inst("s_load_dword", ctx.sreg("s_iter_start"), karg, "136",
-                 comment="iter_start")
-        ctx.inst("s_load_dword", ctx.sreg("s_iter_end"), karg, "140",
-                 comment="iter_end")
-        ctx.inst("s_load_dword", ctx.sreg("s_k_tiles_per_tile"), karg, "144",
-                 comment="k_tiles_per_tile")
-        ctx.inst("s_load_dword", ctx.sreg("s_num_m_tiles"), karg, "148",
-                 comment="num_m_tiles")
-        ctx.inst("s_load_dword", ctx.sreg("s_is_partial"), karg, "152",
-                 comment="is_partial (0=full, 1=partial)")
-        ctx.inst("s_load_dword", ctx.sreg("s_partition_idx"), karg, "156",
-                 comment="partition_idx (workspace slot)")
+        # StreamK fields packed into TensileLite kernarg header
+        # (offsets 0-12). These bytes are normally ignored by the
+        # kernel (gemm_info, info0, info1, numWG). Reusing them
+        # avoids extended kernarg issues with HIP's void** packing.
+        #   offset 0: iter_start (u32)
+        #   offset 4: iter_end (u32)
+        #   offset 8: is_partial (u32)
+        #   offset 12: partition_idx (u32)
+        # Workspace ptr reuses the C pointer slot (offset 40).
+        ctx.inst("s_load_dword", ctx.sreg("s_iter_start"), karg, "0",
+                 comment="iter_start (header[0])")
+        ctx.inst("s_load_dword", ctx.sreg("s_iter_end"), karg, "4",
+                 comment="iter_end (header[1])")
+        ctx.inst("s_load_dword", ctx.sreg("s_is_partial"), karg, "8",
+                 comment="is_partial (header[2])")
+        ctx.inst("s_load_dword", ctx.sreg("s_partition_idx"), karg, "12",
+                 comment="partition_idx (header[3])")
+        ctx.inst("s_load_dwordx2", ctx.sreg("s_workspace_ptr"), karg, "40",
+                 comment="workspace ptr (C slot)")
         ctx.s_waitcnt("lgkmcnt(0)", comment="wait SK kernargs")
         ctx.raw("")
 
