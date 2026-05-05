@@ -705,8 +705,13 @@ def _compute_global_partition_idx(ctx: 'AsmContext', tile: 'TileConfig') -> None
 
 
 def _build_ws_srd(ctx: 'AsmContext') -> None:
-    """Build workspace buffer SRD from s_workspace_ptr."""
-    ctx.alloc_sgpr_permanent(4, "s_srd_ws")
+    """Build workspace buffer SRD from s_workspace_ptr.
+
+    Always emits the MOV instructions so each branch that needs
+    the SRD gets its own initialization at runtime.
+    """
+    if not ctx.has("s_srd_ws"):
+        ctx.alloc_sgpr_permanent(4, "s_srd_ws")
     ctx.inst("s_mov_b32", ctx.sreg("s_srd_ws", 0, 1),
              ctx.sreg("s_workspace_ptr", 0, 1), comment="WS SRD lo")
     ctx.inst("s_mov_b32", ctx.sreg("s_srd_ws", 1, 1),
@@ -827,6 +832,7 @@ def _set_flag(ctx: 'AsmContext') -> None:
              ctx.sreg("s_srd_flags", 0, 4), ctx.sreg("s_tmp0"),
              comment="flags[partition_idx] = 1")
     ctx.s_waitcnt("lgkmcnt(0)", comment="wait flag store")
+    ctx.inst("s_dcache_wb", comment="flush scalar cache to L2 for visibility")
     ctx.raw("")
 
 def _owner_reduce(ctx: 'AsmContext', tile: 'TileConfig') -> None:
@@ -844,20 +850,21 @@ def _owner_reduce(ctx: 'AsmContext', tile: 'TileConfig') -> None:
     tile_area = tile.wg_m * tile.wg_n
     total_accs = mr * nr * acc_per
 
-    # Build workspace + flags SRDs (may already exist from non-owner path,
-    # but alloc_sgpr_permanent is idempotent for same name)
-    if not ctx.has("s_srd_ws"):
-        _build_ws_srd(ctx)
+    # Build workspace + flags SRDs. Must emit initialization MOVs
+    # unconditionally because the non-owner path (which also emits
+    # SRD setup) is on a different branch and the owner never
+    # executes it at runtime.
+    _build_ws_srd(ctx)
     if not ctx.has("s_srd_flags"):
         ctx.alloc_sgpr_permanent(4, "s_srd_flags")
-        ctx.inst("s_mov_b32", ctx.sreg("s_srd_flags", 0, 1),
-                 ctx.sreg("s_flags_ptr", 0, 1), comment="flags SRD lo")
-        ctx.inst("s_mov_b32", ctx.sreg("s_srd_flags", 1, 1),
-                 ctx.sreg("s_flags_ptr", 1, 1), comment="flags SRD hi")
-        ctx.inst("s_mov_b32", ctx.sreg("s_srd_flags", 2, 1), "0xFFFFFFFF",
-                 comment="flags SRD size")
-        ctx.inst("s_mov_b32", ctx.sreg("s_srd_flags", 3, 1), "0x20000",
-                 comment="flags SRD flags")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_flags", 0, 1),
+             ctx.sreg("s_flags_ptr", 0, 1), comment="flags SRD lo")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_flags", 1, 1),
+             ctx.sreg("s_flags_ptr", 1, 1), comment="flags SRD hi")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_flags", 2, 1), "0xFFFFFFFF",
+             comment="flags SRD size")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_flags", 3, 1), "0x20000",
+             comment="flags SRD flags")
 
     _ws_voffset(ctx, tile)
     # v_tmp2 = per-lane byte offset within tile (no partition base yet)
@@ -877,17 +884,19 @@ def _owner_reduce(ctx: 'AsmContext', tile: 'TileConfig') -> None:
              comment="all partitions accumulated")
 
     # Flag index = partition_idx + p
-    ctx.inst("s_add_u32", ctx.sreg("s_tmp1"),
+    # Use s_iter_start as scratch (it's 0 for the owner and no longer needed)
+    ctx.inst("s_add_u32", ctx.sreg("s_iter_start"),
              ctx.sreg("s_partition_idx"), ctx.sreg("s_tmp0"),
              comment="flag_idx = partition_idx + p")
-    ctx.s_lshl(ctx.sreg("s_tmp1"), ctx.sreg("s_tmp1"), 2,
+    ctx.s_lshl(ctx.sreg("s_iter_start"), ctx.sreg("s_iter_start"), 2,
                comment="flag_offset = flag_idx * 4")
 
-    # Poll flag
+    # Poll flag -- s_iter_start holds the offset (preserved across iterations),
+    # s_tmp1 receives the loaded value
     ctx.label("sk_poll_flag")
     ctx.inst("s_buffer_load_dword", ctx.sreg("s_tmp1"),
-             ctx.sreg("s_srd_flags", 0, 4), ctx.sreg("s_tmp1"),
-             "glc", comment="load flag (uncached)")
+             ctx.sreg("s_srd_flags", 0, 4), ctx.sreg("s_iter_start"),
+             "glc", comment="load flag (bypass scalar cache)")
     ctx.s_waitcnt("lgkmcnt(0)", comment="wait flag load")
     ctx.inst("s_cmp_eq_u32", ctx.sreg("s_tmp1"), "0",
              comment="flag still 0?")
