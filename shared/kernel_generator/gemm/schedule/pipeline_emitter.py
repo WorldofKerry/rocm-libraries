@@ -129,18 +129,26 @@ class PipelineEmitter:
                  comment=f"not enough tiles for stage {stage_idx}")
 
         has_writes = False
+        needs_vmcnt = False
         for op in ops:
             if op.kind == OpKind.BARRIER:
-                # Drain loads before barrier (not for last stage in
-                # consume-first mode where body starts with barrier).
-                ctx.s_waitcnt("vmcnt(0)", comment="wait loads")
+                if needs_vmcnt:
+                    ctx.s_waitcnt("vmcnt(0)", comment="wait loads")
+                    needs_vmcnt = False
                 if has_writes:
                     ctx.s_waitcnt("lgkmcnt(0)",
                                  comment="wait LDS writes")
                 ctx.s_barrier(comment=f"sync tile {stage_idx}")
                 continue
             if op.kind == OpKind.DS_WRITE:
+                # Must drain global loads before writing to LDS
+                if needs_vmcnt:
+                    ctx.s_waitcnt("vmcnt(0)",
+                                 comment="wait global loads before ds_write")
+                    needs_vmcnt = False
                 has_writes = True
+            if op.kind == OpKind.GLOBAL_LOAD:
+                needs_vmcnt = True
             self._emit_op(op)
 
         ctx.label(skip_label)
@@ -256,6 +264,14 @@ class PipelineEmitter:
             if i in waitcnts:
                 ctx.s_waitcnt(waitcnts[i],
                               comment=f"auto-wait at pos {i}")
+            # In consume-first mode the barrier syncs DTL loads and
+            # scale ds_writes issued by the previous iteration's
+            # producers.  Wait for both counters before the barrier.
+            if op.kind == OpKind.BARRIER:
+                ctx.s_waitcnt("vmcnt(0)",
+                              comment="wait DTL loads from prev iter")
+                ctx.s_waitcnt("lgkmcnt(0)",
+                              comment="wait LDS writes from prev iter")
             self._emit_op(op)
 
         # k_tiles-- and skip check before producers.
@@ -266,6 +282,13 @@ class PipelineEmitter:
                  comment=f"k_tiles > {pgr - 1}?")
         ctx.inst("s_cbranch_scc0", "load_skip_all",
                  comment="skip producers (drain)")
+
+        # Negate DB step BEFORE producer toggles so write pointers
+        # alternate correctly. In consume-first mode, the ramp-up
+        # left the step at +offset after toggling writes to buf 1.
+        # The first body producer needs -offset to toggle back to
+        # buf 0.  Subsequent iterations alternate naturally.
+        self.buffer_mgr.emit_negate_step(ctx)
 
         # Emit producer ops.
         for i in range(producer_start, len(body)):
@@ -289,6 +312,13 @@ class PipelineEmitter:
         for d_idx, drain_ops in enumerate(self.pipeline.drain):
             ctx.comment(f"Drain stage {d_idx}")
             for op in drain_ops:
+                # Barrier in drain must wait for any in-flight loads
+                # and LDS writes from the last producer iteration.
+                if op.kind == OpKind.BARRIER:
+                    ctx.s_waitcnt("vmcnt(0)",
+                                 comment="wait DTL loads")
+                    ctx.s_waitcnt("lgkmcnt(0)",
+                                 comment="wait LDS writes")
                 self._emit_op(op)
             ctx.raw("")
 
@@ -307,10 +337,23 @@ class PipelineEmitter:
             ctx.comment(f"[TODO] {op.name} ({op.kind.value})")
 
     def _emit_loop_tail(self) -> None:
-        """Negate DB step and branch back to k_loop."""
+        """Negate DB step (produce-first only) and branch back."""
         ctx = self.ctx
-        self.buffer_mgr.emit_negate_step(ctx)
-        ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
-                 comment="more?")
-        ctx.inst("s_cbranch_scc1", "k_loop", comment="loop")
+        # In consume-first mode, negate is emitted before producers
+        # (inside the skip-check guard), so skip it here.
+        if not self.pipeline.is_consume_first:
+            self.buffer_mgr.emit_negate_step(ctx)
+        if self.pipeline.drain:
+            # When explicit drain stages exist, exit the body loop
+            # early so the drain handles the final pgr-1 consumer
+            # iterations.  The body runs k_tiles - (pgr-1) iters.
+            pgr = self.pipeline.pgr
+            ctx.inst("s_cmp_gt_u32", ctx.sreg("s_k_tiles"),
+                     str(pgr - 1),
+                     comment=f"k_tiles > {pgr - 1}? (exit to drain)")
+            ctx.inst("s_cbranch_scc1", "k_loop", comment="loop")
+        else:
+            ctx.inst("s_cmp_lg_u32", ctx.sreg("s_k_tiles"), "0",
+                     comment="more?")
+            ctx.inst("s_cbranch_scc1", "k_loop", comment="loop")
         ctx.raw("")
