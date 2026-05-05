@@ -145,12 +145,6 @@ def _build_loader_reader_scale(ctx):
     else:
         pgr = int(pgr_raw)
 
-    # Attach LDS scale loader to DTL loader for integrated DTL loads
-    if use_lds_scales and scale_loader is not None:
-        from ..memory.global_loader import DTLLoader as _DTL
-        if isinstance(loader, _DTL):
-            loader.attach_scale_loader(scale_loader)
-
     return loader, reader, scale_loader, pgr, use_lds_scales
 
 

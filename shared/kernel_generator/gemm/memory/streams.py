@@ -1,12 +1,12 @@
 """Concrete LDSStream implementations.
 
-Wraps the existing loader/reader codegen into the unified LDSStream
-interface. Each stream handles one data channel (A data, B data,
-scale A, scale B).
+Each stream handles one data channel (A data, B data, scale A,
+scale B) in the unified LDSStream interface.
 
-Phase 1 of migration: these wrap existing code and are not yet
-wired into the pipeline. They will replace GlobalLoader/ScaleLoader
-in Phase 4.
+Actual instruction emission for advance/toggle/load is wired by
+``emit_wiring.py`` which delegates to the existing codegen primitives
+(GlobalLoader, LDSScaleLoader) for data streams, and to ScaleStream
+methods for scale streams.
 """
 from __future__ import annotations
 
@@ -87,24 +87,12 @@ class DTLDataStream(LDSStream):
         ki = self._tile.k_iterations
         return mr * ki
 
-    def advance(self, ctx: 'AsmContext') -> None:
-        srd = f"s_srd_{self._matrix}"
-        ctx.inst("s_add_u32", ctx.sreg(srd, 0, 1),
-                 ctx.sreg(srd, 0, 1), str(self._k_stride),
-                 comment=f"{srd} += {self._k_stride}")
-        ctx.inst("s_addc_u32", ctx.sreg(srd, 1, 1),
-                 ctx.sreg(srd, 1, 1), "0", comment="carry")
+    # advance/toggle_write/toggle_read are wired by emit_wiring.py
+    # to GlobalLoader/LDSReader methods. Stream only declares layout.
 
-    def toggle_write(self, ctx: 'AsmContext') -> None:
-        sg = f"s_lds_wr_{self._matrix}_sg"
-        ctx.inst("s_add_u32", ctx.sreg(sg),
-                 ctx.sreg(sg), ctx.sreg("s_lds_db_step"),
-                 comment=f"wr_{self._matrix} += db")
-
-    def toggle_read(self, ctx: 'AsmContext') -> None:
-        # Delegated to LDSReader.toggle_read() which handles
-        # precomputed swizzle vs recompute vs plain toggle
-        pass
+    def advance(self, ctx: 'AsmContext') -> None: pass
+    def toggle_write(self, ctx: 'AsmContext') -> None: pass
+    def toggle_read(self, ctx: 'AsmContext') -> None: pass
 
 
 class ScaleStream(LDSStream):
