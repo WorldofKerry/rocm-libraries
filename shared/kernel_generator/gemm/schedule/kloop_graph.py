@@ -6,12 +6,11 @@ sequence with auto-placed waits.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional
 
-from ..emit.context import AsmContext
-from ..problem import TileConfig, GemmProblem, MfmaConfig
+from ..problem import TileConfig, GemmProblem
 
 __all__ = [
     "OpKind", "DepKind", "KLoopOp", "Dep", "KLoopGraph",

@@ -113,7 +113,7 @@ def generate_custom_kernel(
         mi_input = "32"
         mi_input_a = "32"
         mi_input_b = "32"
-        pgr_val = 2 if pgr2 else 2  # MXFP4 default PGR=2
+        pgr_val = 2  # MXFP4 default PGR=2
         gwvw_d = 4
 
     tile_cfg = t.to_tile_config()

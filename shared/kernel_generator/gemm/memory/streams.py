@@ -16,13 +16,12 @@ from .lds_stream import LDSStream
 
 if TYPE_CHECKING:
     from ..emit.context import AsmContext
-    from ..problem import TileConfig, GemmProblem, MfmaConfig
+    from ..problem import TileConfig, GemmProblem
 
 __all__ = [
     "DTLDataStream",
     "ScaleStream",
-    "NullStream",
-]
+    ]
 
 
 class DTLDataStream(LDSStream):
@@ -191,49 +190,3 @@ class ScaleStream(LDSStream):
                   comment=f"scale_rd_{self._matrix} += db_step")
 
 
-class NullStream(LDSStream):
-    """No-op stream for non-MX kernels. Zero cost, zero LDS."""
-
-    def __init__(self, matrix: str = "a") -> None:
-        self._matrix = matrix
-
-    @property
-    def name(self) -> str:
-        return f"null_{self._matrix}"
-
-    @property
-    def region_size(self) -> int:
-        return 0
-
-    @property
-    def num_global_loads(self) -> int:
-        return 0
-
-    @property
-    def needs_lds_write(self) -> bool:
-        return False
-
-    @property
-    def has_reads(self) -> bool:
-        return False
-
-    def setup(self, ctx, lds_offset):
-        pass
-
-    def emit_global_loads(self, ctx):
-        pass
-
-    def emit_lds_writes(self, ctx):
-        pass
-
-    def read_op_count(self) -> int:
-        return 0
-
-    def advance(self, ctx):
-        pass
-
-    def toggle_write(self, ctx):
-        pass
-
-    def toggle_read(self, ctx):
-        pass

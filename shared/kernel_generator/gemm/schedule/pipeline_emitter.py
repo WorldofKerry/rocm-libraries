@@ -14,7 +14,7 @@ Key design properties:
 """
 from __future__ import annotations
 
-from typing import List, Optional, TYPE_CHECKING
+from typing import List, TYPE_CHECKING
 
 from .kloop_graph import KLoopOp, OpKind
 from .pipeline_scheduler import ScheduledPipeline

@@ -35,12 +35,12 @@ Everything above and below stays auto-generated.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, List, Optional
 
 
 __all__ = [
-    "TilePhase", "TileLevel", "ScopedAllocator", "Lifetime",
-    "build_gemm_tile_tree", "walk_tile_tree",
+    "TilePhase", "TileLevel",  
+     "walk_tile_tree",
 ]
 
 # Defer import to avoid circular dependency; context.py is standalone

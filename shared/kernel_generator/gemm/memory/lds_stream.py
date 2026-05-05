@@ -10,11 +10,11 @@ See DESIGN_STREAMS.md for architecture rationale.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..emit.context import AsmContext
-    from ..problem import TileConfig, GemmProblem
+    from ..problem import TileConfig
 
 __all__ = ["LDSStream", "LDSBufferManager"]
 

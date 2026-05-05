@@ -5,7 +5,7 @@
 import pytest
 
 from kernel_generator.gemm.memory.lds_stream import LDSStream, LDSBufferManager
-from kernel_generator.gemm.memory.streams import DTLDataStream, ScaleStream, NullStream
+from kernel_generator.gemm.memory.streams import DTLDataStream, ScaleStream
 from kernel_generator.gemm.problem import GemmProblem, DataType, MfmaConfig
 from kernel_generator.gemm.tiling import GemmTiling
 
@@ -152,24 +152,7 @@ class TestScaleStream:
 
 
 # ---------------------------------------------------------------------------
-# 4. NullStream properties
-# ---------------------------------------------------------------------------
 
-class TestNullStream:
-    def test_region_size_zero(self):
-        assert NullStream("a").region_size == 0
-
-    def test_num_global_loads_zero(self):
-        assert NullStream("b").num_global_loads == 0
-
-    def test_has_reads_false(self):
-        assert NullStream().has_reads is False
-
-    def test_needs_lds_write_false(self):
-        assert NullStream().needs_lds_write is False
-
-
-# ---------------------------------------------------------------------------
 # 5. Layout matches current MXFP4 kernel (128x128x256)
 # ---------------------------------------------------------------------------
 

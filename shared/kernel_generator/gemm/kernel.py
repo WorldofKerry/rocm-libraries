@@ -22,7 +22,7 @@ from typing import Callable, Optional
 
 from .emit.context import AsmContext
 from .emit.emitter import alloc_registers, alloc_registers_dtl, emit_header, emit_descriptor, assemble_kernel
-from .emit.layouts import emit_affine, GemmLayouts
+from .emit.layouts import GemmLayouts
 from .emit.phases import default_mfma_visitor
 from .kernarg_layout import layout_for
 from .problem import DataType, GemmProblem, MfmaConfig, TileConfig

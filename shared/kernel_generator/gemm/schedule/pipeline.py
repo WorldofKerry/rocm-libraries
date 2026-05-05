@@ -10,13 +10,12 @@ from typing import Optional
 
 from ..emit.context import AsmContext
 from ..problem import TileConfig, GemmProblem
-from ..memory.global_loader import GlobalLoader, DTLLoader, BufferLoader
+from ..memory.global_loader import DTLLoader, BufferLoader
 from ..memory.lds_reader import LDSReader
 
 __all__ = [
     "TilePartitioner", "GridPartitioner", "StreamKPartitioner",
     "ComputePipeline",
-    "KernelPipeline",
 ]
 
 
@@ -78,29 +77,6 @@ class ComputePipeline:
 # ===================================================================
 # KernelPipeline: composition
 # ===================================================================
-
-class KernelPipeline:
-    """Composes TilePartitioner + ComputePipeline + Epilogue.
-
-    This is the top-level kernel structure. The setup phase
-    (kernarg loading, thread indexing, LDS addresses) runs before
-    this pipeline via the tile tree's prologue phases.
-    """
-
-    def __init__(self, partitioner: TilePartitioner,
-                 compute: ComputePipeline,
-                 epilogue: Optional[object] = None) -> None:
-        self.partitioner = partitioner
-        self.compute = compute
-        self.epilogue = epilogue
-
-    def emit(self, ctx: AsmContext) -> None:
-        ctx.comment("=== KernelPipeline ===")
-        self.partitioner.emit(ctx)
-        self.compute.emit(ctx)
-        # Epilogue is handled by the tile tree's epilogue phases
-        # (phase_store_d), not here. This keeps compatibility with
-        # the existing tile tree walker.
 
 
 def pipeline_kloop_phase(level, ctx) -> None:
@@ -461,61 +437,6 @@ class StreamKPartitioner(TilePartitioner):
         """
         total_tiles = (problem.m // tile.wg_m) * (problem.n // tile.wg_n)
         return (total_tiles, 1, 1)
-
-    def compute_sk_params(self, problem, tile):
-        """Host-side: compute StreamK parameters.
-
-        Returns a dict with:
-        - total_tiles: number of output tiles
-        - k_tiles_per_tile: K iterations per output tile
-        - total_iters: total K-tile iterations across all tiles
-        - dp_tiles: tiles handled by data-parallel (full K)
-        - sk_tiles: tiles handled by StreamK (split K)
-        - sk_ctas: number of WGs doing StreamK work
-        - iters_per_sk_cta: base iterations per StreamK WG
-        - extra_iters: number of WGs that get one extra iteration
-        """
-        tiles_m = problem.m // tile.wg_m
-        tiles_n = problem.n // tile.wg_n
-        total_tiles = tiles_m * tiles_n
-        k_tiles = problem.k // tile.unroll_k
-        total_iters = total_tiles * k_tiles
-
-        # Full waves of data-parallel tiles
-        full_waves = total_tiles // self.num_cus
-        dp_tiles = full_waves * self.num_cus
-
-        # Remaining tiles need StreamK
-        sk_tiles = total_tiles - dp_tiles
-        if sk_tiles == 0:
-            return {
-                "total_tiles": total_tiles,
-                "k_tiles_per_tile": k_tiles,
-                "total_iters": total_iters,
-                "dp_tiles": dp_tiles,
-                "sk_tiles": 0,
-                "sk_ctas": 0,
-                "iters_per_sk_cta": 0,
-                "extra_iters": 0,
-            }
-
-        # StreamK: distribute sk_tiles * k_tiles iterations
-        # across num_cus WGs (or fewer if sk_iters < num_cus)
-        sk_iters = sk_tiles * k_tiles
-        sk_ctas = min(sk_iters, self.num_cus)
-        iters_per_cta = sk_iters // sk_ctas
-        extra = sk_iters % sk_ctas
-
-        return {
-            "total_tiles": total_tiles,
-            "k_tiles_per_tile": k_tiles,
-            "total_iters": total_iters,
-            "dp_tiles": dp_tiles,
-            "sk_tiles": sk_tiles,
-            "sk_ctas": sk_ctas,
-            "iters_per_sk_cta": iters_per_cta,
-            "extra_iters": extra,
-        }
 
 
 def pipeline_v2_kloop_phase(level, ctx) -> None:
