@@ -86,6 +86,22 @@ def _load_hip() -> ctypes.CDLL:
         VP,   # extra (void**)
     ]
     hip.hipModuleLaunchKernel.restype = INT
+
+    # hipModuleLaunchKernel -- same sig but uses extra for flat kernarg
+    hip.hipExtModuleLaunchKernel.argtypes = [
+        VP,   # function
+        INT, INT, INT,  # grid dims
+        INT, INT, INT,  # block dims
+        INT,  # shared mem bytes
+        VP,   # stream
+        VP,   # kernelParams (void**, unused when extra is set)
+        VP,   # extra (void** with LAUNCH_PARAM entries)
+        VP,   # startEvent
+        VP,   # stopEvent
+        INT,  # flags
+    ]
+    hip.hipExtModuleLaunchKernel.restype = INT
+
     hip.hipDeviceSynchronize.restype = INT
     hip.hipModuleUnload.argtypes = [VP]
     hip.hipModuleUnload.restype = INT
@@ -335,6 +351,9 @@ class GemmLauncher:
         elem = p.element_bytes
 
         hip = _load_hip()
+        def _check(ret, msg="HIP error"):
+            if ret != 0:
+                raise RuntimeError(f"{msg}: HIP returned {ret}")
 
         def _check(ret: int, msg: str = "HIP error") -> None:
             if ret != 0:
@@ -461,7 +480,7 @@ class GemmLauncher:
         kernarg_buf = (ctypes.c_char * kernarg_size)(*kernarg)
         kernarg_ptr = ctypes.cast(kernarg_buf, ctypes.c_void_p)
 
-        # Use hipExtModuleLaunchKernel with flat kernarg buffer
+        # Use hipModuleLaunchKernel with flat kernarg buffer
         # Build void** args array matching TensileLite kernarg order
         # hipModuleLaunchKernel with args=void** packs each arg sequentially
         # We use the flat buffer approach via HIP_LAUNCH_PARAM_BUFFER_POINTER
@@ -472,7 +491,7 @@ class GemmLauncher:
                "H2D kernarg")
 
         # Flatten grid to 1D (TensileLite KernArgsVersion >= 1)
-        args = None  # will use flat kernarg via hipExtModuleLaunchKernel
+        args = None  # will use flat kernarg via hipModuleLaunchKernel
 
         # Assembly kernels declare LDS in the kernel descriptor
         # (.amdhsa_group_segment_fixed_size). Passing non-zero sharedMemBytes
@@ -579,6 +598,130 @@ class GemmLauncher:
 
         # Compute correctness against CPU reference
         _, _, _, D_ref = self.reference_numpy()
+        max_err = float(np.max(np.abs(D_out.astype(np.float32) - D_ref.astype(np.float32))))
+        return GemmResult(D=D_out, time_seconds=avg_time, max_abs_error=max_err)
+
+
+    def run_streamk(
+        self,
+        code_object_path: str,
+        kernel_name: str = "gemm_kernel",
+        num_warmup: int = 3,
+        num_iters: int = 10,
+    ) -> GemmResult:
+        """Launch a StreamK GEMM kernel in DP mode (full K per WG).
+
+        Phase 1: all WGs run full K range (is_partial=0). Validates
+        the StreamK partitioner + conditional epilogue.
+        """
+        import time
+
+        hip = _load_hip()
+        def _check(ret, msg="HIP error"):
+            if ret != 0:
+                raise RuntimeError(f"{msg}: HIP returned {ret}")
+
+        p = self.problem
+        tile = self.tile
+        elem = 2
+        k_tiles = p.k // tile.unroll_k
+        grid_m, grid_n = p.grid_dims(tile)
+        total_wgs = grid_m * grid_n
+        block_size = tile.block_size
+        tiles_m = p.m // tile.wg_m
+
+        A, B, _ = self.generate_inputs()
+        _, _, _, D_ref = self.reference_numpy()
+
+        d_A, d_B, d_D = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+        _check(hip.hipMalloc(ctypes.byref(d_A), A.nbytes), "malloc A")
+        _check(hip.hipMalloc(ctypes.byref(d_B), B.nbytes), "malloc B")
+        _check(hip.hipMalloc(ctypes.byref(d_D), p.m * p.n * elem), "malloc D")
+        _check(hip.hipMemcpy(d_A, A.ctypes.data, A.nbytes, 1), "H2D A")
+        _check(hip.hipMemcpy(d_B, B.ctypes.data, B.nbytes, 1), "H2D B")
+        _check(hip.hipMemset(d_D, 0, p.m * p.n * elem), "memset D")
+
+        module = ctypes.c_void_p()
+        _check(hip.hipModuleLoad(ctypes.byref(module), code_object_path.encode()),
+               "hipModuleLoad")
+        func = ctypes.c_void_p()
+        _check(hip.hipModuleGetFunction(ctypes.byref(func), module,
+                                        kernel_name.encode()),
+               "hipModuleGetFunction")
+
+        # Build void** args matching kernel's flat kernarg layout.
+        # Base FP16 (104 bytes) + pad to 128 + SK fields (32 bytes) = 160 bytes.
+        # Each arg contributes its sizeof to the flat layout.
+        _header = [ctypes.c_uint32(0), ctypes.c_uint32(0),
+                   ctypes.c_uint32(0), ctypes.c_uint32(total_wgs)]     # 16B
+        _sizes = [ctypes.c_uint32(p.m), ctypes.c_uint32(p.n),
+                  ctypes.c_uint32(1), ctypes.c_uint32(p.k)]             # 16B
+        _ptrs = [ctypes.c_void_p(d_D.value), ctypes.c_void_p(d_D.value),
+                 ctypes.c_void_p(d_A.value), ctypes.c_void_p(d_B.value)] # 32B
+        _strides = [
+            ctypes.c_uint32(p.n), ctypes.c_uint32(p.m * p.n),
+            ctypes.c_uint32(p.n), ctypes.c_uint32(p.m * p.n),
+            ctypes.c_uint32(p.k), ctypes.c_uint32(p.m * p.k),
+            ctypes.c_uint32(p.k), ctypes.c_uint32(p.n * p.k)]           # 32B
+        _alpha_beta = [ctypes.c_float(1.0), ctypes.c_float(0.0)]         # 8B
+        # Total so far: 104 bytes
+
+        # Pad to offset 128: need 24 bytes = 6 x uint32
+        _pad = [ctypes.c_uint32(0)] * 6                                   # 24B
+
+        # SK fields at offset 128:
+        # workspace_ptr (8B), iter_start(4B), iter_end(4B),
+        # k_tiles_per_tile(4B), num_m_tiles(4B), is_partial(4B), partition_idx(4B)
+        _sk = [
+            ctypes.c_void_p(0),              # workspace_ptr (128-135)
+            ctypes.c_uint32(0),              # iter_start (136)
+            ctypes.c_uint32(k_tiles),        # iter_end (140) = full K
+            ctypes.c_uint32(k_tiles),        # k_tiles_per_tile (144)
+            ctypes.c_uint32(tiles_m),        # num_m_tiles (148)
+            ctypes.c_uint32(0),              # is_partial (152) = not partial
+            ctypes.c_uint32(0),              # partition_idx (156)
+        ]
+
+        _all_args = _header + _sizes + _ptrs + _strides + _alpha_beta + _pad + _sk
+        args = (ctypes.c_void_p * len(_all_args))()
+        for i, v in enumerate(_all_args):
+            args[i] = ctypes.cast(ctypes.pointer(v), ctypes.c_void_p)
+
+        for _ in range(num_warmup):
+            _check(hip.hipModuleLaunchKernel(
+                func, grid_m, grid_n, 1,
+                block_size, 1, 1, 0, None, args, None),
+                "launch warmup")
+        _check(hip.hipDeviceSynchronize(), "sync warmup")
+
+        ev_start, ev_stop = ctypes.c_void_p(), ctypes.c_void_p()
+        _check(hip.hipEventCreate(ctypes.byref(ev_start)), "create event")
+        _check(hip.hipEventCreate(ctypes.byref(ev_stop)), "create event")
+
+        _check(hip.hipEventRecord(ev_start, None), "record start")
+        for _ in range(num_iters):
+            _check(hip.hipModuleLaunchKernel(
+                func, grid_m, grid_n, 1,
+                block_size, 1, 1, 0, None, args, None),
+                "launch timed")
+        _check(hip.hipEventRecord(ev_stop, None), "record stop")
+        _check(hip.hipEventSynchronize(ev_stop), "sync stop")
+
+        elapsed_ms = ctypes.c_float()
+        _check(hip.hipEventElapsedTime(ctypes.byref(elapsed_ms),
+                                        ev_start, ev_stop), "elapsed")
+        avg_time = elapsed_ms.value / 1000.0 / num_iters
+
+        D_out = np.zeros((p.m, p.n), dtype=np.float16)
+        _check(hip.hipMemcpy(D_out.ctypes.data, d_D, p.m * p.n * elem, 2), "D2H D")
+
+        hip.hipEventDestroy(ev_start)
+        hip.hipEventDestroy(ev_stop)
+        hip.hipFree(d_A)
+        hip.hipFree(d_B)
+        hip.hipFree(d_D)
+        hip.hipModuleUnload(module)
+
         max_err = float(np.max(np.abs(D_out.astype(np.float32) - D_ref.astype(np.float32))))
         return GemmResult(D=D_out, time_seconds=avg_time, max_abs_error=max_err)
 
