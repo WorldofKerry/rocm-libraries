@@ -144,7 +144,8 @@ def emit_header(ctx: AsmContext, kernel_name: str) -> None:
 
 
 def emit_descriptor(ctx: AsmContext, kernel_name: str,
-                    lds_total: int, tile: TileConfig) -> None:
+                    lds_total: int, tile: TileConfig,
+                    layout=None) -> None:
     """Emit the AMDHSA kernel descriptor and metadata."""
     accum_offset = (ctx._next["v"] + 3) & ~3
     sgpr_count = ctx._next["s"]
@@ -154,10 +155,8 @@ def emit_descriptor(ctx: AsmContext, kernel_name: str,
     use_wave_abi = ctx._metadata.get('use_wave_abi', False)
     if use_wave_abi:
         kernarg_size = 104  # WaveGemmKernelArgs: 13 u64 fields = 104 bytes
-    elif tile.mfma.is_mx:
-        kernarg_size = 136  # TensileLite MXFP4 batched layout
     else:
-        kernarg_size = 104  # TensileLite non-MX layout
+        kernarg_size = layout.kernarg_size
 
 
     ctx.raw("")
@@ -211,39 +210,8 @@ def emit_descriptor(ctx: AsmContext, kernel_name: str,
             (88, 8, "by_value", "stride_b_scale_dim0"),
             (96, 8, "by_value", "stride_c_dim0"),
         ]
-    # TensileLite batched MXFP4 kernarg layout
-    elif tile.mfma.is_mx:
-        args = [
-            (0, 4, "by_value", "Gemm info"),
-            (4, 4, "by_value", "kernel info0"),
-            (8, 4, "by_value", "kernel info1"),
-            (12, 4, "by_value", "numWG"),
-            (16, 4, "by_value", "SizesFree0"),
-            (20, 4, "by_value", "SizesFree1"),
-            (24, 4, "by_value", "SizesFree2"),
-            (28, 4, "by_value", "SizesSum0"),
-            (32, 8, "global_buffer", "D"),
-            (40, 8, "global_buffer", "C"),
-            (48, 8, "global_buffer", "A"),
-            (56, 8, "global_buffer", "MXSA"),
-            (64, 8, "global_buffer", "B"),
-            (72, 8, "global_buffer", "MXSB"),
-            (80, 4, "by_value", "strideD0"),
-            (84, 4, "by_value", "strideD1"),
-            (88, 4, "by_value", "strideC0"),
-            (92, 4, "by_value", "strideC1"),
-            (96, 4, "by_value", "strideA0"),
-            (100, 4, "by_value", "strideA1"),
-            (104, 4, "by_value", "strideMXSA0"),
-            (108, 4, "by_value", "strideMXSA1"),
-            (112, 4, "by_value", "strideB0"),
-            (116, 4, "by_value", "strideB1"),
-            (120, 4, "by_value", "strideMXSB0"),
-            (124, 4, "by_value", "strideMXSB1"),
-            (128, 4, "by_value", "alpha"),
-            (132, 4, "by_value", "beta"),
-        ]
     else:
+        # TensileLite kernarg layout generated from KernargLayout
         args = [
             (0, 4, "by_value", "Gemm info"),
             (4, 4, "by_value", "kernel info0"),
@@ -253,21 +221,18 @@ def emit_descriptor(ctx: AsmContext, kernel_name: str,
             (20, 4, "by_value", "SizesFree1"),
             (24, 4, "by_value", "SizesFree2"),
             (28, 4, "by_value", "SizesSum0"),
-            (32, 8, "global_buffer", "D"),
-            (40, 8, "global_buffer", "C"),
-            (48, 8, "global_buffer", "A"),
-            (56, 8, "global_buffer", "B"),
-            (64, 4, "by_value", "strideD0"),
-            (68, 4, "by_value", "strideD1"),
-            (72, 4, "by_value", "strideC0"),
-            (76, 4, "by_value", "strideC1"),
-            (80, 4, "by_value", "strideA0"),
-            (84, 4, "by_value", "strideA1"),
-            (88, 4, "by_value", "strideB0"),
-            (92, 4, "by_value", "strideB1"),
-            (96, 4, "by_value", "alpha"),
-            (100, 4, "by_value", "beta"),
         ]
+        for op in layout.operands:
+            label = f"MXS{op.scale_for}" if op.is_scale else op.name
+            args.append((op.offset, 8, "global_buffer", label))
+        stride_off = layout.strides_offset
+        for op in layout.operands:
+            label = f"MXS{op.scale_for}" if op.is_scale else op.name
+            args.append((stride_off, 4, "by_value", f"stride{label}0"))
+            args.append((stride_off + 4, 4, "by_value", f"stride{label}1"))
+            stride_off += 8
+        args.append((stride_off, 4, "by_value", "alpha"))
+        args.append((stride_off + 4, 4, "by_value", "beta"))
     for off, sz, kind, name in args:
         ctx.raw(f"      - .name:           {name}")
         ctx.raw(f"        .offset:         {off}")
@@ -280,7 +245,7 @@ def emit_descriptor(ctx: AsmContext, kernel_name: str,
 
 
 def alloc_registers_dtl(ctx: AsmContext, problem: GemmProblem,
-                        tile: TileConfig) -> None:
+                        tile: TileConfig, layout=None) -> None:
     """Allocate registers for DirectToLDS kernel (no global load buffers).
 
     DTL replaces global_load + ds_write with buffer_load ... ,lds.
@@ -313,7 +278,7 @@ def alloc_registers_dtl(ctx: AsmContext, problem: GemmProblem,
     ctx.alloc_sgpr_permanent(1, "s_soffset_b")    # Scalar offset for 2nd B load
 
     # MX scale SGPRs (Phase 2: real scale loading)
-    if tile.mfma.is_mx:
+    if layout is not None and layout.has_scales:
         ctx.alloc_sgpr_permanent(2, "s_ptr_scale_a")  # Scale A pointer from kernargs
         ctx.alloc_sgpr_permanent(2, "s_ptr_scale_b")  # Scale B pointer from kernargs
         ctx.alloc_sgpr_permanent(1, "s_stride_scale_a")  # Scale A stride (bytes)
@@ -348,7 +313,7 @@ def alloc_registers_dtl(ctx: AsmContext, problem: GemmProblem,
     ctx.alloc_vgpr_permanent(tile.mfma.b_vgprs, "v_b")
 
     # MX scale VGPRs
-    if tile.mfma.is_mx:
+    if layout is not None and layout.has_scales:
         # Constant scale fallback (Phase 1)
         ctx.alloc_vgpr_permanent(1, "v_mxscale")
         # DTL offset VGPR for scale loads

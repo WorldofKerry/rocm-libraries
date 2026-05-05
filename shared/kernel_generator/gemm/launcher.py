@@ -18,6 +18,7 @@ from typing import Optional, Tuple
 import numpy as np
 
 from .problem import DataType, GemmProblem, TileConfig
+from .kernarg_layout import layout_for
 
 __all__ = ["GemmLauncher", "GemmResult"]
 
@@ -393,15 +394,15 @@ class GemmLauncher:
                "hipModuleGetFunction")
 
         # Pack TensileLite kernarg layout (KernArgsVersion >= 1)
-        is_mx = hasattr(self.tile, 'mfma') and getattr(self.tile.mfma, 'is_mx', False)
+        layout = layout_for(p.dtype)
         d_scale_A = ctypes.c_void_p()
         d_scale_B = ctypes.c_void_p()
         grid_m, grid_n = p.grid_dims(self.tile)
         total_wgs = grid_m * grid_n
         block_size = self.tile.block_size
 
-        if is_mx:
-            mx_block = self.tile.mfma.mx_block
+        if layout.has_scales:
+            mx_block = layout.scale_block
             scale_a_cols = p.k // mx_block
             scale_b_cols = p.k // mx_block
             scale_a_bytes = p.m * scale_a_cols
@@ -505,7 +506,7 @@ class GemmLauncher:
         _sizes = [ctypes.c_uint32(p.m), ctypes.c_uint32(p.n),
                   ctypes.c_uint32(1), ctypes.c_uint32(p.k)]
         _ptrs = [ctypes.c_void_p(d_D.value), ctypes.c_void_p(d_D.value)]  # D, C
-        if is_mx:
+        if layout.has_scales:
             _ptrs += [ctypes.c_void_p(d_A.value), ctypes.c_void_p(d_scale_A.value),
                       ctypes.c_void_p(d_B.value), ctypes.c_void_p(d_scale_B.value)]
             _strides = [
@@ -590,7 +591,7 @@ class GemmLauncher:
         hip.hipFree(d_A)
         hip.hipFree(d_B)
         hip.hipFree(d_D)
-        if is_mx:
+        if layout.has_scales:
             hip.hipFree(d_scale_A)
             hip.hipFree(d_scale_B)
         hip.hipFree(d_kernarg)
@@ -629,7 +630,7 @@ class GemmLauncher:
 
         p = self.problem
         tile = self.tile
-        is_mx = hasattr(tile, 'mfma') and getattr(tile.mfma, 'is_mx', False)
+        layout = layout_for(p.dtype)
         elem = 2  # output is always fp16 (2 bytes)
         k_tiles = p.k // tile.unroll_k
         tiles_m = p.m // tile.wg_m
@@ -653,8 +654,8 @@ class GemmLauncher:
         # Scale buffers for MX types
         d_scale_A, d_scale_B = ctypes.c_void_p(0), ctypes.c_void_p(0)
         scale_a_cols = scale_b_cols = 0
-        if is_mx:
-            mx_block = tile.mfma.mx_block
+        if layout.has_scales:
+            mx_block = layout.scale_block
             scale_a_cols = p.k // mx_block
             scale_b_cols = p.k // mx_block
             scale_a_bytes = max(p.m * scale_a_cols, 4096)
@@ -703,7 +704,7 @@ class GemmLauncher:
         flags_lo = flags_val & 0xFFFFFFFF
         flags_hi = (flags_val >> 32) & 0xFFFFFFFF
 
-        if is_mx:
+        if layout.has_scales:
             # MXFP4 TensileLite kernarg (136 bytes, 30 void** entries).
             # StreamK fields: num_partitions in header[0], workspace in C slot,
             # flags_ptr in strideD0/D1 (offsets 80-87).
@@ -807,7 +808,7 @@ class GemmLauncher:
         hip.hipFree(d_A)
         hip.hipFree(d_B)
         hip.hipFree(d_D)
-        if is_mx:
+        if layout.has_scales:
             hip.hipFree(d_scale_A)
             hip.hipFree(d_scale_B)
         if num_partitions > 1:

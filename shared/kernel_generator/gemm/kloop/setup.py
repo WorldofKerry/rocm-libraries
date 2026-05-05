@@ -465,7 +465,8 @@ def phase_wave_abi_setup(level: TileLevel, ctx: AsmContext) -> None:
     ctx.raw("")
 
     # Init MX constant scale VGPR
-    if mfma.is_mx:
+    layout = ctx._metadata.get("layout")
+    if layout.mfma_has_scale_operands:
         ctx.comment("Init MX constant scale = 1.0 (E8M0 0x7F)")
         ctx.v_mov(ctx.vreg("v_mxscale"), "0x7F7F7F7F",
                   comment="scale = 1.0 for all byte lanes")
@@ -494,7 +495,8 @@ def phase_dtl_interleaved_setup(level: TileLevel, ctx: AsmContext) -> None:
     ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_D"), karg, "32", comment="D ptr")
     ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_A"), karg, "48", comment="A ptr")
     # B ptr offset: 64 for MX (MXSA at 56), 56 for non-MX (no MXSA)
-    b_offset = "64" if mfma.is_mx else "56"
+    layout = ctx._metadata.get("layout")
+    b_offset = str(layout.b_ptr_offset())
     ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_B"), karg, b_offset,
              comment="B ptr")
     ctx.s_waitcnt("lgkmcnt(0)", comment="wait kernargs")
@@ -916,7 +918,8 @@ def phase_dtl_interleaved_setup(level: TileLevel, ctx: AsmContext) -> None:
     ctx.raw("")
 
     # Init MX constant scale VGPR (E8M0 scale=1.0 in all 4 bytes)
-    if mfma.is_mx:
+    layout = ctx._metadata.get("layout")
+    if layout.mfma_has_scale_operands:
         ctx.comment("Init MX constant scale = 1.0 (E8M0 0x7F)")
         ctx.v_mov(ctx.vreg("v_mxscale"), "0x7F7F7F7F",
                   comment="scale = 1.0 for all byte lanes")
@@ -1005,7 +1008,8 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
     use_dtl = ctx._metadata.get("use_dtl", True)
     use_real_scales = ctx._metadata.get("use_real_scales", False)
     use_swizzled_scales = ctx._metadata.get("swizzled_scales", False) and use_real_scales
-    if not mfma.is_mx or not use_real_scales:
+    layout = ctx._metadata.get("layout")
+    if not layout.has_scales or not use_real_scales:
         return
 
     mx_block = mfma.mx_block
@@ -1165,5 +1169,3 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
                   comment=f"scale B LDS write base = {scale_buf0_b}")
         # No separate swap mask needed: ADD-based toggle uses s_lds_db_step
         ctx.raw("")
-
-

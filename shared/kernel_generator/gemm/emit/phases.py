@@ -68,7 +68,8 @@ def phase_store_d(level: TileLevel, ctx: AsmContext) -> None:
     colmajor = (ctx._metadata.get("use_1d_grid", False) 
                 or ctx._metadata.get("use_wave_abi", False)
                 or ctx._metadata.get("colmajor_output", False))
-    use_bf16 = (problem.dtype == DataType.BF16) or (colmajor and mfma.is_mx)
+    layout = ctx._metadata.get("layout")
+    use_bf16 = (problem.dtype == DataType.BF16) or (colmajor and layout.colmajor_output_bf16)
 
     ctx.comment("=== Store D via buffer SRD ===")
 
@@ -1054,4 +1055,3 @@ def _store_workspace(ctx: AsmContext, tile: 'TileConfig') -> None:
 
     ctx.s_waitcnt("vmcnt(0)", comment="wait workspace stores")
     ctx.raw("")
-

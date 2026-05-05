@@ -128,7 +128,8 @@ def _build_loader_reader_scale(ctx):
     scale_loader = None
     use_real_scales = ctx._metadata.get("use_real_scales", False)
     use_lds_scales = ctx._metadata.get("use_lds_scales", False)
-    if use_real_scales and tile.mfma.is_mx:
+    layout = ctx._metadata.get("layout")
+    if use_real_scales and layout.has_scales:
         if use_lds_scales:
             from ..memory.scale_loader import LDSScaleLoader
             lds_data_half = ctx._metadata.get("lds_data_half", 0)
@@ -229,7 +230,8 @@ class StreamKPartitioner(TilePartitioner):
                  "40", comment="workspace ptr (C slot)")
         # flags_ptr location depends on kernarg layout:
         # FP16: offset 64 (strideD0/D1), MX: offset 80 (strideD0/D1)
-        flags_offset = "80" if tile.mfma.is_mx else "64"
+        layout = ctx._metadata.get("layout")
+        flags_offset = str(layout.flags_ptr_offset) if layout else "64"
         ctx.inst("s_load_dwordx2", ctx.sreg("s_flags_ptr"), karg,
                  flags_offset, comment="flags ptr (strideD slot)")
         ctx.s_waitcnt("lgkmcnt(0)", comment="wait SK kernargs")
@@ -362,7 +364,7 @@ class StreamKPartitioner(TilePartitioner):
         ctx.raw("")
 
         # Recompute scale SRDs for MX types
-        if tile.mfma.is_mx and ctx.has("s_srd_scale_a"):
+        if layout.has_scales and ctx.has("s_srd_scale_a"):
             use_swizzled = ctx._metadata.get("swizzled_scales", False)
             ctx.comment("Recompute scale SRD A/B for corrected tile coords")
             if use_swizzled:
@@ -416,7 +418,7 @@ class StreamKPartitioner(TilePartitioner):
                  comment="skip K-offset if iter_start == 0")
         ctx.inst("s_cbranch_scc1", "sk_no_k_offset2",
                  comment="no K-offset needed")
-        k_bytes_per_tile_iter = int(tile.unroll_k * elem)
+        k_bytes_per_tile_iter = layout.k_offset_bytes(1, tile.unroll_k) if layout else int(tile.unroll_k * elem)
         ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_iter_start"),
                   str(k_bytes_per_tile_iter),
                   comment=f"k_offset = iter_start * {k_bytes_per_tile_iter}")
@@ -432,9 +434,9 @@ class StreamKPartitioner(TilePartitioner):
                  ctx.sreg("s_srd_b", 1, 1), "0", comment="carry")
         # Scale SRD K-offset: scale stride is K/mx_block, so
         # k_offset_scale = iter_start * (unroll_k / mx_block) * 1 byte
-        if tile.mfma.is_mx and ctx.has("s_srd_scale_a"):
-            mx_block = tile.mfma.mx_block
-            scale_k_bytes = tile.unroll_k // mx_block  # 1 byte per scale
+        if layout.has_scales and ctx.has("s_srd_scale_a"):
+            scale_block = layout.scale_block if layout else tile.mfma.mx_block
+            scale_k_bytes = tile.unroll_k // scale_block  # 1 byte per scale
             ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_iter_start"),
                       str(scale_k_bytes),
                       comment=f"scale_k_offset = iter_start * {scale_k_bytes}")
@@ -563,13 +565,14 @@ def pipeline_v2_kloop_phase(level, ctx) -> None:
     reader.precompute_swizzle_addresses()
 
     # Create MFMAEmitter (after scale registers allocated)
+    layout = ctx._metadata.get("layout")
     if scale_loader is not None and hasattr(scale_loader, 'scale_names_a'):
         names_a = scale_loader.scale_names_a
         names_b = scale_loader.scale_names_b
         emitter = (MFMAEmitter.for_lds_scales(tile.mfma, names_a, names_b)
                    if use_lds_scales
                    else MFMAEmitter.for_vmem_scales(tile.mfma, names_a, names_b))
-    elif tile.mfma.is_mx:
+    elif layout.mfma_has_scale_operands:
         emitter = MFMAEmitter.for_mx_constant(tile.mfma)
     else:
         emitter = MFMAEmitter.for_non_mx(tile.mfma)

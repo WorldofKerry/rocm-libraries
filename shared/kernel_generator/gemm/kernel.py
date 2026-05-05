@@ -24,6 +24,7 @@ from .emit.context import AsmContext
 from .emit.emitter import alloc_registers, alloc_registers_dtl, emit_header, emit_descriptor, assemble_kernel
 from .emit.layouts import emit_affine, GemmLayouts
 from .emit.phases import default_mfma_visitor
+from .kernarg_layout import layout_for
 from .problem import DataType, GemmProblem, MfmaConfig, TileConfig
 from .tiling import GemmTiling
 from .tile.tree import TileLevel, walk_tile_tree
@@ -196,6 +197,7 @@ class GemmKernel:
         """Generate the full kernel assembly."""
         tile = self.tile
         elem = self.problem.element_bytes
+        layout = layout_for(self.problem.dtype)
         pad_elems = tile.lds_pad // elem if tile.lds_pad > 0 else 0
         lds_row_stride = tile.unroll_k + pad_elems
         is_dtl = any(p.name in ("dtl_setup", "dtl_interleaved_setup", "wave_abi_setup")
@@ -215,8 +217,8 @@ class GemmKernel:
         # Scale LDS regions: when using DTL scales, allocate LDS for
         # scale A and scale B (each padded to 4096 for full DTL coverage).
         use_lds_scales = getattr(self, 'use_lds_scales', False)
-        if use_lds_scales and tile.mfma.is_mx:
-            mx_block = tile.mfma.mx_block
+        if use_lds_scales and layout.has_scales:
+            mx_block = layout.scale_block
             # Pad to 256 threads × 16 bytes = 4096
             scale_a_lds = max(tile.wg_m * (tile.unroll_k // mx_block), 4096)
             scale_b_lds = max(tile.wg_n * (tile.unroll_k // mx_block), 4096)
@@ -237,6 +239,7 @@ class GemmKernel:
         ctx._metadata = {
             "tile": tile,
             "problem": self.problem,
+            "layout": layout,
             "layouts": self.layouts,
             "kernel": self,
             "use_dtl": getattr(self, 'use_dtl', True),
@@ -254,7 +257,7 @@ class GemmKernel:
             "streamk": getattr(self, "streamk", False),
         }
         if is_dtl:
-            alloc_registers_dtl(ctx, self.problem, tile)
+            alloc_registers_dtl(ctx, self.problem, tile, layout)
         else:
             alloc_registers(ctx, self.problem, tile)
 
@@ -269,7 +272,7 @@ class GemmKernel:
         emit_header(ctx, self.kernel_name)
         walk_tile_tree(self.tile_tree, ctx, visitor=self.mfma_visitor)
         ctx.inst("s_endpgm", comment="end of kernel")
-        emit_descriptor(ctx, self.kernel_name, lds_total, tile)
+        emit_descriptor(ctx, self.kernel_name, lds_total, tile, layout)
 
         return AsmKernel(
             asm_text=ctx.asm_text(), kernel_name=self.kernel_name,
@@ -297,12 +300,8 @@ def export_wave_kernel(kernel: "GemmKernel", output_path: str,
     mfma = tile.mfma
 
     if kernel_name is None:
-        if mfma.is_mx:
-            kernel_name = f"wave_mxfp4_{tile.wg_m}x{tile.wg_n}x{tile.unroll_k}_kgen"
-        elif mfma.input_type == "bf16":
-            kernel_name = f"wave_bf16_{tile.wg_m}x{tile.wg_n}x{tile.unroll_k}_kgen"
-        else:
-            kernel_name = f"wave_fp16_{tile.wg_m}x{tile.wg_n}x{tile.unroll_k}_kgen"
+        kl = layout_for(kernel.problem.dtype)
+        kernel_name = f"wave_{kl.name}_{tile.wg_m}x{tile.wg_n}x{tile.unroll_k}_kgen"
 
     kernel.kernel_name = kernel_name
     result = kernel.emit()
