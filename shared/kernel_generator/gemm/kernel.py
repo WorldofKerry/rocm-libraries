@@ -117,7 +117,8 @@ class GemmKernel:
               pgr: int = 1,
               wg_mapping_xcc: int = 1,
               colmajor_output: bool = False,
-              pipeline_strategy=None) -> GemmKernel:
+              pipeline_strategy=None,
+              streamk: bool = False) -> GemmKernel:
         """Build a GemmKernel.  GemmTiling is the source of truth.
 
         Args:
@@ -181,6 +182,14 @@ class GemmKernel:
                 f"Cannot preload more tiles than available buffers.")
         k.wg_mapping_xcc = wg_mapping_xcc
         k.colmajor_output = colmajor_output
+        k.streamk = streamk
+
+        # StreamK: swap epilogue to conditional store
+        if streamk:
+            from .emit.phases import phase_store_streamk
+            k.tile_tree = k.tile_tree.replace_phase(
+                "store_d", phase_store_streamk)
+
         return k
 
     def emit(self) -> AsmKernel:
@@ -242,6 +251,7 @@ class GemmKernel:
             "wg_mapping_xcc": getattr(self, "wg_mapping_xcc", 1),
             "colmajor_output": getattr(self, "colmajor_output", False),
             "pipeline_strategy": getattr(self, "pipeline_strategy", None),
+            "streamk": getattr(self, "streamk", False),
         }
         if is_dtl:
             alloc_registers_dtl(ctx, self.problem, tile)

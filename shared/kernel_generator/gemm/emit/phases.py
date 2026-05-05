@@ -617,3 +617,135 @@ def phase_streamk_store(level: TileLevel, ctx: AsmContext) -> None:
 WORKGROUP_EPILOGUE_PHASES = [
     TilePhase("store_d", phase_store_d),
 ]
+
+
+# ===================================================================
+# StreamK epilogue: conditional store (direct or workspace)
+# ===================================================================
+
+def phase_store_streamk(level: TileLevel, ctx: AsmContext) -> None:
+    """StreamK-aware store: direct store for full-K, workspace for partial-K.
+
+    Full-K WGs (s_is_partial == 0): convert f32->f16/bf16 and store to D
+    (same as phase_store_d).
+
+    Partial-K WGs (s_is_partial != 0): store raw f32 accumulators to
+    workspace[partition_idx * MT_M * MT_N + lane_offset]. No conversion.
+    The host reduces all partitions per tile and writes the final result.
+    """
+    tile = _tile(ctx)
+    problem = _problem(ctx)
+
+    # Branch: full-K tiles use the normal store path
+    ctx.comment("=== StreamK Epilogue ===")
+    ctx.inst("s_cmp_eq_u32", ctx.sreg("s_is_partial"), "0",
+             comment="full K range?")
+    ctx.inst("s_cbranch_scc1", "sk_store_direct",
+             comment="yes -> direct store to D")
+
+    # ---- Partial-K: store f32 accumulators to workspace ----
+    _store_workspace(ctx, tile)
+    ctx.inst("s_branch", "sk_store_done", comment="skip direct store")
+
+    # ---- Full-K: normal D store ----
+    ctx.label("sk_store_direct")
+    phase_store_d(level, ctx)
+
+    ctx.label("sk_store_done")
+
+
+def _store_workspace(ctx: AsmContext, tile: 'TileConfig') -> None:
+    """Store raw f32 accumulators to workspace buffer.
+
+    Layout: workspace[partition_idx * MT_M * MT_N + element_offset]
+    Uses soffset for mi stepping (to stay within 16-bit imm limit)
+    and immediate offset for ni/ai within each mi block.
+    """
+    import math
+    mfma = tile.mfma
+    acc_per = mfma.acc_vgprs
+    mr = tile.mfma_m_repeat
+    nr = tile.mfma_n_repeat
+
+    ctx.comment("Store f32 accumulators to workspace")
+
+    # Build workspace SRD from s_workspace_ptr
+    ctx.alloc_sgpr_permanent(4, "s_srd_ws")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_ws", 0, 1),
+             ctx.sreg("s_workspace_ptr", 0, 1), comment="WS SRD base lo")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_ws", 1, 1),
+             ctx.sreg("s_workspace_ptr", 1, 1), comment="WS SRD base hi")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_ws", 2, 1), "0xFFFFFFFF",
+             comment="WS SRD size")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_ws", 3, 1), "0x20000",
+             comment="WS SRD flags: raw buffer")
+
+    tile_area = tile.wg_m * tile.wg_n
+    # Compute base offset: partition_idx * tile_area * 4 (f32)
+    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_partition_idx"),
+              str(tile_area * 4),
+              comment=f"partition offset = idx * {tile_area} * 4")
+
+    # Per-lane voffset: (wave_m * m_per_wave + lane_m_base) * wg_n + (wave_n * n_per_wave + lane_n)
+    # Then scale by 4 (f32) and add partition base
+    ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.n - 1,
+              comment=f"lane_n = lane_id % {mfma.n}")
+    ctx.v_lshr(ctx.vreg("v_tmp1"), ctx.vreg("v_lane_id"),
+               int(math.log2(mfma.m)), comment=f"lane_id / {mfma.m}")
+    ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_tmp1"), 2,
+               comment="* 4 -> lane_m_base")
+
+    ctx.v_mul(ctx.vreg("v_tmp2"), str(tile.m_per_wave),
+              ctx.vreg("v_wave_m"), comment=f"wave_m * {tile.m_per_wave}")
+    ctx.v_add(ctx.vreg("v_tmp2"), ctx.vreg("v_tmp2"), ctx.vreg("v_tmp1"),
+              comment="+ lane_m_base -> base_m")
+
+    ctx.v_mul(ctx.vreg("v_tmp3"), str(tile.n_per_wave),
+              ctx.vreg("v_wave_n"), comment=f"wave_n * {tile.n_per_wave}")
+    ctx.v_add(ctx.vreg("v_tmp3"), ctx.vreg("v_tmp3"), ctx.vreg("v_tmp0"),
+              comment="+ lane_n -> base_n")
+
+    # voffset = (base_m * wg_n + base_n) * 4 + partition_base
+    ctx.v_mul(ctx.vreg("v_tmp2"), str(tile.wg_n), ctx.vreg("v_tmp2"),
+              comment=f"base_m * {tile.wg_n}")
+    ctx.v_add(ctx.vreg("v_tmp2"), ctx.vreg("v_tmp2"), ctx.vreg("v_tmp3"),
+              comment="+ base_n")
+    ctx.v_lshl(ctx.vreg("v_tmp2"), ctx.vreg("v_tmp2"), 2,
+               comment="* 4 -> byte offset")
+    ctx.v_add(ctx.vreg("v_tmp2"), ctx.sreg("s_tmp0"), ctx.vreg("v_tmp2"),
+              comment="+ partition base -> voffset")
+    ctx.raw("")
+
+    # Store accumulators using soffset for mi stepping
+    # mi_stride = mfma.m * wg_n * 4 bytes (row block step)
+    mi_stride = mfma.m * tile.wg_n * 4
+    # ni_stride = mfma.n * 4 bytes (col block step)
+    ni_stride = mfma.n * 4
+    # ai_stride = wg_n * 4 bytes (one row step within mi block)
+    ai_stride = tile.wg_n * 4
+
+    for mi in range(mr):
+        soff = mi * mi_stride
+        if soff > 0:
+            ctx.s_mov(ctx.sreg("s_tmp1"), str(soff),
+                      comment=f"soffset for mi={mi}")
+
+        for ni in range(nr):
+            acc_base = (mi * nr + ni) * acc_per
+            for ai in range(acc_per):
+                imm = ni * ni_stride + ai * ai_stride
+                acc_reg = ctx.areg("acc_C", acc_base + ai, 1)
+                ctx.inst("v_accvgpr_read_b32",
+                         ctx.vreg("v_tmp0"), acc_reg,
+                         comment=f"read acc[{acc_base + ai}]")
+                soff_reg = ctx.sreg("s_tmp1") if soff > 0 else "0"
+                ctx.inst("buffer_store_dword",
+                         ctx.vreg("v_tmp0"),
+                         ctx.vreg("v_tmp2"),
+                         ctx.sreg("s_srd_ws", 0, 4), soff_reg,
+                         f"offen offset:{imm}",
+                         comment=f"ws[m{mi}_n{ni}_a{ai}]")
+
+    ctx.s_waitcnt("vmcnt(0)", comment="wait workspace stores")
+    ctx.raw("")
+

@@ -194,14 +194,6 @@ class StreamKPartitioner(TilePartitioner):
         elem = problem.element_bytes
         log2_uk = int(math.log2(tile.unroll_k))
 
-        sk_params = ctx._metadata.get("streamk_params")
-        if sk_params is None:
-            # Fallback: behave like GridPartitioner
-            ctx.s_lshr(ctx.sreg("s_k_tiles"), ctx.sreg("s_K"), log2_uk,
-                       comment=f"k_tiles = K / {tile.unroll_k}")
-            ctx.raw("")
-            return
-
         ctx.comment("=== StreamK Work Decomposition ===")
 
         # Load StreamK kernargs
@@ -212,6 +204,7 @@ class StreamKPartitioner(TilePartitioner):
         ctx.alloc_sgpr_permanent(1, "s_k_tiles_per_tile")
         ctx.alloc_sgpr_permanent(1, "s_num_m_tiles")
         ctx.alloc_sgpr_permanent(1, "s_is_partial")
+        ctx.alloc_sgpr_permanent(1, "s_partition_idx")
 
         ctx.inst("s_load_dwordx2", ctx.sreg("s_workspace_ptr"), karg, "128",
                  comment="workspace ptr")
@@ -225,6 +218,8 @@ class StreamKPartitioner(TilePartitioner):
                  comment="num_m_tiles")
         ctx.inst("s_load_dword", ctx.sreg("s_is_partial"), karg, "152",
                  comment="is_partial (0=full, 1=partial)")
+        ctx.inst("s_load_dword", ctx.sreg("s_partition_idx"), karg, "156",
+                 comment="partition_idx (workspace slot)")
         ctx.s_waitcnt("lgkmcnt(0)", comment="wait SK kernargs")
         ctx.raw("")
 
@@ -422,7 +417,10 @@ def pipeline_v2_kloop_phase(level, ctx) -> None:
     ctx.raw("")
 
     # K-tile count
-    GridPartitioner().emit(ctx)
+    if ctx._metadata.get("streamk"):
+        StreamKPartitioner().emit(ctx)
+    else:
+        GridPartitioner().emit(ctx)
 
     # Emit K-loop
     PipelineEmitter(scheduled, buffer_mgr, ctx).emit()
