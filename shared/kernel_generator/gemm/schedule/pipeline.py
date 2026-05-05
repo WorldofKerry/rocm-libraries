@@ -113,7 +113,7 @@ def pipeline_kloop_phase(level, ctx) -> None:
 def _build_loader_reader_scale(ctx):
     """Construct the loader, reader, and scale_loader from ctx metadata.
 
-    Returns (loader, reader, scale_loader, pgr, use_lds_scales).
+    Returns (loader, reader, scale_loader, pgr).
     """
     tile = ctx._metadata["tile"]
     problem = ctx._metadata["problem"]
@@ -146,7 +146,7 @@ def _build_loader_reader_scale(ctx):
     else:
         pgr = int(pgr_raw)
 
-    return loader, reader, scale_loader, pgr, use_lds_scales
+    return loader, reader, scale_loader, pgr
 
 
 # ===================================================================
@@ -526,11 +526,11 @@ def pipeline_v2_kloop_phase(level, ctx) -> None:
     """
     tile = ctx._metadata["tile"]
 
-    loader, reader, scale_loader, pgr, use_lds_scales = \
+    loader, reader, scale_loader, pgr = \
         _build_loader_reader_scale(ctx)
 
     # --- New architecture ---
-    from ..memory.streams import DTLDataStream, ScaleStream
+    from ..memory.streams import DTLDataStream
     from ..memory.lds_stream import LDSBufferManager
     from .graph_builder import build_kloop_graph
     from .pipeline_scheduler import PipelineScheduler
@@ -544,9 +544,8 @@ def pipeline_v2_kloop_phase(level, ctx) -> None:
     # This avoids vmcnt(0) stalls before scale ds_writes:
     # the scale loads complete during the DTL load burst.
     streams = []
-    if use_lds_scales and scale_loader is not None:
-        streams.append(ScaleStream("a", tile))
-        streams.append(ScaleStream("b", tile))
+    if scale_loader is not None:
+        streams.extend(scale_loader.streams(tile))
     streams.append(DTLDataStream("a", tile, problem))
     streams.append(DTLDataStream("b", tile, problem))
 
@@ -564,18 +563,15 @@ def pipeline_v2_kloop_phase(level, ctx) -> None:
         scale_loader.precompute_soffsets()
     reader.precompute_swizzle_addresses()
 
-    # Create MFMAEmitter (after scale registers allocated)
-    layout = ctx._metadata.get("layout")
-    if scale_loader is not None and hasattr(scale_loader, 'scale_names_a'):
-        names_a = scale_loader.scale_names_a
-        names_b = scale_loader.scale_names_b
-        emitter = (MFMAEmitter.for_lds_scales(tile.mfma, names_a, names_b)
-                   if use_lds_scales
-                   else MFMAEmitter.for_vmem_scales(tile.mfma, names_a, names_b))
-    elif layout.mfma_has_scale_operands:
-        emitter = MFMAEmitter.for_mx_constant(tile.mfma)
+    # Create MFMAEmitter -- the scale loader knows which variant to use
+    if scale_loader is not None:
+        emitter = scale_loader.mfma_emitter(tile.mfma)
     else:
-        emitter = MFMAEmitter.for_non_mx(tile.mfma)
+        layout = ctx._metadata.get("layout")
+        if layout and layout.mfma_has_scale_operands:
+            emitter = MFMAEmitter.for_mx_constant(tile.mfma)
+        else:
+            emitter = MFMAEmitter.for_non_mx(tile.mfma)
 
     # Wire emit callbacks
     wire_emit_callbacks(graph, streams, buffer_mgr, loader, reader,

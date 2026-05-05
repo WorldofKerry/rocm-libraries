@@ -214,14 +214,12 @@ class GemmKernel:
         else:
             lds_half = int((tile.wg_m + tile.wg_n) * lds_row_stride * elem)
 
-        # Scale LDS regions: when using DTL scales, allocate LDS for
-        # scale A and scale B (each padded to 4096 for full DTL coverage).
+        # Scale LDS: when using LDS-based scale loading, reserve
+        # space for scale A + B (each padded to DTL coverage = 4096).
         use_lds_scales = getattr(self, 'use_lds_scales', False)
         if use_lds_scales and layout.has_scales:
-            mx_block = layout.scale_block
-            # Pad to 256 threads × 16 bytes = 4096
-            scale_a_lds = max(tile.wg_m * (tile.unroll_k // mx_block), 4096)
-            scale_b_lds = max(tile.wg_n * (tile.unroll_k // mx_block), 4096)
+            scale_a_lds = max(tile.wg_m * (tile.unroll_k // layout.scale_block), 4096)
+            scale_b_lds = max(tile.wg_n * (tile.unroll_k // layout.scale_block), 4096)
             lds_scale_half = scale_a_lds + scale_b_lds
         else:
             lds_scale_half = 0

@@ -1006,13 +1006,12 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
     tile = ctx._metadata["tile"]
     mfma = tile.mfma
     use_dtl = ctx._metadata.get("use_dtl", True)
-    use_real_scales = ctx._metadata.get("use_real_scales", False)
-    use_swizzled_scales = ctx._metadata.get("swizzled_scales", False) and use_real_scales
+    use_swizzled_scales = ctx._metadata.get("swizzled_scales", False)
     layout = ctx._metadata.get("layout")
-    if not layout.has_scales or not use_real_scales:
+    if not layout.has_scales:
         return
 
-    mx_block = mfma.mx_block
+    mx_block = layout.scale_block
     scale_k_cols = tile.unroll_k // mx_block
 
     ctx.comment("=== MX Scale Setup (direct VGPR, no LDS) ===")
