@@ -203,6 +203,8 @@ class StreamKPartitioner(TilePartitioner):
         ctx.alloc_sgpr_permanent(1, "s_iter_end")
         ctx.alloc_sgpr_permanent(1, "s_is_partial")
         ctx.alloc_sgpr_permanent(1, "s_partition_idx")
+        ctx.alloc_sgpr_permanent(2, "s_flags_ptr")
+        ctx.alloc_sgpr_permanent(1, "s_num_partitions")
 
         # StreamK fields packed into TensileLite kernarg header
         # (offsets 0-12). These bytes are normally ignored by the
@@ -223,6 +225,10 @@ class StreamKPartitioner(TilePartitioner):
                  comment="partition_idx (header[3])")
         ctx.inst("s_load_dwordx2", ctx.sreg("s_workspace_ptr"), karg, "40",
                  comment="workspace ptr (C slot)")
+        ctx.inst("s_load_dwordx2", ctx.sreg("s_flags_ptr"), karg, "64",
+                 comment="flags ptr (stride D slot)")
+        ctx.inst("s_load_dword", ctx.sreg("s_num_partitions"), karg, "72",
+                 comment="num_partitions_per_tile (stride C0 slot)")
         ctx.s_waitcnt("lgkmcnt(0)", comment="wait SK kernargs")
         ctx.raw("")
 

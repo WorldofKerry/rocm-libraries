@@ -608,12 +608,16 @@ class GemmLauncher:
         kernel_name: str = "gemm_kernel",
         num_warmup: int = 3,
         num_iters: int = 10,
+        num_cus: int = 304,
+        num_partitions: int = 2,
     ) -> GemmResult:
-        """Launch a StreamK GEMM kernel in DP mode (full K per WG).
+        """Launch a StreamK GEMM kernel with K-splitting.
 
-        SK fields are packed into the TensileLite kernarg header
-        (offsets 0-12) which is normally unused by the kernel.
-        Workspace pointer reuses the C slot (offset 40).
+        Each output tile's K range is split into num_partitions parts.
+        The first partition (iter_start=0) is the owner that reduces.
+
+        Args:
+            num_partitions: How many K-splits per tile (1 = no split = DP).
         """
         import time
 
@@ -626,9 +630,14 @@ class GemmLauncher:
         tile = self.tile
         elem = 2
         k_tiles = p.k // tile.unroll_k
-        grid_m, grid_n = p.grid_dims(tile)
-        total_wgs = grid_m * grid_n
+        tiles_m = p.m // tile.wg_m
+        tiles_n = p.n // tile.wg_n
+        total_tiles = tiles_m * tiles_n
         block_size = tile.block_size
+        tile_area = tile.wg_m * tile.wg_n
+
+        # Clamp partitions to available K tiles
+        num_partitions = min(num_partitions, k_tiles)
 
         A, B, _ = self.generate_inputs()
         _, _, _, D_ref = self.reference_numpy()
@@ -641,6 +650,17 @@ class GemmLauncher:
         _check(hip.hipMemcpy(d_B, B.ctypes.data, B.nbytes, 1), "H2D B")
         _check(hip.hipMemset(d_D, 0, p.m * p.n * elem), "memset D")
 
+        # Allocate workspace and flags
+        total_partitions = total_tiles * num_partitions
+        ws_bytes = total_partitions * tile_area * 4  # f32 per element
+        flags_bytes = total_partitions * 4  # u32 per partition
+
+        d_ws = ctypes.c_void_p()
+        d_flags = ctypes.c_void_p()
+        if num_partitions > 1:
+            _check(hip.hipMalloc(ctypes.byref(d_ws), ws_bytes), "malloc ws")
+            _check(hip.hipMalloc(ctypes.byref(d_flags), flags_bytes), "malloc flags")
+
         module = ctypes.c_void_p()
         _check(hip.hipModuleLoad(ctypes.byref(module), code_object_path.encode()),
                "hipModuleLoad")
@@ -649,61 +669,174 @@ class GemmLauncher:
                                         kernel_name.encode()),
                "hipModuleGetFunction")
 
-        # Build void** args with SK fields in header slots.
-        # Header (offsets 0-15): iter_start, iter_end, is_partial, partition_idx
-        _header = [ctypes.c_uint32(0),       # offset 0: iter_start = 0
-                   ctypes.c_uint32(k_tiles), # offset 4: iter_end = full K
-                   ctypes.c_uint32(0),       # offset 8: is_partial = 0
-                   ctypes.c_uint32(0)]       # offset 12: partition_idx = 0
-        _sizes = [ctypes.c_uint32(p.m), ctypes.c_uint32(p.n),
-                  ctypes.c_uint32(1), ctypes.c_uint32(p.k)]
-        # D ptr at offset 32, C ptr (=workspace) at offset 40
-        _ptrs = [ctypes.c_void_p(d_D.value),   # D ptr (offset 32)
-                 ctypes.c_void_p(0),            # C/workspace ptr (offset 40) = NULL for DP
-                 ctypes.c_void_p(d_A.value),    # A ptr (offset 48)
-                 ctypes.c_void_p(d_B.value)]    # B ptr (offset 56)
-        _strides = [
-            ctypes.c_uint32(p.n), ctypes.c_uint32(p.m * p.n),
-            ctypes.c_uint32(p.n), ctypes.c_uint32(p.m * p.n),
-            ctypes.c_uint32(p.k), ctypes.c_uint32(p.m * p.k),
-            ctypes.c_uint32(p.k), ctypes.c_uint32(p.n * p.k),
-        ]
-        _alpha_beta = [ctypes.c_float(1.0), ctypes.c_float(0.0)]
+        # Compute per-WG launch parameters.
+        # Total WGs = total_tiles * num_partitions
+        # Each tile's partitions get consecutive WG indices.
+        # Grid: 1D with total_wgs blocks.
+        total_wgs = total_tiles * num_partitions
 
-        _all_args = _header + _sizes + _ptrs + _strides + _alpha_beta
-        args = (ctypes.c_void_p * len(_all_args))()
-        for i, v in enumerate(_all_args):
-            args[i] = ctypes.cast(ctypes.pointer(v), ctypes.c_void_p)
+        # For each WG, compute: tile_idx, part_idx, iter_start, iter_end
+        # We launch with a 2D grid: (tiles_m * num_partitions, tiles_n)
+        # WG(x, y) -> tile_m = x // num_partitions, part_idx = x % num_partitions
+        # The kernel setup already uses s2 (wg_id_x) for tile_m and s3 for tile_n.
+        # With K-splitting, wg_id_x encodes (tile_m * num_partitions + part_idx).
+        # The kernel's SRD setup uses wg_id_x * wg_m for the A row offset,
+        # so we need to adjust: the actual tile_m = wg_id_x // num_partitions.
 
-        for _ in range(num_warmup):
-            _check(hip.hipModuleLaunchKernel(
-                func, grid_m, grid_n, 1,
-                block_size, 1, 1, 0, None, args, None),
-                "launch warmup")
-        _check(hip.hipDeviceSynchronize(), "sync warmup")
+        # Problem: the kernel's setup phase does s_mul_i32 s14, s2, 256
+        # (wg_id_x * wg_m) for the SRD base. With K-splitting, s2 encodes
+        # tile_m * num_partitions + part_idx, so the SRD calculation is wrong.
 
-        ev_start, ev_stop = ctypes.c_void_p(), ctypes.c_void_p()
-        _check(hip.hipEventCreate(ctypes.byref(ev_start)), "event")
-        _check(hip.hipEventCreate(ctypes.byref(ev_stop)), "event")
-        _check(hip.hipEventRecord(ev_start, None), "record")
-        for _ in range(num_iters):
-            _check(hip.hipModuleLaunchKernel(
-                func, grid_m, grid_n, 1,
-                block_size, 1, 1, 0, None, args, None),
-                "launch")
-        _check(hip.hipEventRecord(ev_stop, None), "record")
-        _check(hip.hipEventSynchronize(ev_stop), "sync")
+        # Solution: keep the 2D grid as (tiles_m, tiles_n) and pass
+        # per-tile partition info via the header. But then each grid
+        # point maps to one tile, and we need to launch num_partitions
+        # times... Or we use a side buffer.
 
-        elapsed_ms = ctypes.c_float()
-        _check(hip.hipEventElapsedTime(ctypes.byref(elapsed_ms),
-                                        ev_start, ev_stop), "elapsed")
-        avg_time = elapsed_ms.value / 1000.0 / num_iters
+        # Simplest correct approach for Phase 1:
+        # Launch tiles_m * tiles_n * num_partitions WGs in a 2D grid:
+        #   grid_x = tiles_m * num_partitions (each tile_m repeated)
+        #   grid_y = tiles_n
+        # Each WG reads its partition info from the header.
+        # But the header is shared across all WGs...
+
+        # Actually, let's just loop over partitions on the host side,
+        # re-launching with different header values per partition.
+        # This is simple, correct, and works for Phase 1.
+
+        def _make_args(iter_start, iter_end, is_partial, partition_idx,
+                       d_ws_val, d_flags_val, num_parts):
+            _header = [ctypes.c_uint32(iter_start),
+                       ctypes.c_uint32(iter_end),
+                       ctypes.c_uint32(is_partial),
+                       ctypes.c_uint32(partition_idx)]
+            _sizes = [ctypes.c_uint32(p.m), ctypes.c_uint32(p.n),
+                      ctypes.c_uint32(1), ctypes.c_uint32(p.k)]
+            _ptrs = [ctypes.c_void_p(d_D.value),
+                     ctypes.c_void_p(d_ws_val),  # C slot = workspace
+                     ctypes.c_void_p(d_A.value),
+                     ctypes.c_void_p(d_B.value)]
+            _strides = [
+                ctypes.c_void_p(d_flags_val),  # stride D0,D1 slot = flags_ptr (8B)
+                ctypes.c_uint32(num_parts),     # stride C0 slot = num_partitions
+                ctypes.c_uint32(0),             # stride C1 (unused)
+                ctypes.c_uint32(p.k), ctypes.c_uint32(p.m * p.k),
+                ctypes.c_uint32(p.k), ctypes.c_uint32(p.n * p.k),
+            ]
+            _alpha_beta = [ctypes.c_float(1.0), ctypes.c_float(0.0)]
+            _all = _header + _sizes + _ptrs + _strides + _alpha_beta
+            args = (ctypes.c_void_p * len(_all))()
+            for i, v in enumerate(_all):
+                args[i] = ctypes.cast(ctypes.pointer(v), ctypes.c_void_p)
+            return args, _all  # keep _all alive
+
+        grid_m = tiles_m
+        grid_n = tiles_n
+
+        # For DP mode (num_partitions=1), single launch
+        if num_partitions == 1:
+            args, _keep = _make_args(0, k_tiles, 0, 0, 0, 0, 1)
+            for _ in range(num_warmup):
+                _check(hip.hipModuleLaunchKernel(
+                    func, grid_m, grid_n, 1,
+                    block_size, 1, 1, 0, None, args, None),
+                    "launch warmup")
+            _check(hip.hipDeviceSynchronize(), "sync warmup")
+
+            ev_s, ev_e = ctypes.c_void_p(), ctypes.c_void_p()
+            _check(hip.hipEventCreate(ctypes.byref(ev_s)), "ev")
+            _check(hip.hipEventCreate(ctypes.byref(ev_e)), "ev")
+            _check(hip.hipEventRecord(ev_s, None), "rec")
+            for _ in range(num_iters):
+                _check(hip.hipModuleLaunchKernel(
+                    func, grid_m, grid_n, 1,
+                    block_size, 1, 1, 0, None, args, None), "launch")
+            _check(hip.hipEventRecord(ev_e, None), "rec")
+            _check(hip.hipEventSynchronize(ev_e), "sync")
+            ms = ctypes.c_float()
+            _check(hip.hipEventElapsedTime(ctypes.byref(ms), ev_s, ev_e), "time")
+            avg_time = ms.value / 1000.0 / num_iters
+            hip.hipEventDestroy(ev_s); hip.hipEventDestroy(ev_e)
+        else:
+            # K-splitting: launch num_partitions times per iteration.
+            # Each launch covers all tiles with a specific partition index.
+            # Partition 0 (owner): iter_start=0, is_partial=1
+            # Partition p>0 (non-owner): iter_start=..., is_partial=1
+            iters_per_part = k_tiles // num_partitions
+            extra_iters = k_tiles % num_partitions
+
+            def _part_range(p_idx):
+                start = p_idx * iters_per_part + min(p_idx, extra_iters)
+                count = iters_per_part + (1 if p_idx < extra_iters else 0)
+                return start, start + count
+
+            # Build args for each partition
+            part_args = []
+            for p_idx in range(num_partitions):
+                s, e = _part_range(p_idx)
+                # partition_idx = tile_serial * num_partitions + p_idx
+                # But with per-launch approach, all tiles in this launch
+                # have the same p_idx. partition_idx is computed per-tile.
+                # Actually, we need partition_idx to be unique per (tile, partition).
+                # With the per-launch approach, we pass p_idx in header[3]
+                # and the kernel doesn't know its tile index for workspace
+                # offset calculation...
+
+                # This is getting complex. Let me simplify:
+                # partition_idx = p_idx (0-based within each tile).
+                # workspace layout: workspace[tile_serial * num_partitions + p_idx]
+                # The kernel uses partition_idx for workspace offset, but it
+                # doesn't know tile_serial. We need to encode tile_serial
+                # into partition_idx.
+
+                # With 2D grid: tile_serial = wg_id_y * tiles_m + wg_id_x.
+                # partition_idx = tile_serial * num_partitions + p_idx.
+                # But the kernel reads partition_idx from kernarg, not from
+                # wg_id. We can't have per-WG values in flat kernarg.
+
+                # SOLUTION: have the kernel compute partition_idx from
+                # its WG IDs: partition_idx = (wg_id_y * tiles_m + wg_id_x) * num_partitions + p_idx_from_header
+                # The header just carries p_idx (which partition within the tile).
+
+                part_args.append((s, e, 1, p_idx))
+
+            # Warmup
+            _check(hip.hipMemset(d_flags, 0, flags_bytes), "clear flags")
+            for _ in range(num_warmup):
+                _check(hip.hipMemset(d_flags, 0, flags_bytes), "clear flags")
+                for s, e, is_p, p_idx in part_args:
+                    args, _keep = _make_args(s, e, is_p, p_idx,
+                                             d_ws.value, d_flags.value, num_partitions)
+                    _check(hip.hipModuleLaunchKernel(
+                        func, grid_m, grid_n, 1,
+                        block_size, 1, 1, 0, None, args, None), "launch")
+                _check(hip.hipDeviceSynchronize(), "sync")
+
+            # Timed
+            ev_s, ev_e = ctypes.c_void_p(), ctypes.c_void_p()
+            _check(hip.hipEventCreate(ctypes.byref(ev_s)), "ev")
+            _check(hip.hipEventCreate(ctypes.byref(ev_e)), "ev")
+            _check(hip.hipEventRecord(ev_s, None), "rec")
+            for _ in range(num_iters):
+                _check(hip.hipMemset(d_flags, 0, flags_bytes), "clear flags")
+                for s, e, is_p, p_idx in part_args:
+                    args, _keep = _make_args(s, e, is_p, p_idx,
+                                             d_ws.value, d_flags.value, num_partitions)
+                    _check(hip.hipModuleLaunchKernel(
+                        func, grid_m, grid_n, 1,
+                        block_size, 1, 1, 0, None, args, None), "launch")
+            _check(hip.hipEventRecord(ev_e, None), "rec")
+            _check(hip.hipEventSynchronize(ev_e), "sync")
+            ms = ctypes.c_float()
+            _check(hip.hipEventElapsedTime(ctypes.byref(ms), ev_s, ev_e), "time")
+            avg_time = ms.value / 1000.0 / num_iters
+            hip.hipEventDestroy(ev_s); hip.hipEventDestroy(ev_e)
 
         D_out = np.zeros((p.m, p.n), dtype=np.float16)
         _check(hip.hipMemcpy(D_out.ctypes.data, d_D, p.m * p.n * elem, 2), "D2H")
 
-        hip.hipEventDestroy(ev_start); hip.hipEventDestroy(ev_stop)
         hip.hipFree(d_A); hip.hipFree(d_B); hip.hipFree(d_D)
+        if num_partitions > 1:
+            hip.hipFree(d_ws); hip.hipFree(d_flags)
         hip.hipModuleUnload(module)
 
         max_err = float(np.max(np.abs(D_out.astype(np.float32) - D_ref.astype(np.float32))))
