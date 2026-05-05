@@ -1,4 +1,4 @@
-"""DTL + 3-barrier + interleaved K-loop for 256x256x64 tile.
+r"""DTL + 3-barrier + interleaved K-loop for 256x256x64 tile.
 
 Matches TensileLite's architecture:
 - 128 MFMAs per K-loop iteration (8x8x2 = mr*nr*ki)
@@ -77,74 +77,34 @@ def _b_off(ni: int, ki: int, tile: TileConfig, mfma: MfmaConfig, elem: float) ->
     return int(row_start * row_stride + lines_crossed * pad_bytes + ki * mfma.k * elem)
 
 
-def phase_wave_abi_setup(level: TileLevel, ctx: AsmContext) -> None:
-    """Setup for WaveGemmKernelArgs ABI (rocRoller custom kernel path).
+# ---------------------------------------------------------------------------
+# Shared helpers for phase_wave_abi_setup / phase_dtl_interleaved_setup
+# ---------------------------------------------------------------------------
 
-    WaveGemmKernelArgs layout (104 bytes, all u64):
-        0:  ptr_a              -- kernel's A (hipBLASLt's B, swapped)
-        8:  ptr_a_scale        -- kernel's ScaleA
-       16:  ptr_b              -- kernel's B (hipBLASLt's A, swapped)
-       24:  ptr_b_scale        -- kernel's ScaleB
-       32:  ptr_c              -- D output
-       40:  m                  -- kernel's M (u64)
-       48:  n                  -- kernel's N (u64)
-       56:  k                  -- K (u64)
-       64:  stride_a_dim0      -- A row stride in bytes (u64)
-       72:  stride_a_scale_dim0-- k/32 (u64)
-       80:  stride_b_dim0      -- B row stride in bytes (u64)
-       88:  stride_b_scale_dim0-- k/32 (u64)
-       96:  stride_c_dim0      -- D column stride (u64)
+def _compute_dtl_lds_b_offset(tile: TileConfig, elem: float,
+                               layouts: GemmLayouts) -> int:
+    """Compute LDS B offset for DTL writes, accounting for padding."""
+    if tile.lds_pad > 0:
+        threads_per_row = int(tile.unroll_k * elem) // 16
+        rows_per_load = tile.block_size // threads_per_row
+        num_loads_a = tile.wg_m // rows_per_load
+        return int(tile.wg_m * tile.unroll_k * elem) + num_loads_a * tile.lds_pad
+    return layouts.lds_b_offset
 
-    Grid is 2D: grid.x = tilesM, grid.y = tilesN.
-    No 1D decomposition needed.
-    """
-    tile = _tile(ctx)
-    problem = _problem(ctx)
-    elem = problem.element_bytes
-    mfma = tile.mfma
-    layouts = _layouts(ctx)
 
-    ctx.comment("=== Wave ABI Setup (rocRoller custom kernel) ===")
-    ctx._metadata["use_wave_abi"] = True
-
-    # Load kernargs -- all fields are u64, load dwordx2 and use low 32 bits
-    karg = ctx.sreg("s_kernarg")
-    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_A"), karg, "0",
-             comment="ptr_a (kernel A)")
-    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_scale_a"), karg, "8",
-             comment="ptr_a_scale")
-    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_B"), karg, "16",
-             comment="ptr_b (kernel B)")
-    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_scale_b"), karg, "24",
-             comment="ptr_b_scale")
-    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_D"), karg, "32",
-             comment="ptr_c (D output)")
-    # M, N, K are u64 -- load low 32 bits via s_load_dword (little-endian)
-    ctx.inst("s_load_dword", ctx.sreg("s_M"), karg, "40",
-             comment="M = low dword of m (u64)")
-    ctx.inst("s_load_dword", ctx.sreg("s_N"), karg, "48",
-             comment="N = low dword of n (u64)")
-    ctx.inst("s_load_dword", ctx.sreg("s_K"), karg, "56",
-             comment="K = low dword of k (u64)")
-    # Scale strides (u64, load low 32 bits)
-    ctx.inst("s_load_dword", ctx.sreg("s_stride_scale_a"), karg, "72",
-             comment="stride_a_scale_dim0 (low 32)")
-    ctx.inst("s_load_dword", ctx.sreg("s_stride_scale_b"), karg, "88",
-             comment="stride_b_scale_dim0 (low 32)")
-    ctx.s_waitcnt("lgkmcnt(0)", comment="wait kernargs")
-    ctx.raw("")
-
-    # 2D grid: s_wg_id_x = tile M index, s_wg_id_y = tile N index (no decomp)
-
-    # Compute K stride in bytes: K * element_bytes
+def _emit_k_stride(ctx: AsmContext, elem: float) -> None:
+    """Emit s_k_stride = K * element_bytes."""
     if elem >= 1:
         ctx.s_lshl(ctx.sreg("s_k_stride"), ctx.sreg("s_K"),
                    int(math.log2(elem)), comment=f"s_k_stride = K * {elem}")
     else:
+        # Sub-byte: elem=0.5 means K / 2
         ctx.s_lshr(ctx.sreg("s_k_stride"), ctx.sreg("s_K"),
                    int(math.log2(1.0 / elem)), comment=f"s_k_stride = K * {elem}")
 
-    # Thread indexing
+
+def _emit_thread_indexing(ctx: AsmContext, tile: TileConfig) -> None:
+    """Emit wave_id, lane_id, wave_m, wave_n from v_tid."""
     log2_ws = int(math.log2(tile.wave_size))
     ctx.v_lshr(ctx.vreg("v_wave_id"), ctx.vreg("v_tid"), log2_ws,
                comment=f"wave_id = tid >> {log2_ws}")
@@ -161,7 +121,10 @@ def phase_wave_abi_setup(level: TileLevel, ctx: AsmContext) -> None:
         ctx.v_mov(ctx.vreg("v_wave_n"), "0", comment="wave_n = 0")
     ctx.raw("")
 
-    # DTL per-lane offset
+
+def _emit_dtl_lane_offset(ctx: AsmContext, tile: TileConfig,
+                           elem: float) -> None:
+    """Emit per-lane DTL buffer offset. Sets v_tmp0=thread_row, v_tmp1=col_bytes."""
     threads_per_row = int(tile.unroll_k * elem) // 16
     log2_tpr = int(math.log2(threads_per_row))
     ctx.comment(f"DTL offset: {threads_per_row} threads/row")
@@ -171,6 +134,12 @@ def phase_wave_abi_setup(level: TileLevel, ctx: AsmContext) -> None:
               comment="thread_col_group")
     ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_tmp1"), 4,
                comment="* 16 -> col_bytes")
+
+
+def _emit_lds_write_offset(ctx: AsmContext, tile: TileConfig,
+                            elem: float) -> None:
+    """Emit swizzled + non-swizzled LDS write offsets and double-buffer init."""
+    mfma = tile.mfma
 
     # Compute swizzled LDS write offset (for BufferLoader path)
     # v_tmp0 = thread_row, v_tmp1 = col_bytes (= thread_col * 16)
@@ -221,7 +190,9 @@ def phase_wave_abi_setup(level: TileLevel, ctx: AsmContext) -> None:
               comment="buf_wr_db = 0 (buffer 0)")
     ctx.raw("")
 
-    # DTL voffset = thread_row * K * elem + col_bytes (global stride)
+
+def _emit_dtl_voffset(ctx: AsmContext) -> None:
+    """Emit DTL voffset = thread_row * K * elem + col_bytes."""
     ctx.inst("v_mul_lo_u32", ctx.vreg("v_dtl_off_a"),
              ctx.sreg("s_k_stride"), ctx.vreg("v_tmp0"), comment="row * K*elem")
     ctx.v_add(ctx.vreg("v_dtl_off_a"), ctx.vreg("v_dtl_off_a"),
@@ -230,7 +201,9 @@ def phase_wave_abi_setup(level: TileLevel, ctx: AsmContext) -> None:
               comment="B offset = same")
     ctx.raw("")
 
-    # SRD A
+
+def _emit_srd_a(ctx: AsmContext, tile: TileConfig) -> None:
+    """Build SRD for A matrix."""
     ctx.comment("SRD A")
     ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"), str(tile.wg_m),
               comment=f"wg_id * {tile.wg_m}")
@@ -244,7 +217,9 @@ def phase_wave_abi_setup(level: TileLevel, ctx: AsmContext) -> None:
     ctx.inst("s_mov_b32", ctx.sreg("s_srd_a", 3, 1), "0x20000", comment="flags")
     ctx.raw("")
 
-    # SRD B
+
+def _emit_srd_b(ctx: AsmContext, tile: TileConfig) -> None:
+    """Build SRD for B matrix."""
     ctx.comment("SRD B")
     ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"), str(tile.wg_n),
               comment=f"wg_id * {tile.wg_n}")
@@ -258,7 +233,11 @@ def phase_wave_abi_setup(level: TileLevel, ctx: AsmContext) -> None:
     ctx.inst("s_mov_b32", ctx.sreg("s_srd_b", 3, 1), "0x20000", comment="flags")
     ctx.raw("")
 
-    # Scalar offsets for multi-line DTL loads
+
+def _emit_dtl_scalar_offsets(ctx: AsmContext, tile: TileConfig,
+                              elem: float) -> None:
+    """Emit scalar offsets for multi-line DTL loads."""
+    threads_per_row = int(tile.unroll_k * elem) // 16
     rows_per_load = tile.block_size // threads_per_row
     ctx.comment(f"Scalar offset for DTL lines ({rows_per_load} rows/load)")
     ctx.s_mul(ctx.sreg("s_soffset_a"), ctx.sreg("s_k_stride"),
@@ -266,7 +245,10 @@ def phase_wave_abi_setup(level: TileLevel, ctx: AsmContext) -> None:
     ctx.s_mov(ctx.sreg("s_soffset_b"), ctx.sreg("s_soffset_a"), comment="same")
     ctx.raw("")
 
-    # LDS write base for DTL
+
+def _emit_dtl_lds_write_base(ctx: AsmContext, tile: TileConfig,
+                              elem: float, layouts: GemmLayouts) -> int:
+    """Emit LDS write base SGPRs for DTL. Returns dtl_lds_b_offset."""
     ctx.comment("LDS write base for DTL")
     dtl_row_stride = int(tile.unroll_k * elem)
     ctx.v_mul(ctx.vreg("v_tmp0"), str(dtl_row_stride),
@@ -275,21 +257,27 @@ def phase_wave_abi_setup(level: TileLevel, ctx: AsmContext) -> None:
               comment="+ col_bytes -> per-thread LDS offset")
     ctx.inst("v_readfirstlane_b32", ctx.sreg("s_lds_wr_a_sg"),
              ctx.vreg("v_tmp0"), comment="LDS write base A")
-    if tile.lds_pad > 0:
-        threads_per_row_ = int(tile.unroll_k * elem) // 16
-        rows_per_load_ = tile.block_size // threads_per_row_
-        num_loads_a_ = tile.wg_m // rows_per_load_
-        dtl_lds_b_offset = int(tile.wg_m * tile.unroll_k * elem) + num_loads_a_ * tile.lds_pad
-    else:
-        dtl_lds_b_offset = layouts.lds_b_offset
+    dtl_lds_b_offset = _compute_dtl_lds_b_offset(tile, elem, layouts)
     ctx.inst("s_add_u32", ctx.sreg("s_lds_wr_b_sg"),
              ctx.sreg("s_lds_wr_a_sg"), str(dtl_lds_b_offset),
              comment=f"LDS write base B = A + {dtl_lds_b_offset}")
     ctx.raw("")
+    return dtl_lds_b_offset
 
-    # LDS read addresses
+
+def _emit_lds_read_addresses(ctx: AsmContext, tile: TileConfig,
+                              elem: float, mfma: MfmaConfig,
+                              layouts: GemmLayouts,
+                              lds_b_off_paired: int,
+                              save_persistent: bool) -> None:
+    """Emit swizzle-aware LDS read addresses for A and B.
+
+    Args:
+        lds_b_off_paired: LDS B offset used in paired-row swizzle branch.
+        save_persistent: Whether to save persistent VGPRs for per-mi/ni
+            recomputation (needed by dtl_interleaved, not by wave_abi).
+    """
     k_per_group = mfma.k // (tile.wave_size // mfma.m)
-    threads_per_row_rd = int(tile.unroll_k * elem) // 16
     row_stride_bytes = int(tile.unroll_k * elem)
     ctx.comment("LDS read addresses")
     ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.m - 1,
@@ -297,7 +285,6 @@ def phase_wave_abi_setup(level: TileLevel, ctx: AsmContext) -> None:
 
     swz = tile.resolved_swizzle(elem)
     if swz is not None and hasattr(swz, 'pair_factor'):
-        # Paired-row swizzle: use actual M-row (not lane_row) for rotation
         from ..memory.swizzle import DataLayout as SwzLayout, LDS_GFX950
         swz_layout = SwzLayout(row_stride_bytes=row_stride_bytes,
                                mfma_k=mfma.k, mfma_m=mfma.m,
@@ -321,7 +308,6 @@ def phase_wave_abi_setup(level: TileLevel, ctx: AsmContext) -> None:
                    int(math.log2(pf)), comment=f"lds_row = m_row / {pf}")
         ctx.v_mul(ctx.vreg("v_tmp2"), str(eff_stride), ctx.vreg("v_tmp2"),
                   comment=f"row_base = lds_row * {eff_stride}")
-        # emit_read_setup: v_lds_rd_a = m_row, v_tmp1 = k_group, v_tmp2 = row_base
         a_out = [ctx.vreg("v_lds_rd_a")]
         for ki in range(1, ki_count):
             vname = f"v_lds_rd_a_k{ki}"
@@ -331,6 +317,17 @@ def phase_wave_abi_setup(level: TileLevel, ctx: AsmContext) -> None:
         swz.emit_read_setup(ctx, swz_layout, LDS_GFX950,
                             ctx.vreg("v_lds_rd_a"), ctx.vreg("v_tmp1"),
                             ctx.vreg("v_tmp2"), a_out)
+
+        if save_persistent:
+            # Save m_row_base and k_group for per-mi recomputation
+            ctx.alloc_vgpr_permanent(1, "v_m_row_base_a")
+            ctx.v_mul(ctx.vreg("v_m_row_base_a"), str(tile.m_per_wave),
+                      ctx.vreg("v_wave_m"), comment=f"m_row_base = wave_m * {tile.m_per_wave}")
+            ctx.v_add(ctx.vreg("v_m_row_base_a"), ctx.vreg("v_m_row_base_a"),
+                      ctx.vreg("v_tmp0"), comment="+ lane_row (persistent)")
+            ctx.alloc_vgpr_permanent(1, "v_k_group_a")
+            ctx.v_mov(ctx.vreg("v_k_group_a"), ctx.vreg("v_tmp1"),
+                      comment="k_group (persistent)")
         ctx.raw("")
 
         # B: n_row = wave_n * n_per_wave + lane_row
@@ -342,7 +339,7 @@ def phase_wave_abi_setup(level: TileLevel, ctx: AsmContext) -> None:
         ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
                   ctx.vreg("v_tmp0"), comment="+ lane_row -> n_row_b")
         # row_base = (n_row / pf) * eff_stride + lds_b_offset
-        lds_b_off = int((tile.wg_m + tile.wg_n) * tile.unroll_k * elem) // 2
+        lds_b_off = lds_b_off_paired
         ctx.v_lshr(ctx.vreg("v_tmp2"), ctx.vreg("v_lds_rd_b"),
                    int(math.log2(pf)), comment=f"lds_row = n_row / {pf}")
         ctx.v_mul(ctx.vreg("v_tmp2"), str(eff_stride), ctx.vreg("v_tmp2"),
@@ -359,6 +356,17 @@ def phase_wave_abi_setup(level: TileLevel, ctx: AsmContext) -> None:
         swz.emit_read_setup(ctx, swz_layout, LDS_GFX950,
                             ctx.vreg("v_lds_rd_b"), ctx.vreg("v_tmp1"),
                             ctx.vreg("v_tmp2"), b_out)
+
+        if save_persistent:
+            # Save n_row_base for per-ni recomputation
+            ctx.alloc_vgpr_permanent(1, "v_n_row_base_b")
+            ctx.v_mul(ctx.vreg("v_n_row_base_b"), str(tile.n_per_wave),
+                      ctx.vreg("v_wave_n"), comment=f"n_row_base = wave_n * {tile.n_per_wave}")
+            ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.m - 1,
+                      comment="lane_row (re-derive for save)")
+            ctx.v_add(ctx.vreg("v_n_row_base_b"), ctx.vreg("v_n_row_base_b"),
+                      ctx.vreg("v_tmp0"), comment="+ lane_row (persistent)")
+            ctx.raw("")
     elif swz is not None:
         # Non-paired swizzle (legacy path)
         from ..memory.swizzle import DataLayout as SwzLayout, LDS_GFX950
@@ -443,34 +451,114 @@ def phase_wave_abi_setup(level: TileLevel, ctx: AsmContext) -> None:
                           comment=f"wave pad = wave_n * {wave_lines_b * tile.lds_pad}")
                 ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
                           ctx.vreg("v_tmp0"), comment="+ wave padding (bytes)")
-    if tile.lds_pad > 0:
-        threads_per_row__ = int(tile.unroll_k * elem) // 16
-        rows_per_load__ = tile.block_size // threads_per_row__
-        num_loads_a__ = tile.wg_m // rows_per_load__
-        dtl_b_off = int(tile.wg_m * tile.unroll_k * elem) + num_loads_a__ * tile.lds_pad
-    else:
-        dtl_b_off = layouts.lds_b_offset
-    # Paired-row swizzle already added lds_b_offset in the swizzle block
+    # Add LDS B offset (non-paired-swizzle cases only; paired already baked it in)
+    dtl_b_off = _compute_dtl_lds_b_offset(tile, elem, layouts)
     swz_check = tile.resolved_swizzle(elem)
     if swz_check is None or not hasattr(swz_check, 'pair_factor'):
         ctx.v_add(ctx.vreg("v_lds_rd_b"), str(dtl_b_off),
                   ctx.vreg("v_lds_rd_b"), comment=f"+ lds_b_offset({dtl_b_off})")
     ctx.raw("")
 
-    # Init accumulators
+
+def _emit_acc_init(ctx: AsmContext, tile: TileConfig) -> None:
+    """Zero accumulators."""
     acc_total = tile.mfma_m_repeat * tile.mfma_n_repeat * tile.mfma.acc_vgprs
     ctx.comment(f"Init {acc_total} accumulators")
     for i in range(acc_total):
         ctx.inst("v_accvgpr_write_b32", ctx.areg("acc_C", i, 1), "0")
     ctx.raw("")
 
-    # Init MX constant scale VGPR
+
+def _emit_mx_const_scale(ctx: AsmContext) -> None:
+    """Init MX constant scale VGPR if needed."""
     layout = ctx._metadata.get("layout")
     if layout.mfma_has_scale_operands:
         ctx.comment("Init MX constant scale = 1.0 (E8M0 0x7F)")
         ctx.v_mov(ctx.vreg("v_mxscale"), "0x7F7F7F7F",
                   comment="scale = 1.0 for all byte lanes")
         ctx.raw("")
+
+
+# ---------------------------------------------------------------------------
+# Public setup phases
+# ---------------------------------------------------------------------------
+
+def phase_wave_abi_setup(level: TileLevel, ctx: AsmContext) -> None:
+    """Setup for WaveGemmKernelArgs ABI (rocRoller custom kernel path).
+
+    WaveGemmKernelArgs layout (104 bytes, all u64):
+        0:  ptr_a              -- kernel's A (hipBLASLt's B, swapped)
+        8:  ptr_a_scale        -- kernel's ScaleA
+       16:  ptr_b              -- kernel's B (hipBLASLt's A, swapped)
+       24:  ptr_b_scale        -- kernel's ScaleB
+       32:  ptr_c              -- D output
+       40:  m                  -- kernel's M (u64)
+       48:  n                  -- kernel's N (u64)
+       56:  k                  -- K (u64)
+       64:  stride_a_dim0      -- A row stride in bytes (u64)
+       72:  stride_a_scale_dim0-- k/32 (u64)
+       80:  stride_b_dim0      -- B row stride in bytes (u64)
+       88:  stride_b_scale_dim0-- k/32 (u64)
+       96:  stride_c_dim0      -- D column stride (u64)
+
+    Grid is 2D: grid.x = tilesM, grid.y = tilesN.
+    No 1D decomposition needed.
+    """
+    tile = _tile(ctx)
+    problem = _problem(ctx)
+    elem = problem.element_bytes
+    mfma = tile.mfma
+    layouts = _layouts(ctx)
+
+    ctx.comment("=== Wave ABI Setup (rocRoller custom kernel) ===")
+    ctx._metadata["use_wave_abi"] = True
+
+    # Load kernargs -- all fields are u64, load dwordx2 and use low 32 bits
+    karg = ctx.sreg("s_kernarg")
+    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_A"), karg, "0",
+             comment="ptr_a (kernel A)")
+    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_scale_a"), karg, "8",
+             comment="ptr_a_scale")
+    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_B"), karg, "16",
+             comment="ptr_b (kernel B)")
+    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_scale_b"), karg, "24",
+             comment="ptr_b_scale")
+    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_D"), karg, "32",
+             comment="ptr_c (D output)")
+    # M, N, K are u64 -- load low 32 bits via s_load_dword (little-endian)
+    ctx.inst("s_load_dword", ctx.sreg("s_M"), karg, "40",
+             comment="M = low dword of m (u64)")
+    ctx.inst("s_load_dword", ctx.sreg("s_N"), karg, "48",
+             comment="N = low dword of n (u64)")
+    ctx.inst("s_load_dword", ctx.sreg("s_K"), karg, "56",
+             comment="K = low dword of k (u64)")
+    # Scale strides (u64, load low 32 bits)
+    ctx.inst("s_load_dword", ctx.sreg("s_stride_scale_a"), karg, "72",
+             comment="stride_a_scale_dim0 (low 32)")
+    ctx.inst("s_load_dword", ctx.sreg("s_stride_scale_b"), karg, "88",
+             comment="stride_b_scale_dim0 (low 32)")
+    ctx.s_waitcnt("lgkmcnt(0)", comment="wait kernargs")
+    ctx.raw("")
+
+    # 2D grid: s_wg_id_x = tile M index, s_wg_id_y = tile N index (no decomp)
+
+    _emit_k_stride(ctx, elem)
+    _emit_thread_indexing(ctx, tile)
+    _emit_dtl_lane_offset(ctx, tile, elem)
+    _emit_lds_write_offset(ctx, tile, elem)
+    _emit_dtl_voffset(ctx)
+    _emit_srd_a(ctx, tile)
+    _emit_srd_b(ctx, tile)
+    _emit_dtl_scalar_offsets(ctx, tile, elem)
+    _emit_dtl_lds_write_base(ctx, tile, elem, layouts)
+
+    # Wave ABI uses a different LDS B offset for paired-row swizzle reads
+    lds_b_off_paired = int((tile.wg_m + tile.wg_n) * tile.unroll_k * elem) // 2
+    _emit_lds_read_addresses(ctx, tile, elem, mfma, layouts,
+                              lds_b_off_paired=lds_b_off_paired,
+                              save_persistent=False)
+    _emit_acc_init(ctx, tile)
+    _emit_mx_const_scale(ctx)
 
 
 def phase_dtl_interleaved_setup(level: TileLevel, ctx: AsmContext) -> None:
@@ -560,370 +648,20 @@ def phase_dtl_interleaved_setup(level: TileLevel, ctx: AsmContext) -> None:
 
 
 
-    # Thread indexing
-    log2_ws = int(math.log2(tile.wave_size))
-    ctx.v_lshr(ctx.vreg("v_wave_id"), ctx.vreg("v_tid"), log2_ws,
-               comment=f"wave_id = tid >> {log2_ws}")
-    ctx.v_and(ctx.vreg("v_lane_id"), ctx.vreg("v_tid"), tile.wave_size - 1,
-              comment=f"lane_id = tid & {tile.wave_size - 1}")
-    log2_wn = int(math.log2(tile.waves_n)) if tile.waves_n > 1 else 0
-    if tile.waves_n > 1:
-        ctx.v_lshr(ctx.vreg("v_wave_m"), ctx.vreg("v_wave_id"), log2_wn,
-                   comment=f"wave_m = wave_id >> {log2_wn}")
-        ctx.v_and(ctx.vreg("v_wave_n"), ctx.vreg("v_wave_id"),
-                  tile.waves_n - 1, comment=f"wave_n = wave_id & {tile.waves_n - 1}")
-    else:
-        ctx.v_mov(ctx.vreg("v_wave_m"), ctx.vreg("v_wave_id"), comment="wave_m")
-        ctx.v_mov(ctx.vreg("v_wave_n"), "0", comment="wave_n = 0")
-    ctx.raw("")
-
-    # DTL per-lane offset
-    threads_per_row = int(tile.unroll_k * elem) // 16
-    log2_tpr = int(math.log2(threads_per_row))
-    ctx.comment(f"DTL offset: {threads_per_row} threads/row")
-    ctx.v_lshr(ctx.vreg("v_tmp0"), ctx.vreg("v_tid"), log2_tpr,
-               comment="thread_row")
-    ctx.v_and(ctx.vreg("v_tmp1"), ctx.vreg("v_tid"), threads_per_row - 1,
-              comment="thread_col_group")
-    # Note: swizzle is NOT applied to DTL offsets because DTL uses the
-    # same offset for both global read and LDS write. Swizzling would
-    # read from wrong global addresses. Swizzle is handled by the
-    # BufferLoader path instead (global_load -> VGPR -> ds_write).
-    ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_tmp1"), 4,
-               comment="* 16 -> col_bytes")
-
-    # K stride: K * element_bytes
-    if elem >= 1:
-        ctx.s_lshl(ctx.sreg("s_k_stride"), ctx.sreg("s_K"),
-                   int(math.log2(elem)), comment=f"s_k_stride = K * {elem}")
-    else:
-        # Sub-byte: elem=0.5 means K / 2
-        ctx.s_lshr(ctx.sreg("s_k_stride"), ctx.sreg("s_K"),
-                   int(math.log2(1.0 / elem)), comment=f"s_k_stride = K * {elem}")
-
-    # Compute swizzled LDS write offset (for BufferLoader path)
-    # v_tmp0 = thread_row, v_tmp1 = col_bytes (= thread_col * 16)
-    swz = tile.resolved_swizzle(elem)
-    if swz is not None and hasattr(swz, 'pair_factor'):
-        from ..memory.swizzle import DataLayout as SwzLayout, LDS_GFX950
-        swz_layout = SwzLayout(row_stride_bytes=int(tile.unroll_k * elem),
-                               mfma_k=mfma.k, mfma_m=mfma.m,
-                               elem_bytes=elem, wave_size=tile.wave_size)
-        pf = swz.pair_factor
-        ec = swz.effective_cols
-        eff_stride = ec * 16
-
-        ctx.comment(f"Swizzled LDS write offset (pair={pf}, eff_cols={ec})")
-        # thread_col in 16B column units (v_tmp1 is already col_bytes)
-        ctx.v_lshr(ctx.vreg("v_tmp4"), ctx.vreg("v_tmp1"), 4,
-                   comment="thread_col = col_bytes / 16")
-        # Apply write swizzle: computes swizzled_col from (thread_row, thread_col)
-        swz.emit_write_swizzle(ctx, swz_layout, LDS_GFX950,
-                               ctx.vreg("v_tmp0"), ctx.vreg("v_tmp4"),
-                               ctx.vreg("v_tmp4"))
-        # lds_row = thread_row / pair_factor
-        ctx.v_lshr(ctx.vreg("v_tmp3"), ctx.vreg("v_tmp0"),
-                   int(math.log2(pf)), comment=f"lds_row = row / {pf}")
-        # v_lds_wr_swz = lds_row * eff_stride + swizzled_col * 16
-        ctx.alloc_vgpr_permanent(1, "v_lds_wr_swz")
-        ctx.v_mul(ctx.vreg("v_lds_wr_swz"), str(eff_stride),
-                  ctx.vreg("v_tmp3"), comment=f"lds_row * {eff_stride}")
-        ctx.v_lshl(ctx.vreg("v_tmp4"), ctx.vreg("v_tmp4"), 4,
-                   comment="swizzled_col * 16")
-        ctx.v_add(ctx.vreg("v_lds_wr_swz"), ctx.vreg("v_lds_wr_swz"),
-                  ctx.vreg("v_tmp4"), comment="+ swizzled_col_bytes")
-        ctx.raw("")
-
-    # LDS write offset = thread_row * unroll_k * elem + col_bytes
-    # This uses the LDS row stride (unroll_k*elem), NOT the global stride (K*elem)
-    row_stride_lds = int(tile.unroll_k * elem)
-    ctx.alloc_vgpr_permanent(1, "v_lds_wr_off")
-    ctx.v_mul(ctx.vreg("v_lds_wr_off"), str(row_stride_lds),
-              ctx.vreg("v_tmp0"), comment=f"row * {row_stride_lds} (LDS stride)")
-    ctx.v_add(ctx.vreg("v_lds_wr_off"), ctx.vreg("v_lds_wr_off"),
-              ctx.vreg("v_tmp1"), comment="+ col_bytes -> v_lds_wr_off")
-    ctx.raw("")
-
-    # Double-buffer write offset for BufferLoader (starts at 0)
-    ctx.alloc_sgpr_permanent(1, "s_buf_wr_db")
-    ctx.s_mov(ctx.sreg("s_buf_wr_db"), "0",
-              comment="buf_wr_db = 0 (buffer 0)")
-    ctx.raw("")
-
-    # DTL voffset = thread_row * K * elem + col_bytes (global stride)
-    ctx.inst("v_mul_lo_u32", ctx.vreg("v_dtl_off_a"),
-             ctx.sreg("s_k_stride"), ctx.vreg("v_tmp0"), comment="row * K*elem")
-    ctx.v_add(ctx.vreg("v_dtl_off_a"), ctx.vreg("v_dtl_off_a"),
-              ctx.vreg("v_tmp1"), comment="+ col_bytes")
-    ctx.v_mov(ctx.vreg("v_dtl_off_b"), ctx.vreg("v_dtl_off_a"),
-              comment="B offset = same")
-    ctx.raw("")
-
-    # SRD A
-    ctx.comment("SRD A")
-    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"), str(tile.wg_m),
-              comment=f"wg_id * {tile.wg_m}")
-    ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
-             ctx.sreg("s_k_stride"), comment="* K*elem")
-    ctx.inst("s_add_u32", ctx.sreg("s_srd_a", 0, 1),
-             ctx.sreg("s_ptr_A", 0, 1), ctx.sreg("s_tmp0"), comment="SRD_A lo")
-    ctx.inst("s_addc_u32", ctx.sreg("s_srd_a", 1, 1),
-             ctx.sreg("s_ptr_A", 1, 1), "0", comment="SRD_A hi")
-    ctx.inst("s_mov_b32", ctx.sreg("s_srd_a", 2, 1), "0xFFFFFFFF", comment="limit")
-    ctx.inst("s_mov_b32", ctx.sreg("s_srd_a", 3, 1), "0x20000", comment="flags")
-    ctx.raw("")
-
-    # SRD B
-    ctx.comment("SRD B")
-    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"), str(tile.wg_n),
-              comment=f"wg_id * {tile.wg_n}")
-    ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
-             ctx.sreg("s_k_stride"), comment="* K*elem")
-    ctx.inst("s_add_u32", ctx.sreg("s_srd_b", 0, 1),
-             ctx.sreg("s_ptr_B", 0, 1), ctx.sreg("s_tmp0"), comment="SRD_B lo")
-    ctx.inst("s_addc_u32", ctx.sreg("s_srd_b", 1, 1),
-             ctx.sreg("s_ptr_B", 1, 1), "0", comment="SRD_B hi")
-    ctx.inst("s_mov_b32", ctx.sreg("s_srd_b", 2, 1), "0xFFFFFFFF", comment="limit")
-    ctx.inst("s_mov_b32", ctx.sreg("s_srd_b", 3, 1), "0x20000", comment="flags")
-    ctx.raw("")
-
-    # Scalar offsets for multi-line DTL loads
-    rows_per_load = tile.block_size // threads_per_row
-    ctx.comment(f"Scalar offset for DTL lines ({rows_per_load} rows/load)")
-    ctx.s_mul(ctx.sreg("s_soffset_a"), ctx.sreg("s_k_stride"),
-              str(rows_per_load), comment=f"soffset = {rows_per_load} * K*elem")
-    ctx.s_mov(ctx.sreg("s_soffset_b"), ctx.sreg("s_soffset_a"), comment="same")
-    ctx.raw("")
-
-    # LDS write base for DTL (SGPR, wave-uniform)
-    pad_e = tile.lds_pad // elem if tile.lds_pad > 0 else 0
-    lds_row_stride = tile.unroll_k + pad_e
-    ctx.comment("LDS write base for DTL")
-    # DTL writes contiguously (m0 + lane_id*16), so row stride = unroll_k * elem
-    # NOT lds_row_stride (which includes per-row padding for non-DTL).
-    # The per-load-line padding is handled by m0 increments.
-    dtl_row_stride = int(tile.unroll_k * elem)  # 128 bytes for uk=64 fp16
-    ctx.v_mul(ctx.vreg("v_tmp0"), str(dtl_row_stride),
-              ctx.vreg("v_tmp0"), comment=f"row * {dtl_row_stride}")
-    ctx.v_add(ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),
-              comment="+ col_bytes -> per-thread LDS offset")
-    ctx.inst("v_readfirstlane_b32", ctx.sreg("s_lds_wr_a_sg"),
-             ctx.vreg("v_tmp0"), comment="LDS write base A")
-    # Compute DTL-specific lds_b_offset (with per-load-line padding)
-    if tile.lds_pad > 0:
-        threads_per_row_ = int(tile.unroll_k * elem) // 16
-        rows_per_load_ = tile.block_size // threads_per_row_
-        num_loads_a_ = tile.wg_m // rows_per_load_
-        dtl_lds_b_offset = int(tile.wg_m * tile.unroll_k * elem) + num_loads_a_ * tile.lds_pad
-    else:
-        dtl_lds_b_offset = layouts.lds_b_offset
-    ctx.inst("s_add_u32", ctx.sreg("s_lds_wr_b_sg"),
-             ctx.sreg("s_lds_wr_a_sg"), str(dtl_lds_b_offset),
-             comment=f"LDS write base B = A + {dtl_lds_b_offset}")
-    ctx.raw("")
-
-    # LDS read addresses
-    k_per_group = mfma.k // (tile.wave_size // mfma.m)
-    threads_per_row_rd = int(tile.unroll_k * elem) // 16
-    row_stride_bytes = int(tile.unroll_k * elem)
-    ctx.comment("LDS read addresses")
-    ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.m - 1,
-              comment=f"lane_row = lane_id % {mfma.m}")
-
-    swz = tile.resolved_swizzle(elem)
-    if swz is not None and hasattr(swz, 'pair_factor'):
-        # Paired-row swizzle: use m_row for rotation, paired row_base
-        from ..memory.swizzle import DataLayout as SwzLayout, LDS_GFX950
-        swz_layout = SwzLayout(row_stride_bytes=row_stride_bytes,
-                               mfma_k=mfma.k, mfma_m=mfma.m,
-                               elem_bytes=elem, wave_size=tile.wave_size)
-        pf = swz.pair_factor
-        ec = swz.effective_cols
-        eff_stride = ec * 16
-        ki_count = swz_layout.ki_count
-
-        ctx.v_lshr(ctx.vreg("v_tmp1"), ctx.vreg("v_lane_id"),
-                   int(math.log2(mfma.m)), comment=f"k_group = lane_id / {mfma.m}")
-
-        # A: m_row = wave_m * m_per_wave + lane_row
-        ctx.comment("LDS read A (paired-row swizzle)")
-        ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(tile.m_per_wave),
-                  ctx.vreg("v_wave_m"), comment=f"wave_m * {tile.m_per_wave}")
-        ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
-                  ctx.vreg("v_tmp0"), comment="+ lane_row -> m_row_a")
-        # row_base = (m_row / pf) * eff_stride
-        ctx.v_lshr(ctx.vreg("v_tmp2"), ctx.vreg("v_lds_rd_a"),
-                   int(math.log2(pf)), comment=f"lds_row = m_row / {pf}")
-        ctx.v_mul(ctx.vreg("v_tmp2"), str(eff_stride), ctx.vreg("v_tmp2"),
-                  comment=f"row_base = lds_row * {eff_stride}")
-        a_out = [ctx.vreg("v_lds_rd_a")]
-        for ki in range(1, ki_count):
-            vname = f"v_lds_rd_a_k{ki}"
-            if not ctx.has(vname):
-                ctx.alloc_vgpr_permanent(1, vname)
-            a_out.append(ctx.vreg(vname))
-        swz.emit_read_setup(ctx, swz_layout, LDS_GFX950,
-                            ctx.vreg("v_lds_rd_a"), ctx.vreg("v_tmp1"),
-                            ctx.vreg("v_tmp2"), a_out)
-
-        # Save m_row_base and k_group for per-mi recomputation
-        ctx.alloc_vgpr_permanent(1, "v_m_row_base_a")
-        ctx.v_mul(ctx.vreg("v_m_row_base_a"), str(tile.m_per_wave),
-                  ctx.vreg("v_wave_m"), comment=f"m_row_base = wave_m * {tile.m_per_wave}")
-        ctx.v_add(ctx.vreg("v_m_row_base_a"), ctx.vreg("v_m_row_base_a"),
-                  ctx.vreg("v_tmp0"), comment="+ lane_row (persistent)")
-        ctx.alloc_vgpr_permanent(1, "v_k_group_a")
-        ctx.v_mov(ctx.vreg("v_k_group_a"), ctx.vreg("v_tmp1"),
-                  comment="k_group (persistent)")
-        ctx.raw("")
-
-        # B: n_row = wave_n * n_per_wave + lane_row
-        ctx.comment("LDS read B (paired-row swizzle)")
-        ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.m - 1,
-                  comment=f"lane_row = lane_id % {mfma.m}")
-        ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(tile.n_per_wave),
-                  ctx.vreg("v_wave_n"), comment=f"wave_n * {tile.n_per_wave}")
-        ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
-                  ctx.vreg("v_tmp0"), comment="+ lane_row -> n_row_b")
-        lds_b_off = dtl_lds_b_offset
-        ctx.v_lshr(ctx.vreg("v_tmp2"), ctx.vreg("v_lds_rd_b"),
-                   int(math.log2(pf)), comment=f"lds_row = n_row / {pf}")
-        ctx.v_mul(ctx.vreg("v_tmp2"), str(eff_stride), ctx.vreg("v_tmp2"),
-                  comment=f"row_base = lds_row * {eff_stride}")
-        ctx.s_mov(ctx.sreg("s_tmp0"), str(lds_b_off), comment=f"lds_b_off={lds_b_off}")
-        ctx.v_add(ctx.vreg("v_tmp2"), ctx.vreg("v_tmp2"), ctx.sreg("s_tmp0"),
-                  comment=f"+ lds_b_offset={lds_b_off}")
-        b_out = [ctx.vreg("v_lds_rd_b")]
-        for ki in range(1, ki_count):
-            vname = f"v_lds_rd_b_k{ki}"
-            if not ctx.has(vname):
-                ctx.alloc_vgpr_permanent(1, vname)
-            b_out.append(ctx.vreg(vname))
-        swz.emit_read_setup(ctx, swz_layout, LDS_GFX950,
-                            ctx.vreg("v_lds_rd_b"), ctx.vreg("v_tmp1"),
-                            ctx.vreg("v_tmp2"), b_out)
-
-        # Save n_row_base for per-ni recomputation
-        ctx.alloc_vgpr_permanent(1, "v_n_row_base_b")
-        ctx.v_mul(ctx.vreg("v_n_row_base_b"), str(tile.n_per_wave),
-                  ctx.vreg("v_wave_n"), comment=f"n_row_base = wave_n * {tile.n_per_wave}")
-        ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.m - 1,
-                  comment="lane_row (re-derive for save)")
-        ctx.v_add(ctx.vreg("v_n_row_base_b"), ctx.vreg("v_n_row_base_b"),
-                  ctx.vreg("v_tmp0"), comment="+ lane_row (persistent)")
-        ctx.raw("")
-    elif swz is not None:
-        # Legacy swizzle (non-paired)
-        from ..memory.swizzle import DataLayout as SwzLayout, LDS_GFX950
-        swz_layout = SwzLayout(row_stride_bytes=row_stride_bytes,
-                               mfma_k=mfma.k, mfma_m=mfma.m,
-                               elem_bytes=elem, wave_size=tile.wave_size)
-        ctx.v_lshr(ctx.vreg("v_tmp1"), ctx.vreg("v_lane_id"),
-                   int(math.log2(mfma.m)), comment=f"k_group = lane_id / {mfma.m}")
-        ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(row_stride_bytes),
-                  ctx.vreg("v_tmp0"), comment=f"lane_row * {row_stride_bytes}")
-        ki_count = swz_layout.ki_count
-        a_out = [ctx.vreg("v_lds_rd_a")] + [ctx.vreg(f"v_lds_rd_a_k{ki}") for ki in range(1, ki_count)]
-        swz.emit_read_setup(ctx, swz_layout, LDS_GFX950,
-                            ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),
-                            ctx.vreg("v_lds_rd_a"), a_out)
-        ctx.raw("")
-        ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.m - 1,
-                  comment=f"lane_row (re-derive)")
-        ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(row_stride_bytes),
-                  ctx.vreg("v_tmp0"), comment=f"lane_row * {row_stride_bytes}")
-        b_out = [ctx.vreg("v_lds_rd_b")] + [ctx.vreg(f"v_lds_rd_b_k{ki}") for ki in range(1, ki_count)]
-        swz.emit_read_setup(ctx, swz_layout, LDS_GFX950,
-                            ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),
-                            ctx.vreg("v_lds_rd_b"), b_out)
-    else:
-        ctx.v_lshr(ctx.vreg("v_tmp1"), ctx.vreg("v_lane_id"),
-                   int(math.log2(mfma.m)), comment=f"lane_id / {mfma.m}")
-        ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_tmp1"),
-                   int(math.log2(k_per_group)), comment=f"* {k_per_group}")
-
-        # LDS read A
-        ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(tile.m_per_wave),
-                  ctx.vreg("v_wave_m"), comment=f"wave_m * {tile.m_per_wave}")
-        ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
-                  ctx.vreg("v_tmp0"), comment="+ lane_row")
-        ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(tile.unroll_k),
-                  ctx.vreg("v_lds_rd_a"), comment=f"* {tile.unroll_k}")
-        if tile.lds_pad > 0:
-            tpr = int(tile.unroll_k * elem) // 16
-            rpl = tile.block_size // tpr
-            wave_lines = tile.m_per_wave // rpl
-            if wave_lines > 0:
-                ctx.v_mul(ctx.vreg("v_tmp0"), str(wave_lines * tile.lds_pad),
-                          ctx.vreg("v_wave_m"),
-                          comment=f"wave pad = wave_m * {wave_lines * tile.lds_pad}")
-                ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
-                          ctx.vreg("v_tmp0"), comment="+ wave padding")
-        ctx.v_add(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
-                  ctx.vreg("v_tmp1"), comment="+ lane_k")
-        if elem >= 1:
-            ctx.v_lshl(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
-                       int(math.log2(elem)), comment=f"* {elem}")
-        else:
-            ctx.v_lshr(ctx.vreg("v_lds_rd_a"), ctx.vreg("v_lds_rd_a"),
-                       int(math.log2(1.0 / elem)), comment=f"* {elem} (sub-byte)")
-        ctx.raw("")
-
-        # LDS read B
-        ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.m - 1,
-                  comment=f"lane_row = lane_id % {mfma.m} (re-derive)")
-        ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(tile.n_per_wave),
-                  ctx.vreg("v_wave_n"), comment=f"wave_n * {tile.n_per_wave}")
-        ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
-                  ctx.vreg("v_tmp0"), comment="+ lane_row")
-        ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(tile.unroll_k),
-                  ctx.vreg("v_lds_rd_b"), comment=f"* {tile.unroll_k}")
-        ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
-                  ctx.vreg("v_tmp1"), comment="+ lane_k")
-        if elem >= 1:
-            ctx.v_lshl(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
-                       int(math.log2(elem)), comment=f"* {elem}")
-        else:
-            ctx.v_lshr(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
-                       int(math.log2(1.0 / elem)), comment=f"* {elem} (sub-byte)")
-        if tile.lds_pad > 0:
-            tpr_b = int(tile.unroll_k * elem) // 16
-            rpl_b = tile.block_size // tpr_b
-            wave_lines_b = tile.n_per_wave // rpl_b
-            if wave_lines_b > 0:
-                ctx.v_mul(ctx.vreg("v_tmp0"), str(wave_lines_b * tile.lds_pad),
-                          ctx.vreg("v_wave_n"),
-                          comment=f"wave pad = wave_n * {wave_lines_b * tile.lds_pad}")
-                ctx.v_add(ctx.vreg("v_lds_rd_b"), ctx.vreg("v_lds_rd_b"),
-                          ctx.vreg("v_tmp0"), comment="+ wave padding (bytes)")
-    if tile.lds_pad > 0:
-        threads_per_row__ = int(tile.unroll_k * elem) // 16
-        rows_per_load__ = tile.block_size // threads_per_row__
-        num_loads_a__ = tile.wg_m // rows_per_load__
-        dtl_b_off = int(tile.wg_m * tile.unroll_k * elem) + num_loads_a__ * tile.lds_pad
-    else:
-        dtl_b_off = layouts.lds_b_offset
-    # Paired-row swizzle already added lds_b_offset in the swizzle block
-    swz_check = tile.resolved_swizzle(elem)
-    if swz_check is None or not hasattr(swz_check, 'pair_factor'):
-        ctx.v_add(ctx.vreg("v_lds_rd_b"), str(dtl_b_off),
-                  ctx.vreg("v_lds_rd_b"), comment=f"+ lds_b_offset({dtl_b_off})")
-    ctx.raw("")
-
-    # Init accumulators
-    acc_total = tile.mfma_m_repeat * tile.mfma_n_repeat * tile.mfma.acc_vgprs
-    ctx.comment(f"Init {acc_total} accumulators")
-    for i in range(acc_total):
-        ctx.inst("v_accvgpr_write_b32", ctx.areg("acc_C", i, 1), "0")
-    ctx.raw("")
-
-    # Init MX constant scale VGPR (E8M0 scale=1.0 in all 4 bytes)
-    layout = ctx._metadata.get("layout")
-    if layout.mfma_has_scale_operands:
-        ctx.comment("Init MX constant scale = 1.0 (E8M0 0x7F)")
-        ctx.v_mov(ctx.vreg("v_mxscale"), "0x7F7F7F7F",
-                  comment="scale = 1.0 for all byte lanes")
-        ctx.raw("")
+    _emit_thread_indexing(ctx, tile)
+    _emit_dtl_lane_offset(ctx, tile, elem)
+    _emit_k_stride(ctx, elem)
+    _emit_lds_write_offset(ctx, tile, elem)
+    _emit_dtl_voffset(ctx)
+    _emit_srd_a(ctx, tile)
+    _emit_srd_b(ctx, tile)
+    _emit_dtl_scalar_offsets(ctx, tile, elem)
+    dtl_lds_b_offset = _emit_dtl_lds_write_base(ctx, tile, elem, layouts)
+    _emit_lds_read_addresses(ctx, tile, elem, mfma, layouts,
+                              lds_b_off_paired=dtl_lds_b_offset,
+                              save_persistent=True)
+    _emit_acc_init(ctx, tile)
+    _emit_mx_const_scale(ctx)
 
 
 
