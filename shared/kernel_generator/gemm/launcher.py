@@ -610,12 +610,16 @@ class GemmLauncher:
         num_iters: int = 10,
         num_partitions: int = 1,
     ) -> GemmResult:
-        """Launch a StreamK GEMM kernel.
+        """Launch a StreamK GEMM kernel with a single dispatch.
+
+        All WGs launch in one grid. Each WG derives its tile and
+        K-partition from its flat workgroup ID on the GPU side.
 
         Args:
             num_partitions: K-splits per tile (1 = DP, >1 = StreamK).
+                            Must be a power of 2.
         """
-        import time
+        import struct
 
         hip = _load_hip()
         def _check(ret, msg="HIP error"):
@@ -624,7 +628,7 @@ class GemmLauncher:
 
         p = self.problem
         tile = self.tile
-        elem = 2
+        elem = 2  # FP16
         k_tiles = p.k // tile.unroll_k
         tiles_m = p.m // tile.wg_m
         tiles_n = p.n // tile.wg_n
@@ -644,7 +648,7 @@ class GemmLauncher:
         _check(hip.hipMemcpy(d_B, B.ctypes.data, B.nbytes, 1), "H2D B")
         _check(hip.hipMemset(d_D, 0, p.m * p.n * elem), "memset D")
 
-        # Workspace + flags
+        # Workspace + flags (only needed when num_partitions > 1)
         d_ws, d_flags = ctypes.c_void_p(0), ctypes.c_void_p(0)
         if num_partitions > 1:
             ws_bytes = total_tiles * num_partitions * tile_area * 4
@@ -659,140 +663,87 @@ class GemmLauncher:
         _check(hip.hipModuleGetFunction(ctypes.byref(func), module,
                                         kernel_name.encode()), "getFunction")
 
-        def _build_args(iter_s, iter_e, is_partial, part_idx,
-                        ws_val, flags_val, n_parts):
-            """Build void** args array. Returns (args, refs) where refs
-            must be kept alive until after the launch completes.
+        # Single-launch grid: total_tiles * num_partitions WGs in 1D
+        grid_x = total_tiles * num_partitions
 
-            Must have exactly 22 entries matching the kernel's
-            .amdgpu_metadata arg descriptors (FP16 non-MX layout).
-            flags_ptr is split into two u32 halves so the entry count
-            stays at 22 and HIP copies 4 bytes per stride slot. The
-            kernel reconstructs the pointer via s_load_dwordx2 at
-            offset 64.
-            """
-            flags_lo = flags_val & 0xFFFFFFFF
-            flags_hi = (flags_val >> 32) & 0xFFFFFFFF
-            refs = [
-                ctypes.c_uint32(iter_s), ctypes.c_uint32(iter_e),
-                ctypes.c_uint32(is_partial), ctypes.c_uint32(part_idx),
-                ctypes.c_uint32(p.m), ctypes.c_uint32(p.n),
-                ctypes.c_uint32(1), ctypes.c_uint32(p.k),
-                ctypes.c_void_p(d_D.value), ctypes.c_void_p(ws_val),
-                ctypes.c_void_p(d_A.value), ctypes.c_void_p(d_B.value),
-                ctypes.c_uint32(flags_lo),   # strideD0 -> flags_ptr lo
-                ctypes.c_uint32(flags_hi),   # strideD1 -> flags_ptr hi
-                ctypes.c_uint32(n_parts),    # strideC0 -> num_partitions
-                ctypes.c_uint32(0),          # strideC1 -> unused
-                ctypes.c_uint32(p.k), ctypes.c_uint32(p.m * p.k),
-                ctypes.c_uint32(p.k), ctypes.c_uint32(p.n * p.k),
-                ctypes.c_float(1.0), ctypes.c_float(0.0),
-            ]
-            assert len(refs) == 22, f'Expected 22 args, got {len(refs)}'
-            args = (ctypes.c_void_p * len(refs))()
-            for i, v in enumerate(refs):
-                args[i] = ctypes.c_void_p(ctypes.addressof(v))
-            return args, refs
+        # Build kernarg via void** matching TensileLite FP16 22-arg layout.
+        # Header slots carry StreamK params instead of the usual metadata.
+        ws_val = d_ws.value if d_ws.value else 0
+        flags_val = d_flags.value if d_flags.value else 0
+        flags_lo = flags_val & 0xFFFFFFFF
+        flags_hi = (flags_val >> 32) & 0xFFFFFFFF
 
-        if num_partitions == 1:
-            args, refs = _build_args(0, k_tiles, 0, 0, 0, 0, 1)
-            for _ in range(num_warmup):
-                _check(hip.hipModuleLaunchKernel(
-                    func, tiles_m, tiles_n, 1,
-                    block_size, 1, 1, 0, None, args, None), "warmup")
-            _check(hip.hipDeviceSynchronize(), "sync")
+        refs = [
+            ctypes.c_uint32(num_partitions),  # header[0]: num_partitions
+            ctypes.c_uint32(0),               # header[1]: unused
+            ctypes.c_uint32(0),               # header[2]: unused
+            ctypes.c_uint32(grid_x),          # header[3]: total_wgs (WGMXCC)
+            ctypes.c_uint32(p.m),             # M
+            ctypes.c_uint32(p.n),             # N
+            ctypes.c_uint32(1),               # batch
+            ctypes.c_uint32(p.k),             # K
+            ctypes.c_void_p(d_D.value),       # D ptr
+            ctypes.c_void_p(ws_val),          # workspace ptr (C slot)
+            ctypes.c_void_p(d_A.value),       # A ptr
+            ctypes.c_void_p(d_B.value),       # B ptr
+            ctypes.c_uint32(flags_lo),        # strideD0 -> flags_ptr lo
+            ctypes.c_uint32(flags_hi),        # strideD1 -> flags_ptr hi
+            ctypes.c_uint32(0),               # strideC0 -> unused
+            ctypes.c_uint32(0),               # strideC1 -> unused
+            ctypes.c_uint32(p.k),             # strideA0
+            ctypes.c_uint32(p.m * p.k),       # strideA1
+            ctypes.c_uint32(p.k),             # strideB0
+            ctypes.c_uint32(p.n * p.k),       # strideB1
+            ctypes.c_float(1.0),              # alpha
+            ctypes.c_float(0.0),              # beta
+        ]
+        assert len(refs) == 22, f"Expected 22 args, got {len(refs)}"
+        args = (ctypes.c_void_p * len(refs))()
+        for i, v in enumerate(refs):
+            args[i] = ctypes.c_void_p(ctypes.addressof(v))
 
-            ev_s, ev_e = ctypes.c_void_p(), ctypes.c_void_p()
-            _check(hip.hipEventCreate(ctypes.byref(ev_s)), "ev")
-            _check(hip.hipEventCreate(ctypes.byref(ev_e)), "ev")
-            _check(hip.hipEventRecord(ev_s, None), "rec")
-            for _ in range(num_iters):
-                _check(hip.hipModuleLaunchKernel(
-                    func, tiles_m, tiles_n, 1,
-                    block_size, 1, 1, 0, None, args, None), "launch")
-            _check(hip.hipEventRecord(ev_e, None), "rec")
-            _check(hip.hipEventSynchronize(ev_e), "sync")
-            ms = ctypes.c_float()
-            _check(hip.hipEventElapsedTime(ctypes.byref(ms), ev_s, ev_e), "time")
-            avg_time = ms.value / 1000.0 / num_iters
-            hip.hipEventDestroy(ev_s); hip.hipEventDestroy(ev_e)
-        else:
-            # K-splitting: launch each partition on a separate HIP stream.
-            # Partitions must execute concurrently because the owner
-            # (partition 0) polls flags set by non-owners.
-            iters_per_part = k_tiles // num_partitions
-            extra = k_tiles % num_partitions
-
-            part_ranges = []
-            for p_idx in range(num_partitions):
-                s = p_idx * iters_per_part + min(p_idx, extra)
-                e = s + iters_per_part + (1 if p_idx < extra else 0)
-                part_ranges.append((s, e))
-
-            # Keep all args alive across launches
-            all_args = []
-            all_refs = []
-            for p_idx, (s, e) in enumerate(part_ranges):
-                a, r = _build_args(s, e, 1, p_idx,
-                                   d_ws.value, d_flags.value, num_partitions)
-                all_args.append(a)
-                all_refs.append(r)
-
-            # Create one stream per partition for concurrent execution
-            streams = []
-            for _ in range(num_partitions):
-                stream = ctypes.c_void_p()
-                _check(hip.hipStreamCreate(ctypes.byref(stream)), "stream")
-                streams.append(stream)
-
-            # Warmup
-            for _ in range(num_warmup):
-                _check(hip.hipDeviceSynchronize(), "pre-warmup sync")
+        def _clear_and_launch(stream=None):
+            """Clear flags (if needed) and launch the kernel."""
+            if num_partitions > 1:
                 _check(hip.hipMemset(d_flags, 0,
                        total_tiles * num_partitions * 4), "clear flags")
-                _check(hip.hipDeviceSynchronize(), "post-memset sync")
-                # Launch non-owner partitions first so they can set flags
-                # before the owner starts polling
-                for p_idx in reversed(range(len(all_args))):
-                    _check(hip.hipModuleLaunchKernel(
-                        func, tiles_m, tiles_n, 1,
-                        block_size, 1, 1, 0, streams[p_idx], all_args[p_idx], None), "warmup")
-                _check(hip.hipDeviceSynchronize(), "sync warmup")
+                _check(hip.hipDeviceSynchronize(), "sync flags")
+            _check(hip.hipModuleLaunchKernel(
+                func, grid_x, 1, 1,
+                block_size, 1, 1, 0, stream, args, None), "launch")
 
-            ev_s, ev_e = ctypes.c_void_p(), ctypes.c_void_p()
-            _check(hip.hipEventCreate(ctypes.byref(ev_s)), "ev")
-            _check(hip.hipEventCreate(ctypes.byref(ev_e)), "ev")
-            _check(hip.hipDeviceSynchronize(), "pre-time sync")
-            _check(hip.hipEventRecord(ev_s, None), "rec")
-            for _ in range(num_iters):
-                # Clear flags before each iteration (device-wide sync first)
-                _check(hip.hipDeviceSynchronize(), "iter sync")
-                _check(hip.hipMemset(d_flags, 0,
-                       total_tiles * num_partitions * 4), "clear flags")
-                _check(hip.hipDeviceSynchronize(), "post-memset sync")
-                # Launch non-owner partitions first
-                for p_idx in reversed(range(len(all_args))):
-                    _check(hip.hipModuleLaunchKernel(
-                        func, tiles_m, tiles_n, 1,
-                        block_size, 1, 1, 0, streams[p_idx], all_args[p_idx], None), "launch")
-            _check(hip.hipDeviceSynchronize(), "final sync")
-            _check(hip.hipEventRecord(ev_e, None), "rec")
-            _check(hip.hipEventSynchronize(ev_e), "sync")
-            ms = ctypes.c_float()
-            _check(hip.hipEventElapsedTime(ctypes.byref(ms), ev_s, ev_e), "time")
-            avg_time = ms.value / 1000.0 / num_iters
-            hip.hipEventDestroy(ev_s); hip.hipEventDestroy(ev_e)
-            for stream in streams:
-                hip.hipStreamDestroy(stream)
+        # Warmup
+        for _ in range(num_warmup):
+            _clear_and_launch()
+        _check(hip.hipDeviceSynchronize(), "sync warmup")
 
+        # Timed runs
+        ev_s, ev_e = ctypes.c_void_p(), ctypes.c_void_p()
+        _check(hip.hipEventCreate(ctypes.byref(ev_s)), "ev")
+        _check(hip.hipEventCreate(ctypes.byref(ev_e)), "ev")
+        _check(hip.hipEventRecord(ev_s, None), "rec")
+        for _ in range(num_iters):
+            _clear_and_launch()
+        _check(hip.hipEventRecord(ev_e, None), "rec")
+        _check(hip.hipEventSynchronize(ev_e), "sync")
+        ms = ctypes.c_float()
+        _check(hip.hipEventElapsedTime(ctypes.byref(ms), ev_s, ev_e), "time")
+        avg_time = ms.value / 1000.0 / num_iters
+        hip.hipEventDestroy(ev_s)
+        hip.hipEventDestroy(ev_e)
+
+        # Copy result back
         D_out = np.zeros((p.m, p.n), dtype=np.float16)
         _check(hip.hipMemcpy(D_out.ctypes.data, d_D, p.m * p.n * elem, 2), "D2H")
 
-        hip.hipFree(d_A); hip.hipFree(d_B); hip.hipFree(d_D)
+        # Cleanup
+        hip.hipFree(d_A)
+        hip.hipFree(d_B)
+        hip.hipFree(d_D)
         if num_partitions > 1:
-            hip.hipFree(d_ws); hip.hipFree(d_flags)
+            hip.hipFree(d_ws)
+            hip.hipFree(d_flags)
         hip.hipModuleUnload(module)
 
         max_err = float(np.max(np.abs(D_out.astype(np.float32) - D_ref.astype(np.float32))))
         return GemmResult(D=D_out, time_seconds=avg_time, max_abs_error=max_err)
-

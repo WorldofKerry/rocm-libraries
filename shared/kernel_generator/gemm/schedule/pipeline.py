@@ -176,122 +176,218 @@ class StreamKPartitioner(TilePartitioner):
         self.num_cus = num_cus
 
     def emit(self, ctx: AsmContext) -> None:
-        """Emit StreamK work decomposition.
+        """Emit single-launch StreamK work decomposition.
 
-        Reads StreamK params from kernargs (set by host launcher):
-        - offset 128: workspace_ptr (u64)
-        - offset 136: iter_start (u32) -- this WG's first K-tile iter
-        - offset 140: iter_end (u32) -- this WG's last K-tile iter (exclusive)
-        - offset 144: k_tiles_per_tile (u32)
-        - offset 148: num_m_tiles (u32)
-        - offset 152: is_partial (u32) -- 1 if this WG has partial K range
+        Each WG computes its own tile and partition from its flat WG ID.
+        No per-partition kernarg packing needed on the host.
 
-        Sets s_k_tiles = iter_end - iter_start.
-        Adjusts SRD bases for K-offset if k_start > 0.
+        Kernarg layout (reuses TensileLite header slots):
+          offset 0:  num_partitions (u32)
+          offset 4:  unused (u32)
+          offset 8:  unused (u32)
+          offset 12: total_wgs (u32) -- for WGMXCC
+          offset 40: workspace_ptr (u64) -- C slot
+          offset 64: flags_ptr lo/hi (u32x2) -- stride D slots
+
+        GPU-side computation from wg_serial (s_wg_id_x):
+          tile_idx      = wg_serial >> log2(num_partitions)
+          partition_idx = wg_serial & (num_partitions - 1)
+          tile_m        = tile_idx % tiles_m
+          tile_n        = tile_idx / tiles_m
+          k_tiles       = K / unroll_k
+          iters_per_part = k_tiles >> log2(num_partitions)
+          extra          = k_tiles & (num_partitions - 1)
+          iter_start     = partition_idx * iters_per_part
+                           + min(partition_idx, extra)
+          s_k_tiles      = iters_per_part
+                           + (1 if partition_idx < extra else 0)
+          is_partial     = (num_partitions > 1) ? 1 : 0
+
+        Requires num_partitions to be a power of 2.
         """
         tile = ctx._metadata["tile"]
         problem = ctx._metadata["problem"]
         elem = problem.element_bytes
         log2_uk = int(math.log2(tile.unroll_k))
+        log2_wgm = int(math.log2(tile.wg_m))
 
-        ctx.comment("=== StreamK Work Decomposition ===")
+        ctx.comment("=== StreamK Single-Launch Work Decomposition ===")
 
-        # Load StreamK kernargs
+        # Allocate persistent SGPRs used by the epilogue
         karg = ctx.sreg("s_kernarg")
         ctx.alloc_sgpr_permanent(2, "s_workspace_ptr")
         ctx.alloc_sgpr_permanent(1, "s_iter_start")
-        ctx.alloc_sgpr_permanent(1, "s_iter_end")
         ctx.alloc_sgpr_permanent(1, "s_is_partial")
         ctx.alloc_sgpr_permanent(1, "s_partition_idx")
         ctx.alloc_sgpr_permanent(2, "s_flags_ptr")
         ctx.alloc_sgpr_permanent(1, "s_num_partitions")
 
-        # StreamK fields packed into TensileLite kernarg header
-        # (offsets 0-12). These bytes are normally ignored by the
-        # kernel (gemm_info, info0, info1, numWG). Reusing them
-        # avoids extended kernarg issues with HIP's void** packing.
-        #   offset 0: iter_start (u32)
-        #   offset 4: iter_end (u32)
-        #   offset 8: is_partial (u32)
-        #   offset 12: partition_idx (u32)
-        # Workspace ptr reuses the C pointer slot (offset 40).
-        ctx.inst("s_load_dword", ctx.sreg("s_iter_start"), karg, "0",
-                 comment="iter_start (header[0])")
-        ctx.inst("s_load_dword", ctx.sreg("s_iter_end"), karg, "4",
-                 comment="iter_end (header[1])")
-        ctx.inst("s_load_dword", ctx.sreg("s_is_partial"), karg, "8",
-                 comment="is_partial (header[2])")
-        ctx.inst("s_load_dword", ctx.sreg("s_partition_idx"), karg, "12",
-                 comment="partition_idx (header[3])")
-        ctx.inst("s_load_dwordx2", ctx.sreg("s_workspace_ptr"), karg, "40",
-                 comment="workspace ptr (C slot)")
-        ctx.inst("s_load_dwordx2", ctx.sreg("s_flags_ptr"), karg, "64",
-                 comment="flags ptr (stride D slot)")
-        ctx.inst("s_load_dword", ctx.sreg("s_num_partitions"), karg, "72",
-                 comment="num_partitions_per_tile (stride C0 slot)")
+        # Load num_partitions, workspace_ptr, flags_ptr from kernargs
+        ctx.inst("s_load_dword", ctx.sreg("s_num_partitions"), karg, "0",
+                 comment="num_partitions (header[0])")
+        ctx.inst("s_load_dwordx2", ctx.sreg("s_workspace_ptr"), karg,
+                 "40", comment="workspace ptr (C slot)")
+        ctx.inst("s_load_dwordx2", ctx.sreg("s_flags_ptr"), karg,
+                 "64", comment="flags ptr (stride D slot)")
         ctx.s_waitcnt("lgkmcnt(0)", comment="wait SK kernargs")
         ctx.raw("")
 
-        # s_k_tiles = iter_end - iter_start
-        ctx.inst("s_sub_u32", ctx.sreg("s_k_tiles"),
-                 ctx.sreg("s_iter_end"), ctx.sreg("s_iter_start"),
-                 comment="s_k_tiles = iter_end - iter_start")
-
-        # Compute tile index from iter_start
-        # tile_idx = iter_start / k_tiles_per_tile (host provides this as int)
-        # For simplicity: host packs (wg_id_x, wg_id_y) directly
-        # rather than requiring GPU-side division.
-        # TODO: support multi-tile StreamK with GPU-side decomposition
+        # --- Decompose flat wg_serial into tile + partition ---
+        # num_partitions is power-of-2; use shift/mask
+        ctx.comment("tile_idx = wg_serial / num_partitions")
+        ctx.inst("s_ff1_i32_b32", ctx.sreg("s_tmp0"),
+                 ctx.sreg("s_num_partitions"),
+                 comment="log2(num_partitions)")
+        ctx.inst("s_lshr_b32", ctx.sreg("s_tmp1"),
+                 ctx.sreg("s_wg_id_x"), ctx.sreg("s_tmp0"),
+                 comment="tile_idx = wg_serial >> log2(npart)")
+        ctx.inst("s_sub_u32", ctx.sreg("s_partition_idx"),
+                 ctx.sreg("s_num_partitions"), "1",
+                 comment="npart - 1 (mask)")
+        ctx.inst("s_and_b32", ctx.sreg("s_partition_idx"),
+                 ctx.sreg("s_wg_id_x"), ctx.sreg("s_partition_idx"),
+                 comment="partition_idx = wg_serial & (npart-1)")
+        # s_tmp1 = tile_idx, s_tmp0 = log2(npart)
         ctx.raw("")
 
-        # Adjust A/B SRD bases for K-offset
-        # k_start_within_tile = iter_start % k_tiles_per_tile
-        # k_byte_offset = k_start_within_tile * unroll_k * elem
-        # For now: host passes k_start directly via iter_start encoding
-        ctx.comment("Adjust SRD for K-offset (StreamK partial K)")
-        ctx.inst("s_cmp_eq_u32", ctx.sreg("s_iter_start"), "0",
-                 comment="skip if k_start == 0")
-        ctx.inst("s_cbranch_scc1", "sk_no_k_offset",
-                 comment="no K-offset needed")
+        # Decompose tile_idx -> tile_m, tile_n
+        # tiles_m = M >> log2(wg_m) (power-of-2 assumed)
+        ctx.comment("Decompose tile_idx into tile_m, tile_n")
+        ctx.inst("s_lshr_b32", ctx.sreg("s_iter_start"),
+                 ctx.sreg("s_M"), str(log2_wgm),
+                 comment=f"tiles_m = M / {tile.wg_m}")
+        # tile_m = tile_idx % tiles_m; tile_n = tile_idx / tiles_m
+        ctx.inst("s_ff1_i32_b32", ctx.sreg("s_is_partial"),
+                 ctx.sreg("s_iter_start"),
+                 comment="log2(tiles_m)")
+        ctx.inst("s_sub_u32", ctx.sreg("s_iter_start"),
+                 ctx.sreg("s_iter_start"), "1",
+                 comment="tiles_m - 1 (mask)")
+        ctx.inst("s_and_b32", ctx.sreg("s_wg_id_x"),
+                 ctx.sreg("s_tmp1"), ctx.sreg("s_iter_start"),
+                 comment="tile_m = tile_idx & (tiles_m-1)")
+        ctx.inst("s_lshr_b32", ctx.sreg("s_wg_id_y"),
+                 ctx.sreg("s_tmp1"), ctx.sreg("s_is_partial"),
+                 comment="tile_n = tile_idx >> log2(tiles_m)")
+        ctx.raw("")
 
-        # k_byte_offset = iter_start * unroll_k * elem (within-tile K offset)
-        # But iter_start is global, need modulo k_tiles_per_tile
-        # Simpler: host passes k_start_tiles directly
-        # For the single-tile-per-WG case, this is just iter_start
+        # --- Compute K-range for this partition ---
+        ctx.comment("Compute iter_start / s_k_tiles from partition_idx")
+        ctx.s_lshr(ctx.sreg("s_k_tiles"), ctx.sreg("s_K"), log2_uk,
+                   comment=f"k_tiles = K / {tile.unroll_k}")
+        # iters_per_part = k_tiles >> log2(npart)
+        # s_tmp0 still holds log2(npart) from above
+        ctx.inst("s_lshr_b32", ctx.sreg("s_iter_start"),
+                 ctx.sreg("s_k_tiles"), ctx.sreg("s_tmp0"),
+                 comment="iters_per_part = k_tiles / npart")
+        # extra = k_tiles & (npart - 1)
+        ctx.inst("s_sub_u32", ctx.sreg("s_is_partial"),
+                 ctx.sreg("s_num_partitions"), "1",
+                 comment="npart - 1")
+        ctx.inst("s_and_b32", ctx.sreg("s_is_partial"),
+                 ctx.sreg("s_k_tiles"), ctx.sreg("s_is_partial"),
+                 comment="extra = k_tiles & (npart-1)")
+        # iter_start = partition_idx * iters_per_part + min(partition_idx, extra)
+        ctx.s_mul(ctx.sreg("s_tmp1"), ctx.sreg("s_partition_idx"),
+                  ctx.sreg("s_iter_start"),
+                  comment="partition_idx * iters_per_part")
+        ctx.inst("s_min_u32", ctx.sreg("s_tmp0"),
+                 ctx.sreg("s_partition_idx"), ctx.sreg("s_is_partial"),
+                 comment="min(partition_idx, extra)")
+        ctx.inst("s_add_u32", ctx.sreg("s_iter_start"),
+                 ctx.sreg("s_tmp1"), ctx.sreg("s_tmp0"),
+                 comment="iter_start = part*ipp + min(part, extra)")
+        # s_k_tiles = iters_per_part + (partition_idx < extra ? 1 : 0)
+        ctx.inst("s_ff1_i32_b32", ctx.sreg("s_tmp0"),
+                 ctx.sreg("s_num_partitions"),
+                 comment="log2(num_partitions) again")
+        ctx.inst("s_lshr_b32", ctx.sreg("s_tmp1"),
+                 ctx.sreg("s_k_tiles"), ctx.sreg("s_tmp0"),
+                 comment="iters_per_part (recomputed)")
+        ctx.inst("s_cmp_lt_u32", ctx.sreg("s_partition_idx"),
+                 ctx.sreg("s_is_partial"),
+                 comment="partition_idx < extra?")
+        ctx.inst("s_cselect_b32", ctx.sreg("s_tmp0"), "1", "0",
+                 comment="bonus = scc ? 1 : 0")
+        ctx.inst("s_add_u32", ctx.sreg("s_k_tiles"),
+                 ctx.sreg("s_tmp1"), ctx.sreg("s_tmp0"),
+                 comment="s_k_tiles = iters_per_part + bonus")
+        ctx.raw("")
+
+        # is_partial = (num_partitions > 1) ? 1 : 0
+        ctx.inst("s_cmp_gt_u32", ctx.sreg("s_num_partitions"), "1",
+                 comment="num_partitions > 1?")
+        ctx.inst("s_cselect_b32", ctx.sreg("s_is_partial"), "1", "0",
+                 comment="is_partial = (npart > 1)")
+        ctx.raw("")
+
+        # Recompute SRD A/B bases using the corrected tile coords.
+        # The setup phase computed SRDs from the raw s_wg_id_x/y which
+        # held the flat serial. Now that we've set them to tile_m/tile_n,
+        # recompute: SRD_A = ptr_A + tile_m * wg_m * K * elem
+        #            SRD_B = ptr_B + tile_n * wg_n * K * elem
+        ctx.comment("Recompute SRD A/B for corrected tile coords")
+        ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"),
+                  str(tile.wg_m), comment=f"tile_m * {tile.wg_m}")
+        ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+                 ctx.sreg("s_k_stride"),
+                 comment="* K_stride (K * elem)")
+        ctx.inst("s_add_u32", ctx.sreg("s_srd_a", 0, 1),
+                 ctx.sreg("s_ptr_A", 0, 1), ctx.sreg("s_tmp0"),
+                 comment="SRD_A = ptr_A + row_offset")
+        ctx.inst("s_addc_u32", ctx.sreg("s_srd_a", 1, 1),
+                 ctx.sreg("s_ptr_A", 1, 1), "0", comment="carry")
+        ctx.inst("s_mov_b32", ctx.sreg("s_srd_a", 2, 1),
+                 "0xFFFFFFFF", comment="limit")
+        ctx.inst("s_mov_b32", ctx.sreg("s_srd_a", 3, 1),
+                 "0x20000", comment="flags")
+
+        ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"),
+                  str(tile.wg_n), comment=f"tile_n * {tile.wg_n}")
+        ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+                 ctx.sreg("s_k_stride"),
+                 comment="* K_stride (K * elem)")
+        ctx.inst("s_add_u32", ctx.sreg("s_srd_b", 0, 1),
+                 ctx.sreg("s_ptr_B", 0, 1), ctx.sreg("s_tmp0"),
+                 comment="SRD_B = ptr_B + row_offset")
+        ctx.inst("s_addc_u32", ctx.sreg("s_srd_b", 1, 1),
+                 ctx.sreg("s_ptr_B", 1, 1), "0", comment="carry")
+        ctx.inst("s_mov_b32", ctx.sreg("s_srd_b", 2, 1),
+                 "0xFFFFFFFF", comment="limit")
+        ctx.inst("s_mov_b32", ctx.sreg("s_srd_b", 3, 1),
+                 "0x20000", comment="flags")
+        ctx.raw("")
+
+        # Now apply K-offset if iter_start > 0 (separate pass since
+        # we just rebuilt the SRD bases)
+        ctx.inst("s_cmp_eq_u32", ctx.sreg("s_iter_start"), "0",
+                 comment="skip K-offset if iter_start == 0")
+        ctx.inst("s_cbranch_scc1", "sk_no_k_offset2",
+                 comment="no K-offset needed")
         k_bytes_per_tile_iter = tile.unroll_k * elem
         ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_iter_start"),
                   str(k_bytes_per_tile_iter),
                   comment=f"k_offset = iter_start * {k_bytes_per_tile_iter}")
-        # Add to SRD A base
         ctx.inst("s_add_u32", ctx.sreg("s_srd_a", 0, 1),
                  ctx.sreg("s_srd_a", 0, 1), ctx.sreg("s_tmp0"),
                  comment="SRD_A += k_offset")
         ctx.inst("s_addc_u32", ctx.sreg("s_srd_a", 1, 1),
-                 ctx.sreg("s_srd_a", 1, 1), "0",
-                 comment="carry")
-        # Add to SRD B base
+                 ctx.sreg("s_srd_a", 1, 1), "0", comment="carry")
         ctx.inst("s_add_u32", ctx.sreg("s_srd_b", 0, 1),
                  ctx.sreg("s_srd_b", 0, 1), ctx.sreg("s_tmp0"),
                  comment="SRD_B += k_offset")
         ctx.inst("s_addc_u32", ctx.sreg("s_srd_b", 1, 1),
-                 ctx.sreg("s_srd_b", 1, 1), "0",
-                 comment="carry")
-
-        ctx.label("sk_no_k_offset")
+                 ctx.sreg("s_srd_b", 1, 1), "0", comment="carry")
+        ctx.label("sk_no_k_offset2")
         ctx.raw("")
 
     def grid_dims(self, problem, tile):
         """Compute grid dimensions for StreamK launch.
 
-        Uses data-parallel approach: launch enough WGs to fill all CUs
-        for complete waves, then handle the remainder.
+        Returns base tile count. The launcher multiplies by
+        num_partitions to get the actual 1D grid size.
         """
-        tiles_m = problem.m // tile.wg_m
-        tiles_n = problem.n // tile.wg_n
-        total_tiles = tiles_m * tiles_n
-
-        # For now: just launch all tiles (same as grid partitioner)
-        # but with 1D grid for future StreamK extension
+        total_tiles = (problem.m // tile.wg_m) * (problem.n // tile.wg_n)
         return (total_tiles, 1, 1)
 
     def compute_sk_params(self, problem, tile):
