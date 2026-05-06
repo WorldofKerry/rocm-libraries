@@ -135,13 +135,17 @@ class Mainloop:
         """LDS bytes for scale data per buffer."""
         return self.scale_strategy.lds_bytes(tile, self.layout)
 
-    def resolve_swizzle(self, tile: TileConfig) -> Swizzle:
-        """Return the swizzle, auto-deriving if needed."""
+    def resolve_swizzle(self, tile: TileConfig):
+        """Return the swizzle, auto-deriving if needed.
+        
+        Returns None when no swizzle is configured (identity case),
+        matching the legacy flag path behavior.
+        """
         if not isinstance(self.swizzle, IdentitySwizzle):
             return self.swizzle
         # Check if tile has auto-swizzle configured
         resolved = tile.resolved_swizzle(self.layout.element_bytes())
-        return resolved if resolved is not None else self.swizzle
+        return resolved  # None if no swizzle configured
 
 
 # ── Factory functions ─────────────────────────────────────────────

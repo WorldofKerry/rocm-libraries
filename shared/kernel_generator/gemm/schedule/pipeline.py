@@ -87,14 +87,30 @@ def pipeline_kloop_phase(level, ctx) -> None:
 # ── Shared helpers ────────────────────────────────────────────────
 
 def _build_loader_reader_scale(ctx):
-    """Construct the loader, reader, and scale_loader from ctx metadata.
+    """Construct the loader, reader, and scale_loader.
+
+    When a Mainloop is present in ctx._metadata, components are
+    taken directly from it -- no flag checks needed.
+    Falls back to flag-based construction for backward compat.
 
     Returns (loader, reader, scale_loader, pgr).
     """
     tile = ctx._metadata["tile"]
     problem = ctx._metadata["problem"]
-    use_dtl = ctx._metadata.get("use_dtl", True)
+    mainloop = ctx._metadata.get("mainloop")
 
+    if mainloop is not None:
+        # Mainloop path: components are already chosen
+        loader = mainloop.loader_cls(ctx, tile, problem)
+        swizzle = mainloop.resolve_swizzle(tile)
+        reader = LDSReader(ctx, tile, problem, swizzle=swizzle)
+        lds_data_half = ctx._metadata.get("lds_data_half", 0)
+        scale_loader = mainloop.scale_strategy.build_loader(
+            ctx, tile, lds_data_half)
+        return loader, reader, scale_loader, mainloop.pgr
+
+    # Legacy flag-based path
+    use_dtl = ctx._metadata.get("use_dtl", True)
     loader_cls = ctx._metadata.get("loader_cls",
                                    DTLLoader if use_dtl else BufferLoader)
     loader = loader_cls(ctx, tile, problem)
@@ -511,8 +527,15 @@ def pipeline_v2_kloop_phase(level, ctx) -> None:
               comment=f"DB step = {lds_half_total}")
     ctx.raw("")
 
-    # K-tile count
-    if ctx._metadata.get("streamk"):
+    # K-tile count: mainloop's grid component or legacy flag
+    mainloop = ctx._metadata.get("mainloop")
+    if mainloop is not None:
+        from ..mainloop import StreamKStore
+        if isinstance(mainloop.epilogue, StreamKStore):
+            StreamKPartitioner().emit(ctx)
+        else:
+            GridPartitioner().emit(ctx)
+    elif ctx._metadata.get("streamk"):
         StreamKPartitioner().emit(ctx)
     else:
         GridPartitioner().emit(ctx)
