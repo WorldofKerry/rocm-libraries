@@ -25,6 +25,7 @@ from .emit.emitter import alloc_registers, alloc_registers_dtl, emit_header, emi
 from .emit.layouts import GemmLayouts
 from .emit.phases import default_mfma_visitor
 from .kernarg_layout import layout_for
+from .mainloop import Mainloop
 from .problem import DataType, GemmProblem, MfmaConfig, TileConfig
 from .tiling import GemmTiling
 from .tile.tree import TileLevel, walk_tile_tree
@@ -119,7 +120,8 @@ class GemmKernel:
               wg_mapping_xcc: int = 1,
               colmajor_output: bool = False,
               pipeline_strategy=None,
-              streamk: bool = False) -> GemmKernel:
+              streamk: bool = False,
+              mainloop: Optional[Mainloop] = None) -> GemmKernel:
         """Build a GemmKernel.  GemmTiling is the source of truth.
 
         Args:
@@ -191,6 +193,23 @@ class GemmKernel:
             k.tile_tree = k.tile_tree.replace_phase(
                 "store_d", phase_store_streamk)
 
+        # Store mainloop (if provided, overrides individual flags)
+        if mainloop is not None:
+            k.mainloop = mainloop
+            # Sync flags from mainloop for backward compat during migration
+            k.pgr = mainloop.pgr
+            k.use_lds_scales = mainloop.scale_strategy.needs_lds
+            k.use_real_scales = mainloop.layout.has_scales
+            k.use_dtl = True  # mainloop always uses DTL currently
+            k.colmajor_output = mainloop.colmajor_output
+            from .mainloop import StreamKStore
+            k.streamk = isinstance(mainloop.epilogue, StreamKStore)
+            # Swap epilogue from mainloop
+            k.tile_tree = k.tile_tree.replace_phase(
+                "store_d", mainloop.epilogue.phase_func())
+        else:
+            k.mainloop = None
+
         return k
 
     def emit(self) -> AsmKernel:
@@ -238,6 +257,7 @@ class GemmKernel:
             "tile": tile,
             "problem": self.problem,
             "layout": layout,
+            "mainloop": getattr(self, "mainloop", None),
             "layouts": self.layouts,
             "kernel": self,
             "use_dtl": getattr(self, 'use_dtl', True),
