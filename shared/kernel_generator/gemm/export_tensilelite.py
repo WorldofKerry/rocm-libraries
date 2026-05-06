@@ -156,7 +156,7 @@ custom.config:
   StreamKXCCMapping: 0
   TransposeLDS: 0
   NoReject: true
-amdhsa.version: [ 1, 2 ]
+amdhsa.version: [ 1, 1 ]
 amdhsa.kernels:
   - .name:            {kernel_name}
     .symbol:          {kernel_name}.kd
@@ -387,7 +387,7 @@ custom.config:
   StreamKXCCMapping: 0
   TransposeLDS: 0
   NoReject: true
-amdhsa.version: [1, 2]
+amdhsa.version: [ 1, 1 ]
 amdhsa.kernels:
   - .name:            {kernel_name}
     .symbol:          {kernel_name}.kd
