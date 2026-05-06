@@ -292,7 +292,7 @@ class LDSScaleLoader(ScaleLoader):
         byte layout per lane: [mi_even_ki0, mi_odd_ki0, mi_even_ki1, mi_odd_ki1]
 
     Per matrix: 4 groups (g0..g3 covering mi=0..7 or ni=0..7).
-    Per wave partition: 1024 bytes (4 groups × 256).
+    Per wave partition: 512 bytes (4 groups × 256).
 
     DTL loads 4096 bytes per matrix (1 load, 256 threads × 16 bytes).
     ds_read_b32 reads 4 bytes per group (4 reads per matrix = 8 total).
@@ -432,7 +432,7 @@ class LDSScaleLoader(ScaleLoader):
                   comment="scale B voffset")
         ctx.raw("")
 
-        # ds_read base: wave_partition * 1024 + laneId * 4 + lds_base
+        # ds_read base: wave_partition * 512 + laneId * 4 + lds_base
         ctx.comment("Scale ds_read base (pre-swizzled LDS)")
         if not ctx.has("v_scale_rd_a"):
             ctx.alloc_vgpr_permanent(1, "v_scale_rd_a")
@@ -447,8 +447,8 @@ class LDSScaleLoader(ScaleLoader):
                     comment="laneId * 4")
 
         # wave_m partition: waveId_m * 1024
-        ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_wave_m"), 10,
-                    comment="wave_m * 1024 (partition offset)")
+        ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_wave_m"), 9,
+                    comment="wave_m * 512 (partition offset)")
         ctx.v_add(ctx.vreg("v_scale_rd_a"), ctx.vreg("v_tmp0"),
                   ctx.vreg("v_tmp1"),
                   comment="laneId*4 + partition_m")
@@ -459,8 +459,8 @@ class LDSScaleLoader(ScaleLoader):
                   comment="+ lds_base_a")
 
         # wave_n partition: waveId_n * 1024
-        ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_wave_n"), 10,
-                    comment="wave_n * 1024 (partition offset)")
+        ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_wave_n"), 9,
+                    comment="wave_n * 512 (partition offset)")
         ctx.v_add(ctx.vreg("v_scale_rd_b"), ctx.vreg("v_tmp0"),
                   ctx.vreg("v_tmp1"),
                   comment="laneId*4 + partition_n")
@@ -493,21 +493,28 @@ class LDSScaleLoader(ScaleLoader):
                      comment=f"scale B dword {dw}")
 
     def emit_scale_ds_writes(self) -> None:
-        """Write scale VGPRs to LDS. Must be called after vmcnt(0)."""
+        """Write scale VGPRs to LDS using the strided DTL voffset.
+
+        The LDS layout must match the ds_read pattern used later.
+        The DTL voffset = (tid%16)*16 + (tid/16)*stride, which places
+        each group of 16 threads' data at stride-spaced intervals.
+        """
         ctx = self._ctx
-        ctx.v_lshl(ctx.vreg("v_tmp8"), ctx.vreg("v_tid"), 4,
-                   comment="tid * 16 (LDS offset)")
-        ctx.v_add(ctx.vreg("v_tmp9"), ctx.vreg("v_tmp8"),
+        # Use the same strided voffset as the DTL global read so the
+        # LDS layout matches the ds_read addressing pattern.
+        ctx.v_add(ctx.vreg("v_tmp9"),
+                  ctx.vreg("v_dtl_off_scale_a_lds"),
                   ctx.sreg("s_lds_wr_scale_a"),
-                  comment="LDS addr A = wr_base_a + tid*16")
+                  comment="LDS addr A = wr_base_a + strided_voff")
         for dw in range(4):
             ctx.inst("ds_write_b32",
                      ctx.vreg("v_tmp9"), ctx.vreg(f"v_tmp{dw}"),
                      f"offset:{dw * 4}",
                      comment=f"scale A dw{dw} -> LDS")
-        ctx.v_add(ctx.vreg("v_tmp9"), ctx.vreg("v_tmp8"),
+        ctx.v_add(ctx.vreg("v_tmp9"),
+                  ctx.vreg("v_dtl_off_scale_b_lds"),
                   ctx.sreg("s_lds_wr_scale_b"),
-                  comment="LDS addr B = wr_base_b + tid*16")
+                  comment="LDS addr B = wr_base_b + strided_voff")
         for dw in range(4):
             ctx.inst("ds_write_b32",
                      ctx.vreg("v_tmp9"), ctx.vreg(f"v_tmp{4 + dw}"),
