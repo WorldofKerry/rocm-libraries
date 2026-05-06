@@ -125,6 +125,7 @@ class Mainloop:
     epilogue: StoreEpilogue
     colmajor_output: bool = False
     wave_abi: bool = False
+    tensilelite_abi: bool = False
 
     @property
     def num_buffers(self) -> int:
@@ -301,4 +302,5 @@ def mainloop_mxfp4_tensilelite(
         pgr=pgr,
         epilogue=DirectStore(),
         colmajor_output=colmajor_output,
+        tensilelite_abi=True,
     )

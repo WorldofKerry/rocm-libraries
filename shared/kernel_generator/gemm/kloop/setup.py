@@ -572,19 +572,18 @@ def phase_dtl_interleaved_setup(level: TileLevel, ctx: AsmContext) -> None:
     ctx.comment("=== DTL Interleaved Setup ===")
 
     # TensileLite kernarg layout (batched MXFP4, KernArgsVersion >= 1):
-    #   0-15: header (Gemm info, kernel info0/1, numWG) -- ignored
-    #   16: M, 20: N, 24: batch, 28: K
-    #   32: D, 40: C, 48: A, 56: MXSA, 64: B, 72: MXSB
-    #   80+: strides, alpha, beta
+    # Kernarg header: 16 bytes for our launcher, 0 for TensileLite client
+    mainloop = ctx._metadata.get("mainloop")
+    hdr = 0 if (mainloop and getattr(mainloop, 'tensilelite_abi', False)) else 16
     karg = ctx.sreg("s_kernarg")
-    ctx.inst("s_load_dword", ctx.sreg("s_M"), karg, "16", comment="M")
-    ctx.inst("s_load_dword", ctx.sreg("s_N"), karg, "20", comment="N")
-    ctx.inst("s_load_dword", ctx.sreg("s_K"), karg, "28", comment="K")
-    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_D"), karg, "32", comment="D ptr")
-    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_A"), karg, "48", comment="A ptr")
+    ctx.inst("s_load_dword", ctx.sreg("s_M"), karg, str(hdr + 0), comment="M")
+    ctx.inst("s_load_dword", ctx.sreg("s_N"), karg, str(hdr + 4), comment="N")
+    ctx.inst("s_load_dword", ctx.sreg("s_K"), karg, str(hdr + 12), comment="K")
+    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_D"), karg, str(hdr + 16), comment="D ptr")
+    ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_A"), karg, str(hdr + 32), comment="A ptr")
     # B ptr offset: 64 for MX (MXSA at 56), 56 for non-MX (no MXSA)
     layout = ctx._metadata.get("layout")
-    b_offset = str(layout.b_ptr_offset())
+    b_offset = str(layout.b_ptr_offset() - 16 + hdr)
     ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_B"), karg, b_offset,
              comment="B ptr")
     ctx.s_waitcnt("lgkmcnt(0)", comment="wait kernargs")
@@ -646,15 +645,16 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
     # Wave ABI already loads scale ptrs/strides in setup phase
     mainloop_ref = ctx._metadata.get("mainloop")
     if not (mainloop_ref and mainloop_ref.wave_abi):
-        # TensileLite kernarg offsets: MXSA@56, MXSB@72, strides@104,120
         karg = ctx.sreg("s_kernarg")
-        ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_scale_a"), karg, "56",
+        ml = ctx._metadata.get("mainloop")
+        hdr = 0 if (ml and getattr(ml, 'tensilelite_abi', False)) else 16
+        ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_scale_a"), karg, str(hdr + 40),
                  comment="scale A ptr (MXSA)")
-        ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_scale_b"), karg, "72",
+        ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_scale_b"), karg, str(hdr + 56),
                  comment="scale B ptr (MXSB)")
-        ctx.inst("s_load_dword", ctx.sreg("s_stride_scale_a"), karg, "104",
+        ctx.inst("s_load_dword", ctx.sreg("s_stride_scale_a"), karg, str(hdr + 88),
                  comment="strideMXSA0")
-        ctx.inst("s_load_dword", ctx.sreg("s_stride_scale_b"), karg, "120",
+        ctx.inst("s_load_dword", ctx.sreg("s_stride_scale_b"), karg, str(hdr + 104),
                  comment="strideMXSB0")
         ctx.s_waitcnt("lgkmcnt(0)", comment="wait scale kernargs")
         ctx.raw("")

@@ -82,7 +82,7 @@ def _format_mxfp4_custom_kernel(
 .amdhsa_kernel {kernel_name}
     .amdhsa_group_segment_fixed_size {lds}
     .amdhsa_private_segment_fixed_size 0
-    .amdhsa_kernarg_size 136
+    .amdhsa_kernarg_size 120
     .amdhsa_user_sgpr_kernarg_segment_ptr 1
     .amdhsa_system_sgpr_workgroup_id_x 1
     .amdhsa_system_sgpr_workgroup_id_y 1
@@ -164,129 +164,113 @@ amdhsa.kernels:
     .sgpr_count:      {sgpr}
     .vgpr_count:      {vgpr}
     .agpr_count:      {agpr}
-    .kernarg_segment_size: 136
+    .kernarg_segment_size: 120
     .kernarg_segment_align: 8
     .group_segment_fixed_size: {lds}
     .private_segment_fixed_size: 0
     .wavefront_size:  64
     .max_flat_workgroup_size: 256
     .args:
-      - .name:           Gemm info
+      - .name:           SizesFree0
         .offset:         0
         .size:           4
         .value_kind:     by_value
-      - .name:           kernel info0
+      - .name:           SizesFree1
         .offset:         4
         .size:           4
         .value_kind:     by_value
-      - .name:           kernel info1
+      - .name:           SizesFree2
         .offset:         8
         .size:           4
         .value_kind:     by_value
-      - .name:           numWG
+      - .name:           SizesSum0
         .offset:         12
         .size:           4
         .value_kind:     by_value
-      - .name:           SizesFree0
-        .offset:         16
-        .size:           4
-        .value_kind:     by_value
-      - .name:           SizesFree1
-        .offset:         20
-        .size:           4
-        .value_kind:     by_value
-      - .name:           SizesFree2
-        .offset:         24
-        .size:           4
-        .value_kind:     by_value
-      - .name:           SizesSum0
-        .offset:         28
-        .size:           4
-        .value_kind:     by_value
       - .name:           D
-        .offset:         32
+        .offset:         16
         .size:           8
         .value_kind:     global_buffer
         .address_space:  generic
       - .name:           C
-        .offset:         40
+        .offset:         24
         .size:           8
         .value_kind:     global_buffer
         .address_space:  generic
       - .name:           A
-        .offset:         48
+        .offset:         32
         .size:           8
         .value_kind:     global_buffer
         .address_space:  generic
       - .name:           MXSA
-        .offset:         56
+        .offset:         40
         .size:           8
         .value_kind:     global_buffer
         .address_space:  generic
       - .name:           B
-        .offset:         64
+        .offset:         48
         .size:           8
         .value_kind:     global_buffer
         .address_space:  generic
       - .name:           MXSB
-        .offset:         72
+        .offset:         56
         .size:           8
         .value_kind:     global_buffer
         .address_space:  generic
       - .name:           strideD0
-        .offset:         80
+        .offset:         64
         .size:           4
         .value_kind:     by_value
       - .name:           strideD1
-        .offset:         84
+        .offset:         68
         .size:           4
         .value_kind:     by_value
       - .name:           strideC0
-        .offset:         88
+        .offset:         72
         .size:           4
         .value_kind:     by_value
       - .name:           strideC1
-        .offset:         92
+        .offset:         76
         .size:           4
         .value_kind:     by_value
       - .name:           strideA0
-        .offset:         96
+        .offset:         80
         .size:           4
         .value_kind:     by_value
       - .name:           strideA1
-        .offset:         100
+        .offset:         84
         .size:           4
         .value_kind:     by_value
       - .name:           strideMXSA0
-        .offset:         104
+        .offset:         88
         .size:           4
         .value_kind:     by_value
       - .name:           strideMXSA1
-        .offset:         108
+        .offset:         92
         .size:           4
         .value_kind:     by_value
       - .name:           strideB0
-        .offset:         112
+        .offset:         96
         .size:           4
         .value_kind:     by_value
       - .name:           strideB1
-        .offset:         116
+        .offset:         100
         .size:           4
         .value_kind:     by_value
       - .name:           strideMXSB0
-        .offset:         120
+        .offset:         104
         .size:           4
         .value_kind:     by_value
       - .name:           strideMXSB1
-        .offset:         124
+        .offset:         108
         .size:           4
         .value_kind:     by_value
       - .name:           alpha
-        .offset:         128
+        .offset:         112
         .size:           4
         .value_kind:     by_value
       - .name:           beta
-        .offset:         132
+        .offset:         116
         .size:           4
         .value_kind:     by_value
 ...
