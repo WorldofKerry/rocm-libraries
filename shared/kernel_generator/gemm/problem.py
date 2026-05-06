@@ -18,9 +18,12 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 from .tile.transforms import Dim, Tile, TileDescriptor
+
+if TYPE_CHECKING:
+    from .memory.swizzle import Swizzle
 
 __all__ = [
     "DataType", "GemmProblem", "MfmaConfig", "SubTileConfig",
@@ -264,7 +267,7 @@ class TileConfig:
 
     # -- swizzle resolution ------------------------------------------------
 
-    def resolved_swizzle(self, elem_bytes: float = None):
+    def resolved_swizzle(self, elem_bytes: Optional[float] = None) -> Optional[Swizzle]:
         """Return the active Swizzle instance, or None.
         
         If self.swizzle is set, use it directly.

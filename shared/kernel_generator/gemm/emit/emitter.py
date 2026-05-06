@@ -12,10 +12,13 @@ import os
 import subprocess
 import tempfile
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from .context import AsmContext
 from ..problem import GemmProblem, TileConfig
+
+if TYPE_CHECKING:
+    from ..kernarg_layout import KernargLayout
 
 __all__ = ["assemble_kernel"]
 
@@ -145,7 +148,7 @@ def emit_header(ctx: AsmContext, kernel_name: str) -> None:
 
 def emit_descriptor(ctx: AsmContext, kernel_name: str,
                     lds_total: int, tile: TileConfig,
-                    layout=None) -> None:
+                    layout: Optional[KernargLayout] = None) -> None:
     """Emit the AMDHSA kernel descriptor and metadata."""
     accum_offset = (ctx._next["v"] + 3) & ~3
     sgpr_count = ctx._next["s"]
@@ -245,7 +248,7 @@ def emit_descriptor(ctx: AsmContext, kernel_name: str,
 
 
 def alloc_registers_dtl(ctx: AsmContext, problem: GemmProblem,
-                        tile: TileConfig, layout=None) -> None:
+                        tile: TileConfig, layout: Optional[KernargLayout] = None) -> None:
     """Allocate registers for DirectToLDS kernel (no global load buffers).
 
     DTL replaces global_load + ds_write with buffer_load ... ,lds.

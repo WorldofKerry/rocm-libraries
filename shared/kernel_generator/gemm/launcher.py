@@ -352,7 +352,7 @@ class GemmLauncher:
         elem = p.element_bytes
 
         hip = _load_hip()
-        def _check(ret, msg="HIP error"):
+        def _check(ret: int, msg: str = "HIP error") -> None:
             if ret != 0:
                 raise RuntimeError(f"{msg}: HIP returned {ret}")
 
@@ -624,7 +624,7 @@ class GemmLauncher:
         import struct
 
         hip = _load_hip()
-        def _check(ret, msg="HIP error"):
+        def _check(ret: int, msg: str = "HIP error") -> None:
             if ret != 0:
                 raise RuntimeError(f"{msg}: HIP returned {ret}")
 
@@ -770,7 +770,7 @@ class GemmLauncher:
         for i, v in enumerate(refs):
             args[i] = ctypes.c_void_p(ctypes.addressof(v))
 
-        def _clear_and_launch(stream=None):
+        def _clear_and_launch(stream: Optional[ctypes.c_void_p] = None) -> None:
             """Clear flags (if needed) and launch the kernel."""
             if num_partitions > 1:
                 _check(hip.hipMemset(d_flags, 0,

@@ -17,10 +17,13 @@ Three concrete strategies:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Dict
+from typing import TYPE_CHECKING, Dict
 
 from ..emit.context import AsmContext
-from ..problem import TileConfig
+from ..problem import MfmaConfig, TileConfig
+
+if TYPE_CHECKING:
+    from .mfma_emitter import MFMAEmitter
 
 __all__ = [
     "ScaleLoader",
@@ -64,11 +67,11 @@ class ScaleLoader(ABC):
     def scale_names_b(self) -> dict:
         """Map ``(ni, ki)`` -> VGPR name for scale B."""
 
-    def streams(self, tile) -> list:
+    def streams(self, tile: TileConfig) -> list:
         """LDS streams this loader needs (empty for non-LDS loaders)."""
         return []
 
-    def mfma_emitter(self, mfma):
+    def mfma_emitter(self, mfma: MfmaConfig) -> MFMAEmitter:
         """Create the appropriate MFMAEmitter for this scale strategy."""
         from .mfma_emitter import MFMAEmitter
         return MFMAEmitter.for_non_mx(mfma)
@@ -171,7 +174,7 @@ class VMEMScaleLoader(ScaleLoader):
     def scale_names_a(self) -> dict:
         return dict(self._scale_a_names)
 
-    def mfma_emitter(self, mfma):
+    def mfma_emitter(self, mfma: MfmaConfig) -> MFMAEmitter:
         """VMEM scales: MFMA reads scale from VGPRs loaded via buffer_load."""
         from .mfma_emitter import MFMAEmitter
         return MFMAEmitter.for_vmem_scales(mfma, self.scale_names_a, self.scale_names_b)
@@ -341,12 +344,12 @@ class LDSScaleLoader(ScaleLoader):
     def scale_names_a(self) -> dict:
         return dict(self._scale_a_names)
 
-    def streams(self, tile) -> list:
+    def streams(self, tile: TileConfig) -> list:
         """LDS scale streams for DTL-based scale loading."""
         from .streams import ScaleStream
         return [ScaleStream("a", tile), ScaleStream("b", tile)]
 
-    def mfma_emitter(self, mfma):
+    def mfma_emitter(self, mfma: MfmaConfig) -> MFMAEmitter:
         """LDS scales: MFMA reads scale from VGPRs loaded via ds_read."""
         from .mfma_emitter import MFMAEmitter
         return MFMAEmitter.for_lds_scales(mfma, self.scale_names_a, self.scale_names_b)
@@ -359,7 +362,7 @@ class LDSScaleLoader(ScaleLoader):
     def scale_names_b(self) -> dict:
         return dict(self._scale_b_names)
 
-    def mfma_emitter(self, mfma):
+    def mfma_emitter(self, mfma: MfmaConfig) -> MFMAEmitter:
         """VMEM scales: MFMA reads scale from VGPRs loaded via buffer_load."""
         from .mfma_emitter import MFMAEmitter
         return MFMAEmitter.for_vmem_scales(mfma, self.scale_names_a, self.scale_names_b)
@@ -583,4 +586,3 @@ class LDSScaleLoader(ScaleLoader):
     def precompute_soffsets(self) -> None:
         self.alloc_registers()
         self.emit_setup()
-

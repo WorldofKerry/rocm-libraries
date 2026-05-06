@@ -47,14 +47,14 @@ def wire_emit_callbacks(
         ctx: AsmContext for register resolution.
         scale_loader: Optional LDSScaleLoader for scale reads.
     """
-    def _advance_srd(ctx, srd_name, stride):
+    def _advance_srd(ctx: AsmContext, srd_name: str, stride: int) -> None:
         ctx.inst("s_add_u32", ctx.sreg(srd_name, 0, 1),
                  ctx.sreg(srd_name, 0, 1), str(stride),
                  comment=f"{srd_name} += {stride}")
         ctx.inst("s_addc_u32", ctx.sreg(srd_name, 1, 1),
                  ctx.sreg(srd_name, 1, 1), "0", comment="carry")
 
-    def _toggle_write_sg(ctx, sg_name):
+    def _toggle_write_sg(ctx: AsmContext, sg_name: str) -> None:
         ctx.inst("s_add_u32", ctx.sreg(sg_name),
                  ctx.sreg(sg_name), ctx.sreg("s_lds_db_step"),
                  comment=f"{sg_name} += db")

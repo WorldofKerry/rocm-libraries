@@ -6,12 +6,17 @@ components following the CK/TensileLite/Triton pattern.
 from __future__ import annotations
 
 import math
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from ..emit.context import AsmContext
 from ..problem import TileConfig, GemmProblem
 from ..memory.global_loader import DTLLoader, BufferLoader
 from ..memory.lds_reader import LDSReader
+
+if TYPE_CHECKING:
+    from ..memory.global_loader import GlobalLoader
+    from ..memory.scale_loader import ScaleLoader
+    from ..tile.tree import TileLevel
 
 __all__ = [
     "TilePartitioner", "GridPartitioner", "StreamKPartitioner",
@@ -54,7 +59,7 @@ class GridPartitioner(TilePartitioner):
                    comment=f"k_tiles = K / {tile.unroll_k}")
         ctx.raw("")
 
-    def grid_dims(self, problem, tile):
+    def grid_dims(self, problem: GemmProblem, tile: TileConfig) -> tuple[int, int, int]:
         return (problem.m // tile.wg_m, problem.n // tile.wg_n, 1)
 
 
@@ -79,14 +84,14 @@ class ComputePipeline:
 # ===================================================================
 
 
-def pipeline_kloop_phase(level, ctx) -> None:
+def pipeline_kloop_phase(level: TileLevel, ctx: AsmContext) -> None:
     """Phase function: unified stream architecture K-loop."""
     return pipeline_v2_kloop_phase(level, ctx)
 
 
 # ── Shared helpers ────────────────────────────────────────────────
 
-def _build_loader_reader_scale(ctx):
+def _build_loader_reader_scale(ctx: AsmContext) -> tuple[GlobalLoader, LDSReader, ScaleLoader, int]:
     """Construct the loader, reader, and scale_loader from mainloop.
 
     Returns (loader, reader, scale_loader, pgr).
@@ -409,7 +414,7 @@ class StreamKPartitioner(TilePartitioner):
         ctx.label("sk_no_k_offset2")
         ctx.raw("")
 
-    def grid_dims(self, problem, tile):
+    def grid_dims(self, problem: GemmProblem, tile: TileConfig) -> tuple[int, int, int]:
         """Compute grid dimensions for StreamK launch.
 
         Returns base tile count. The launcher multiplies by
@@ -419,7 +424,7 @@ class StreamKPartitioner(TilePartitioner):
         return (total_tiles, 1, 1)
 
 
-def pipeline_v2_kloop_phase(level, ctx) -> None:
+def pipeline_v2_kloop_phase(level: TileLevel, ctx: AsmContext) -> None:
     """Phase function using the new unified stream architecture.
 
     Default pipeline strategy. Uses LDSStream + LDSBufferManager +

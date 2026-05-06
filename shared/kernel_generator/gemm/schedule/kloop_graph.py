@@ -47,7 +47,7 @@ class KLoopOp:
     # "lgkmcnt" for ds_read/ds_write, "vmcnt" for global_load/scale_load
     hw_counter: Optional[str] = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.hw_counter is None:
             if self.kind in (OpKind.DS_READ, OpKind.DS_WRITE):
                 self.hw_counter = "lgkmcnt"
@@ -118,4 +118,3 @@ class KLoopGraph:
 
 
 # ===================================================================
-

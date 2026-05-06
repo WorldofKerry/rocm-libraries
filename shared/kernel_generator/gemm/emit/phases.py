@@ -357,7 +357,7 @@ def _store_d_packed(ctx: AsmContext, tile: TileConfig, mfma: MfmaConfig, acc_per
 
 
 def _emit_buffer_store_dword(ctx: AsmContext, vdata_name: str, soffset_name: str, imm_offset: int,
-                              comment):
+                              comment: str) -> None:
     """Emit one buffer_store_dword via the D matrix SRD.
 
     Stores 32 bits (two packed BF16/FP16 values) at consecutive addresses.
@@ -384,7 +384,7 @@ def _emit_buffer_store_dword(ctx: AsmContext, vdata_name: str, soffset_name: str
 
 
 def _emit_buffer_store_dwordx2(ctx: AsmContext, vdata_name: str, soffset_name: str, imm_offset: int,
-                               comment):
+                               comment: str) -> None:
     """Emit one buffer_store_dwordx2 via the D matrix SRD (GWVW=4).
 
     Stores 64 bits (four packed BF16/FP16 values) at consecutive addresses.
@@ -411,7 +411,7 @@ def _emit_buffer_store_dwordx2(ctx: AsmContext, vdata_name: str, soffset_name: s
 
 
 def _emit_buffer_store_short(ctx: AsmContext, vdata_name: str, soffset_name: str, imm_offset: int,
-                              comment):
+                              comment: str) -> None:
     """Emit one buffer_store_short via the D matrix SRD.
 
     If imm_offset exceeds the 12-bit immediate field (4095), the excess

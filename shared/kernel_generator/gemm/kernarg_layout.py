@@ -16,7 +16,10 @@ Usage::
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
+from typing import TYPE_CHECKING, List, Optional, Union
+
+if TYPE_CHECKING:
+    from .problem import DataType, MfmaConfig
 
 __all__ = [
     "OperandSlot", "KernargLayout",
@@ -143,7 +146,7 @@ _LAYOUT_MAP = {
 }
 
 
-def layout_for(dtype, mfma=None) -> KernargLayout:
+def layout_for(dtype: Union[DataType, str], mfma: Optional[MfmaConfig] = None) -> KernargLayout:
     """Look up the KernargLayout for a DataType enum or string."""
     key = dtype.value if hasattr(dtype, 'value') else str(dtype)
     if key not in _LAYOUT_MAP:
