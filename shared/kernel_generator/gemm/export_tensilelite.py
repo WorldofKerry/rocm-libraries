@@ -2,6 +2,22 @@
 
 Generates a TensileLite-compatible custom kernel .s file that can be
 benchmarked through Tensile.sh or tensilelite-client.
+
+Usage example::
+
+    PYTHONPATH=shared python3 -c "
+    from kernel_generator.gemm.export_tensilelite import generate_custom_kernel
+    open('/tmp/k.s','w').write(generate_custom_kernel(128,128,256,dtype='mxfp4'))
+    "
+    cp /tmp/k.s <tensilelite>/Tensile/CustomKernels/<name>.s
+
+    # --library-format=msgpack required when client lacks YAML support
+    HIP_VISIBLE_DEVICES=6 ./Tensile.sh test.yaml /tmp/out \
+      --cxx-compiler /opt/rocm/bin/amdclang++ --library-format=msgpack \
+      --prebuilt-client ./tensilelite-client
+
+Note: benchmark YAML must set HighPrecisionAccumulate: true and
+Batched: true in the ProblemType section to match the kernel metadata.
 """
 from __future__ import annotations
 
