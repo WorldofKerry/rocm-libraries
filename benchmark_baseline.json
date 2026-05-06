@@ -1,0 +1,56 @@
+{
+  "fp16_4096_pgr1": {
+    "us": 168.3,
+    "err": 3.05e-05
+  },
+  "fp16_4096_pgr2": {
+    "us": 177.6,
+    "err": 3.05e-05
+  },
+  "mxfp4_4096_pgr1": {
+    "us": 54.4,
+    "err": 4360.0
+  },
+  "mxfp4_4096_pgr2": {
+    "us": 55.8,
+    "err": 4360.0
+  },
+  "fp16_4096_sk_dp": {
+    "us": 165.6,
+    "err": 3.05e-05
+  },
+  "mxfp4_4096_sk_dp": {
+    "us": 54.5,
+    "err": 4360.0
+  },
+  "regs_fp16_pgr1": {
+    "vgpr": 116,
+    "sgpr": 53,
+    "acc": 256
+  },
+  "regs_fp16_pgr2": {
+    "vgpr": 116,
+    "sgpr": 53,
+    "acc": 256
+  },
+  "regs_mxfp4_pgr1": {
+    "vgpr": 168,
+    "sgpr": 73,
+    "acc": 256
+  },
+  "regs_mxfp4_pgr2": {
+    "vgpr": 168,
+    "sgpr": 73,
+    "acc": 256
+  },
+  "regs_fp16_sk": {
+    "vgpr": 116,
+    "sgpr": 69,
+    "acc": 256
+  },
+  "regs_mxfp4_sk": {
+    "vgpr": 168,
+    "sgpr": 89,
+    "acc": 256
+  }
+}
