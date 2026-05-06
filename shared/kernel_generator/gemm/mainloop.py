@@ -276,3 +276,29 @@ def mainloop_mxfp4_wave_abi(
         colmajor_output=True,
         wave_abi=True,
     )
+
+
+def mainloop_mxfp4_tensilelite(
+    *,
+    pgr: int = 1,
+    wg_mapping_xcc: int = 1,
+    colmajor_output: bool = False,
+) -> Mainloop:
+    """MXFP4 mainloop for TensileLite custom kernels.
+
+    Uses VMEM scale loading (direct buffer_load to VGPRs, no LDS for
+    scales). This avoids the pre-swizzled byte layout complexity of the
+    LDS path and works with MXScaleFormat=0 (raw scale data).
+    """
+    from .memory.global_loader import DTLLoader
+
+    return Mainloop(
+        layout=MXFP4_LAYOUT,
+        grid=_make_grid(wg_mapping_xcc),
+        loader_cls=DTLLoader,
+        scale_strategy=VMEMScaleStrategy(swizzled=False),
+        swizzle=IdentitySwizzle(),
+        pgr=pgr,
+        epilogue=DirectStore(),
+        colmajor_output=colmajor_output,
+    )

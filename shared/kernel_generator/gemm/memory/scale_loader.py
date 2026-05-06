@@ -229,11 +229,13 @@ class VMEMScaleLoader(ScaleLoader):
     # -- SRD / offset setup -------------------------------------------------
 
     def emit_setup(self) -> None:
-        """Precompute scale soffset SGPRs (linear mode only).
+        """Precompute per-lane voffset and per-mi soffset for raw scale format.
 
-        For the swizzled mode the soffsets are computed in
-        ``phase_mx_scale_setup`` (they depend on wave layout), so
-        this method only handles the linear per-mi / per-ni offsets.
+        Raw scale layout: scale_A[m][k_block] stored contiguously with
+        inner_stride = strideMXSA0 / 32 bytes per M-row.
+
+        Per-lane voffset = (wave_m * mr * 16 + lane_id % 16) * inner_stride
+        Per-mi soffset   = mi * 16 * inner_stride
         """
         if self._swizzled:
             return
@@ -242,19 +244,71 @@ class VMEMScaleLoader(ScaleLoader):
         mfma = self._mfma
         mr, nr = self._mr, self._nr
 
-        ctx.comment("Precompute scale soffsets")
+        # Compute inner_stride = strideMXSA0 / 32 (bytes per individual M-row)
+        ctx.comment("Scale inner stride = stride / 32")
+        ctx.alloc_sgpr_permanent(1, "s_inner_stride_sa")
+        ctx.inst("s_lshr_b32", ctx.sreg("s_inner_stride_sa"),
+                 ctx.sreg("s_stride_scale_a"), "5",
+                 comment="inner_stride_a = stride_scale_a >> 5")
+        ctx.alloc_sgpr_permanent(1, "s_inner_stride_sb")
+        ctx.inst("s_lshr_b32", ctx.sreg("s_inner_stride_sb"),
+                 ctx.sreg("s_stride_scale_b"), "5",
+                 comment="inner_stride_b = stride_scale_b >> 5")
+        ctx.raw("")
+
+        # Per-lane voffset for scale A:
+        # v_scale_voff_a = (wave_m * mr * 16 + lane_id & 15) * inner_stride_a
+        ctx.comment("Scale A per-lane voffset")
+        if not ctx.has("v_scale_voff_a"):
+            ctx.alloc_vgpr_permanent(1, "v_scale_voff_a")
+        ctx.inst("v_mul_lo_u32", ctx.vreg("v_tmp0"),
+                 str(mr * mfma.m), ctx.vreg("v_wave_m"),
+                 comment=f"wave_m * {mr * mfma.m}")
+        ctx.inst("v_and_b32", ctx.vreg("v_tmp1"),
+                 ctx.vreg("v_lane_id"), "15",
+                 comment="lane_id & 15 (M-row within MFMA tile)")
+        ctx.inst("v_add_u32", ctx.vreg("v_tmp0"),
+                 ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),
+                 comment="M-row relative to WG start")
+        ctx.inst("v_mul_lo_u32", ctx.vreg("v_scale_voff_a"),
+                 ctx.sreg("s_inner_stride_sa"), ctx.vreg("v_tmp0"),
+                 comment="* inner_stride_a -> byte offset")
+        ctx.raw("")
+
+        # Per-lane voffset for scale B:
+        ctx.comment("Scale B per-lane voffset")
+        if not ctx.has("v_scale_voff_b"):
+            ctx.alloc_vgpr_permanent(1, "v_scale_voff_b")
+        ctx.inst("v_mul_lo_u32", ctx.vreg("v_tmp0"),
+                 str(nr * mfma.n), ctx.vreg("v_wave_n"),
+                 comment=f"wave_n * {nr * mfma.n}")
+        ctx.inst("v_and_b32", ctx.vreg("v_tmp1"),
+                 ctx.vreg("v_lane_id"), "15",
+                 comment="lane_id & 15 (N-row within MFMA tile)")
+        ctx.inst("v_add_u32", ctx.vreg("v_tmp0"),
+                 ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),
+                 comment="N-row relative to WG start")
+        ctx.inst("v_mul_lo_u32", ctx.vreg("v_scale_voff_b"),
+                 ctx.sreg("s_inner_stride_sb"), ctx.vreg("v_tmp0"),
+                 comment="* inner_stride_b -> byte offset")
+        ctx.raw("")
+
+        # Per-mi soffsets using inner_stride
+        ctx.comment("Precompute scale soffsets (inner_stride based)")
         for mi_ in range(1, mr):
             soff_name = f"s_soff_sa_{mi_}"
             ctx.alloc_sgpr_permanent(1, soff_name)
-            ctx.s_mul(ctx.sreg(soff_name), ctx.sreg("s_stride_scale_a"),
-                      str(mi_ * mfma.m),
-                      comment=f"soff_a[{mi_}] = stride * {mi_ * mfma.m}")
+            ctx.inst("s_mul_i32", ctx.sreg(soff_name),
+                     ctx.sreg("s_inner_stride_sa"),
+                     str(mi_ * mfma.m),
+                     comment=f"soff_a[{mi_}] = inner_stride * {mi_ * mfma.m}")
         for ni_ in range(1, nr):
             soff_name = f"s_soff_sb_{ni_}"
             ctx.alloc_sgpr_permanent(1, soff_name)
-            ctx.s_mul(ctx.sreg(soff_name), ctx.sreg("s_stride_scale_b"),
-                      str(ni_ * mfma.n),
-                      comment=f"soff_b[{ni_}] = stride * {ni_ * mfma.n}")
+            ctx.inst("s_mul_i32", ctx.sreg(soff_name),
+                     ctx.sreg("s_inner_stride_sb"),
+                     str(ni_ * mfma.n),
+                     comment=f"soff_b[{ni_}] = inner_stride * {ni_ * mfma.n}")
         ctx.raw("")
 
 
@@ -271,6 +325,76 @@ class VMEMScaleLoader(ScaleLoader):
             ctx.inst("s_addc_u32", ctx.sreg(srd_name, 1, 1),
                      ctx.sreg(srd_name, 1, 1), "0", comment="carry")
 
+
+    def streams(self, tile: TileConfig) -> list:
+        """Return dummy scale streams so the graph builder creates read ops.
+
+        VMEMScaleLoader loads scales directly to VGPRs via buffer_load,
+        not through LDS. But the pipeline graph needs scale read ops to
+        schedule the loads at the right point. These streams have zero
+        LDS region (scales bypass LDS entirely).
+        """
+        from .streams import ScaleStream
+        # Use region_size=0 since VMEM doesn't use LDS for scales
+        sa = ScaleStream("a", tile)
+        sb = ScaleStream("b", tile)
+        sa._region = 0  # Override: no LDS needed
+        sb._region = 0
+        return [sa, sb]
+
+    def emit_read_a(self, mi: int, ki: int) -> None:
+        """Emit buffer_load_dword for scale A at (mi, ki).
+
+        Uses per-lane v_scale_voff_a for M-row addressing and per-mi
+        soffset for tile offset. Each ki adds offset:(ki*4) to select
+        the correct 4-byte group of k-block scales.
+        """
+        if mi % 2 != 0:
+            return
+        ctx = self._ctx
+        voff = ctx.vreg("v_scale_voff_a")
+        srd = ctx.sreg("s_srd_scale_a", 0, 4)
+        for ki2 in range(self._ki_count):
+            name = self._scale_a_names.get((mi, ki2))
+            if name is None:
+                continue
+            soff = ctx.sreg(f"s_soff_sa_{mi}") if mi > 0 else "0"
+            k_off = ki2 * 4  # 4 bytes per ki (4 k-blocks of 32)
+            off_str = f"offen offset:{k_off}" if k_off > 0 else "offen"
+            ctx.inst("buffer_load_dword",
+                     ctx.vreg(name), voff, srd, soff, off_str,
+                     comment=f"scale A m{mi} k{ki2}")
+            # Also load mi+1 if it exists (different VGPR)
+            name2 = self._scale_a_names.get((mi + 1, ki2))
+            if name2 and name2 != name:
+                soff2 = ctx.sreg(f"s_soff_sa_{mi+1}")
+                ctx.inst("buffer_load_dword",
+                         ctx.vreg(name2), voff, srd, soff2, off_str,
+                         comment=f"scale A m{mi+1} k{ki2}")
+
+    def emit_read_b(self, ni: int, ki: int) -> None:
+        """Emit buffer_load_dword for scale B at (ni, ki)."""
+        if ni % 2 != 0:
+            return
+        ctx = self._ctx
+        voff = ctx.vreg("v_scale_voff_b")
+        srd = ctx.sreg("s_srd_scale_b", 0, 4)
+        for ki2 in range(self._ki_count):
+            name = self._scale_b_names.get((ni, ki2))
+            if name is None:
+                continue
+            soff = ctx.sreg(f"s_soff_sb_{ni}") if ni > 0 else "0"
+            k_off = ki2 * 4
+            off_str = f"offen offset:{k_off}" if k_off > 0 else "offen"
+            ctx.inst("buffer_load_dword",
+                     ctx.vreg(name), voff, srd, soff, off_str,
+                     comment=f"scale B n{ni} k{ki2}")
+            name2 = self._scale_b_names.get((ni + 1, ki2))
+            if name2 and name2 != name:
+                soff2 = ctx.sreg(f"s_soff_sb_{ni+1}")
+                ctx.inst("buffer_load_dword",
+                         ctx.vreg(name2), voff, srd, soff2, off_str,
+                         comment=f"scale B n{ni+1} k{ki2}")
 
     def precompute_soffsets(self) -> None:
         """Alias for emit_setup() -- called by ComposableKLoop."""

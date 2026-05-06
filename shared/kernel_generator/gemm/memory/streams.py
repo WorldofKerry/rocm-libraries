@@ -70,6 +70,8 @@ class DTLDataStream(LDSStream):
         return False  # DTL: hardware writes directly to LDS
 
     def setup(self, ctx: 'AsmContext', lds_offset: int) -> None:
+        if self._region == 0:
+            return
         self._lds_offset = lds_offset
         # SRD, voffset, soffset setup delegated to existing kloop/setup.py
         # (will be migrated here in Phase 4)
@@ -126,16 +128,24 @@ class ScaleStream(LDSStream):
 
     @property
     def num_global_loads(self) -> int:
+        if self._region == 0:
+            return 0
         return 4  # 4 x buffer_load_dword per matrix
 
     @property
     def needs_lds_write(self) -> bool:
+        if self._region == 0:
+            return False  # VMEM path: no LDS
         return True  # 2-step: buffer_load to VGPRs then ds_write
 
     def setup(self, ctx: 'AsmContext', lds_offset: int) -> None:
+        if self._region == 0:
+            return
         self._lds_offset = lds_offset
 
     def emit_global_loads(self, ctx: 'AsmContext') -> None:
+        if self._region == 0:
+            return  # VMEM path: scales loaded directly to VGPRs
         # Issue 4 buffer_load_dword into tmp VGPRs
         srd = f"s_srd_scale_{self._matrix}"
         voff = f"v_dtl_off_scale_{self._matrix}_lds"
@@ -147,6 +157,8 @@ class ScaleStream(LDSStream):
                      comment=f"scale {self._matrix.upper()} dword {dw}")
 
     def emit_lds_writes(self, ctx: 'AsmContext') -> None:
+        if self._region == 0:
+            return  # VMEM path: no LDS writes for scales
         # Write 4 dwords to LDS at tid*16 + lds_write_base
         wr_base = f"s_lds_wr_scale_{self._matrix}"
         tmp_addr = "v_tmp8" if self._matrix == "a" else "v_tmp9"
@@ -169,6 +181,8 @@ class ScaleStream(LDSStream):
         return (mr + 1) // 2
 
     def advance(self, ctx: 'AsmContext') -> None:
+        if self._region == 0:
+            return  # VMEM path: advance handled by VMEMScaleLoader
         srd = f"s_srd_scale_{self._matrix}"
         stride = self._scale_k_stride
         ctx.inst("s_add_u32", ctx.sreg(srd, 0, 1),
@@ -178,12 +192,16 @@ class ScaleStream(LDSStream):
                  ctx.sreg(srd, 1, 1), "0", comment="carry")
 
     def toggle_write(self, ctx: 'AsmContext') -> None:
+        if self._region == 0:
+            return
         sg = f"s_lds_wr_scale_{self._matrix}"
         ctx.inst("s_add_u32", ctx.sreg(sg),
                  ctx.sreg(sg), ctx.sreg("s_lds_db_step"),
                  comment=f"wr_scale_{self._matrix} += db_step")
 
     def toggle_read(self, ctx: 'AsmContext') -> None:
+        if self._region == 0:
+            return
         rd = f"v_scale_rd_{self._matrix}"
         ctx.v_add(ctx.vreg(rd), ctx.vreg(rd),
                   ctx.sreg("s_lds_db_step"),

@@ -524,7 +524,7 @@ def generate_custom_kernel(
         The full .s file text including assembly body,
         .amdhsa_kernel descriptor, and .amdgpu_metadata YAML config.
     """
-    from .mainloop import mainloop_fp16, mainloop_mxfp4
+    from .mainloop import mainloop_fp16, mainloop_mxfp4_tensilelite
 
     if dtype == "fp16":
         mfma = MfmaConfig.f16_16x16x16()
@@ -546,7 +546,7 @@ def generate_custom_kernel(
         )
         p = GemmProblem(4096, 4096, 4096, dtype=DataType.MXFP4)
         effective_pgr = 2  # MXFP4 always PGR=2
-        ml = mainloop_mxfp4(
+        ml = mainloop_mxfp4_tensilelite(
             pgr=effective_pgr, wg_mapping_xcc=2, colmajor_output=True,
         )
 
