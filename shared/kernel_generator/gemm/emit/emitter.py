@@ -152,8 +152,8 @@ def emit_descriptor(ctx: AsmContext, kernel_name: str,
     acc_count = ctx._next["acc"]
     vgpr_count = accum_offset + acc_count
     # Kernarg size depends on ABI mode
-    use_wave_abi = ctx._metadata.get('use_wave_abi', False)
-    if use_wave_abi:
+    mainloop = ctx._metadata.get('mainloop')
+    if mainloop and mainloop.wave_abi:
         kernarg_size = 104  # WaveGemmKernelArgs: 13 u64 fields = 104 bytes
     else:
         kernarg_size = layout.kernarg_size
@@ -194,7 +194,7 @@ def emit_descriptor(ctx: AsmContext, kernel_name: str,
     ctx.raw(f"    .max_flat_workgroup_size: {tile.block_size}")
     ctx.raw(f"    .args:")
     # Wave ABI kernarg layout (WaveGemmKernelArgs)
-    if use_wave_abi:
+    if mainloop and mainloop.wave_abi:
         args = [
             (0, 8, "global_buffer", "ptr_a"),
             (8, 8, "global_buffer", "ptr_a_scale"),

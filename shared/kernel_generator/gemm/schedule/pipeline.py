@@ -98,9 +98,8 @@ def _build_loader_reader_scale(ctx):
     loader = mainloop.loader_cls(ctx, tile, problem)
     swizzle = mainloop.resolve_swizzle(tile)
     reader = LDSReader(ctx, tile, problem, swizzle=swizzle)
-    lds_data_half = ctx._metadata.get("lds_data_half", 0)
     scale_loader = mainloop.scale_strategy.build_loader(
-        ctx, tile, lds_data_half)
+        ctx, tile, mainloop.lds_data_half(tile))
     return loader, reader, scale_loader, mainloop.pgr
 
 
@@ -427,6 +426,7 @@ def pipeline_v2_kloop_phase(level, ctx) -> None:
     PipelineScheduler + PipelineEmitter.
     """
     tile = ctx._metadata["tile"]
+    mainloop = ctx._metadata["mainloop"]
 
     loader, reader, scale_loader, pgr = \
         _build_loader_reader_scale(ctx)
@@ -482,9 +482,7 @@ def pipeline_v2_kloop_phase(level, ctx) -> None:
     scheduled = PipelineScheduler(graph).schedule()
 
     ctx.alloc_sgpr_permanent(1, "s_lds_db_step")
-    lds_scale_half = ctx._metadata.get("lds_scale_half", 0)
-    lds_data_half = ctx._metadata.get("lds_data_half", 0)
-    lds_half_total = lds_data_half + lds_scale_half
+    lds_half_total = mainloop.lds_half_total(tile)
     if not ctx.has("s_rd_db"):
         ctx.alloc_sgpr_permanent(1, "s_rd_db")
     ctx.s_mov(ctx.sreg("s_rd_db"), "0", comment="rd_db = 0")
@@ -494,7 +492,6 @@ def pipeline_v2_kloop_phase(level, ctx) -> None:
 
     # K-tile count: determined by mainloop epilogue type
     from ..mainloop import StreamKStore
-    mainloop = ctx._metadata["mainloop"]
     if isinstance(mainloop.epilogue, StreamKStore):
         StreamKPartitioner().emit(ctx)
     else:

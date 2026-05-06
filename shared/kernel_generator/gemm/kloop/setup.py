@@ -511,7 +511,7 @@ def phase_wave_abi_setup(level: TileLevel, ctx: AsmContext) -> None:
     layouts = _layouts(ctx)
 
     ctx.comment("=== Wave ABI Setup (rocRoller custom kernel) ===")
-    ctx._metadata["use_wave_abi"] = True
+    # wave_abi flag set for backward compat (phases that check it)
 
     # Load kernargs -- all fields are u64, load dwordx2 and use low 32 bits
     karg = ctx.sreg("s_kernarg")
@@ -644,7 +644,8 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
     ctx.comment("=== MX Scale Setup (direct VGPR, no LDS) ===")
 
     # Wave ABI already loads scale ptrs/strides in setup phase
-    if not ctx._metadata.get("use_wave_abi", False):
+    mainloop_ref = ctx._metadata.get("mainloop")
+    if not (mainloop_ref and mainloop_ref.wave_abi):
         # TensileLite kernarg offsets: MXSA@56, MXSB@72, strides@104,120
         karg = ctx.sreg("s_kernarg")
         ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_scale_a"), karg, "56",
@@ -706,7 +707,7 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
     ctx.raw("")
 
     # Allocate scale soffset SGPRs for swizzled mode
-    if ctx._metadata.get("use_wave_abi", False):
+    if mainloop_ref and mainloop_ref.wave_abi:
         ctx.alloc_sgpr_permanent(1, "s_scale_soff_a0")
         ctx.alloc_sgpr_permanent(1, "s_scale_soff_a1")
         ctx.alloc_sgpr_permanent(1, "s_scale_soff_b0")
@@ -773,7 +774,7 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
 
     # LDS scale write bases (for LDSScaleLoader / DTL scale path)
     if mainloop and mainloop.scale_strategy.needs_lds:
-        lds_data_half = ctx._metadata.get("lds_data_half", 0)
+        lds_data_half = mainloop.lds_data_half(tile)
         mx_block = tile.mfma.mx_block
         scale_a_lds_size = max(tile.wg_m * (tile.unroll_k // mx_block), 4096)
 

@@ -113,15 +113,16 @@ class GemmKernel:
               kernel_name: str = "gemm_kernel",
               tile_tree: Optional[TileLevel] = None,
               tiling: Optional[GemmTiling] = None,
+              mainloop: Optional[Mainloop] = None,
+              # Legacy params (used to auto-construct mainloop if not provided)
               wave_abi: bool = False,
               use_dtl: bool = True,
               pgr2: bool = False,
               pgr: int = 1,
               wg_mapping_xcc: int = 1,
               colmajor_output: bool = False,
-              pipeline_strategy=None,
-              streamk: bool = False,
-              mainloop: Optional[Mainloop] = None) -> GemmKernel:
+              pipeline_strategy: Optional[object] = None,
+              streamk: bool = False) -> 'GemmKernel':
         """Build a GemmKernel.  GemmTiling is the source of truth.
 
         Args:
@@ -213,51 +214,27 @@ class GemmKernel:
     def emit(self) -> AsmKernel:
         """Generate the full kernel assembly."""
         tile = self.tile
-        elem = self.problem.element_bytes
         layout = layout_for(self.problem.dtype)
-        pad_elems = tile.lds_pad // elem if tile.lds_pad > 0 else 0
-        lds_row_stride = tile.unroll_k + pad_elems
-        is_dtl = any(p.name in ("dtl_setup", "dtl_interleaved_setup", "wave_abi_setup")
-                     for p in self.tile_tree.prologue_phases)
-        if is_dtl and tile.lds_pad > 0:
-            # DTL uses per-load-line padding (not per-row)
-            threads_per_row = int(tile.unroll_k * elem) // 16
-            rows_per_load = tile.block_size // threads_per_row
-            num_loads_a = tile.wg_m // rows_per_load
-            num_loads_b = tile.wg_n // rows_per_load
-            lds_a = int(tile.wg_m * tile.unroll_k * elem) + num_loads_a * tile.lds_pad
-            lds_b = int(tile.wg_n * tile.unroll_k * elem) + num_loads_b * tile.lds_pad
-            lds_half = lds_a + lds_b
-        else:
-            lds_half = int((tile.wg_m + tile.wg_n) * lds_row_stride * elem)
+        mainloop = self.mainloop
 
-        # Scale LDS sizing from mainloop's scale strategy
-        lds_scale_half = self.mainloop.lds_scale_half(tile)
+        elem = self.problem.element_bytes
 
-        # Double-buffered LDS: scales within each buffer (interlaced).
-        # Buffer 0: [data A | data B | scale A | scale B]
-        # Buffer 1: [data A | data B | scale A | scale B]
-        # DB step = lds_half + lds_scale_half (total per buffer).
-        lds_half_total = lds_half + lds_scale_half
-        is_db = any(p.name in ("scheduled_k_loop",)
-                     for p in self.tile_tree.prologue_phases)
-        lds_total = lds_half_total * 2 if is_db else lds_half_total
+        # LDS sizing derived from mainloop
+        lds_total = mainloop.lds_total(tile)
 
         ctx = AsmContext()
-        # Detect wave_abi from tile tree phases
-        is_wave_abi = any(p.name == "wave_abi_setup"
-                         for p in self.tile_tree.prologue_phases)
         ctx._metadata = {
             "tile": tile,
             "problem": self.problem,
             "layout": layout,
-            "mainloop": self.mainloop,
+            "mainloop": mainloop,
             "layouts": self.layouts,
             "kernel": self,
-            "lds_scale_half": lds_scale_half,
-            "lds_data_half": lds_half,
-            "use_wave_abi": is_wave_abi,
         }
+        # DTL kernels use a different register allocation
+        is_dtl = any(p.name in ("dtl_setup", "dtl_interleaved_setup",
+                                "wave_abi_setup")
+                     for p in self.tile_tree.prologue_phases)
         if is_dtl:
             alloc_registers_dtl(ctx, self.problem, tile, layout)
         else:
