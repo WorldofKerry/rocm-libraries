@@ -640,6 +640,166 @@ def _ws_voffset(ctx: 'AsmContext', tile: 'TileConfig') -> None:
                comment="* 4 -> byte offset within tile")
 
 
+def _set_flag(ctx: 'AsmContext') -> None:
+    """Set flags[partition_idx] = 1 to signal completion.
+
+    All waves execute this -- s_buffer_store is a scalar op
+    and all waves write the same value (idempotent).
+    """
+    ctx.comment("Set completion flag")
+    # Build flags SRD if not already done
+    if not ctx.has("s_srd_flags"):
+        ctx.alloc_sgpr_permanent(4, "s_srd_flags")
+        ctx.inst("s_mov_b32", ctx.sreg("s_srd_flags", 0, 1),
+                 ctx.sreg("s_flags_ptr", 0, 1), comment="flags SRD lo")
+        ctx.inst("s_mov_b32", ctx.sreg("s_srd_flags", 1, 1),
+                 ctx.sreg("s_flags_ptr", 1, 1), comment="flags SRD hi")
+        ctx.inst("s_mov_b32", ctx.sreg("s_srd_flags", 2, 1), "0xFFFFFFFF",
+                 comment="flags SRD size")
+        ctx.inst("s_mov_b32", ctx.sreg("s_srd_flags", 3, 1), "0x20000",
+                 comment="flags SRD flags")
+
+    # soffset = partition_idx * 4
+    ctx.s_lshl(ctx.sreg("s_tmp0"), ctx.sreg("s_partition_idx"), 2,
+               comment="flag offset = partition_idx * 4")
+    ctx.s_mov(ctx.sreg("s_tmp1"), "1", comment="flag value = 1")
+
+    # Barrier ensures all waves finished stores, then set flag
+    ctx.s_barrier(comment="sync waves before flag")
+    ctx.inst("s_buffer_store_dword", ctx.sreg("s_tmp1"),
+             ctx.sreg("s_srd_flags", 0, 4), ctx.sreg("s_tmp0"),
+             comment="flags[partition_idx] = 1")
+    ctx.s_waitcnt("lgkmcnt(0)", comment="wait flag store")
+    ctx.inst("s_dcache_wb", comment="flush scalar cache to L2 for visibility")
+    ctx.raw("")
+
+def _owner_reduce(ctx: 'AsmContext', tile: 'TileConfig') -> None:
+    """Owner WG: poll flags, load partials from workspace, accumulate.
+
+    For each partition p > 0 of this tile:
+      1. Poll flags[first_partition + p] until non-zero
+      2. Load f32 workspace[partition_idx_of_p * tile_area + lane_offset]
+      3. v_add_f32 into accumulators
+    """
+    mfma = tile.mfma
+    acc_per = mfma.acc_vgprs
+    mr = tile.mfma_m_repeat
+    nr = tile.mfma_n_repeat
+    tile_area = tile.wg_m * tile.wg_n
+    total_accs = mr * nr * acc_per
+
+    # Build workspace + flags SRDs. Must emit initialization MOVs
+    # unconditionally because the non-owner path (which also emits
+    # SRD setup) is on a different branch and the owner never
+    # executes it at runtime.
+    _build_ws_srd(ctx)
+    if not ctx.has("s_srd_flags"):
+        ctx.alloc_sgpr_permanent(4, "s_srd_flags")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_flags", 0, 1),
+             ctx.sreg("s_flags_ptr", 0, 1), comment="flags SRD lo")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_flags", 1, 1),
+             ctx.sreg("s_flags_ptr", 1, 1), comment="flags SRD hi")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_flags", 2, 1), "0xFFFFFFFF",
+             comment="flags SRD size")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_flags", 3, 1), "0x20000",
+             comment="flags SRD flags")
+
+    _ws_voffset(ctx, tile)
+    # v_tmp2 = per-lane byte offset within tile (no partition base yet)
+
+    # Loop over partitions: partition_idx+1 .. partition_idx+num_partitions-1
+    # The owner is partition_idx (iter_start==0). Other partitions are
+    # partition_idx+1, partition_idx+2, etc.
+    # num_partitions_per_tile is passed via kernarg.
+    ctx.s_mov(ctx.sreg("s_tmp0"), "1", comment="p = 1 (first non-owner)")
+
+    ctx.label("sk_reduce_loop")
+    # Check if p >= num_partitions_per_tile
+    ctx.inst("s_cmp_ge_u32", ctx.sreg("s_tmp0"),
+             ctx.sreg("s_num_partitions"),
+             comment="p >= num_partitions?")
+    ctx.inst("s_cbranch_scc1", "sk_reduce_done",
+             comment="all partitions accumulated")
+
+    # Flag index = partition_idx + p
+    # Use s_iter_start as scratch (it's 0 for the owner and no longer needed)
+    ctx.inst("s_add_u32", ctx.sreg("s_iter_start"),
+             ctx.sreg("s_partition_idx"), ctx.sreg("s_tmp0"),
+             comment="flag_idx = partition_idx + p")
+    ctx.s_lshl(ctx.sreg("s_iter_start"), ctx.sreg("s_iter_start"), 2,
+               comment="flag_offset = flag_idx * 4")
+
+    # Poll flag -- s_iter_start holds the offset (preserved across iterations),
+    # s_tmp1 receives the loaded value
+    ctx.label("sk_poll_flag")
+    ctx.inst("s_buffer_load_dword", ctx.sreg("s_tmp1"),
+             ctx.sreg("s_srd_flags", 0, 4), ctx.sreg("s_iter_start"),
+             "glc", comment="load flag (bypass scalar cache)")
+    ctx.s_waitcnt("lgkmcnt(0)", comment="wait flag load")
+    ctx.inst("s_cmp_eq_u32", ctx.sreg("s_tmp1"), "0",
+             comment="flag still 0?")
+    ctx.inst("s_cbranch_scc1", "sk_poll_flag",
+             comment="spin until flag set")
+
+    # Load partial from workspace and accumulate
+    # ws_base = (partition_idx + p) * tile_area * 4
+    ctx.inst("s_add_u32", ctx.sreg("s_tmp1"),
+             ctx.sreg("s_partition_idx"), ctx.sreg("s_tmp0"),
+             comment="ws_slot = partition_idx + p")
+    ctx.s_mul(ctx.sreg("s_tmp1"), ctx.sreg("s_tmp1"),
+              str(tile_area * 4), comment="ws_base = slot * tile_bytes")
+
+    # Add per-lane offset (v_tmp2) to ws_base
+    ctx.v_add(ctx.vreg("v_tmp3"), ctx.sreg("s_tmp1"), ctx.vreg("v_tmp2"),
+              comment="ws_addr = ws_base + lane_offset")
+
+    # Load each accumulator element, add to existing acc
+    mi_stride = mfma.m * tile.wg_n * 4
+    ni_stride = mfma.n * 4
+    ai_stride = tile.wg_n * 4
+
+    for mi in range(mr):
+        soff = mi * mi_stride
+        if soff > 0:
+            ctx.s_mov(ctx.sreg("s_tmp1"), str(soff),
+                      comment=f"soffset mi={mi}")
+        for ni in range(nr):
+            acc_base = (mi * nr + ni) * acc_per
+            for ai in range(acc_per):
+                imm = ni * ni_stride + ai * ai_stride
+                soff_reg = ctx.sreg("s_tmp1") if soff > 0 else "0"
+                ctx.inst("buffer_load_dword",
+                         ctx.vreg("v_tmp0"),
+                         ctx.vreg("v_tmp3"),
+                         ctx.sreg("s_srd_ws", 0, 4), soff_reg,
+                         f"offen offset:{imm}",
+                         comment=f"load ws[m{mi}_n{ni}_a{ai}]")
+                ctx.s_waitcnt("vmcnt(0)", comment="wait load")
+                acc_reg = ctx.areg("acc_C", acc_base + ai, 1)
+                # Read acc, add, write back
+                ctx.inst("v_accvgpr_read_b32",
+                         ctx.vreg("v_tmp4"), acc_reg,
+                         comment=f"read acc[{acc_base + ai}]")
+                ctx.inst("v_add_f32",
+                         ctx.vreg("v_tmp4"),
+                         ctx.vreg("v_tmp4"), ctx.vreg("v_tmp0"),
+                         comment="acc += partial")
+                ctx.inst("v_accvgpr_write_b32",
+                         acc_reg, ctx.vreg("v_tmp4"),
+                         comment=f"write acc[{acc_base + ai}]")
+
+    ctx.s_waitcnt("vmcnt(0)", comment="wait all loads")
+
+    # Next partition
+    ctx.inst("s_add_u32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"), "1",
+             comment="p++")
+    ctx.inst("s_branch", "sk_reduce_loop", comment="next partition")
+
+    ctx.label("sk_reduce_done")
+    ctx.raw("")
+
+
+
 def _store_workspace(ctx: AsmContext, tile: 'TileConfig') -> None:
     """Store raw f32 accumulators to workspace buffer.
 
