@@ -205,7 +205,7 @@ def _emit_dtl_voffset(ctx: AsmContext) -> None:
 def _emit_srd_a(ctx: AsmContext, tile: TileConfig) -> None:
     """Build SRD for A matrix."""
     ctx.comment("SRD A")
-    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"), str(tile.wg_m // 32),
+    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"), str(tile.wg_m),
               comment=f"wg_id * {tile.wg_m}")
     ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
              ctx.sreg("s_k_stride"), comment="* K*elem")
@@ -221,7 +221,7 @@ def _emit_srd_a(ctx: AsmContext, tile: TileConfig) -> None:
 def _emit_srd_b(ctx: AsmContext, tile: TileConfig) -> None:
     """Build SRD for B matrix."""
     ctx.comment("SRD B")
-    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"), str(tile.wg_n // 32),
+    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"), str(tile.wg_n),
               comment=f"wg_id * {tile.wg_n}")
     ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
              ctx.sreg("s_k_stride"), comment="* K*elem")
