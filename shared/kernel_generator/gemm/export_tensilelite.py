@@ -99,6 +99,10 @@ def _format_mxfp4_custom_kernel(
 custom.config:
   InternalSupportParams:
     KernArgsVersion: 2
+    UseUniversalArgs: false
+    SupportUserGSU: false
+    SupportCustomWGM: false
+    SupportCustomStaggerU: false
   ProblemType:
     OperationType: GEMM
     DataType: F4
