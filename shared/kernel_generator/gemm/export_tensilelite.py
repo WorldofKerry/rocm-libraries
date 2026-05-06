@@ -155,6 +155,7 @@ custom.config:
   StreamKAtomic: 0
   StreamKXCCMapping: 0
   TransposeLDS: 0
+  PreloadKernArgs: False
   NoReject: true
 amdhsa.version: [ 1, 1 ]
 amdhsa.kernels:
@@ -386,6 +387,7 @@ custom.config:
   StreamKAtomic: 0
   StreamKXCCMapping: 0
   TransposeLDS: 0
+  PreloadKernArgs: False
   NoReject: true
 amdhsa.version: [ 1, 1 ]
 amdhsa.kernels:
