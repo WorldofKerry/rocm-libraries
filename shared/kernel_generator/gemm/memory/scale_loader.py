@@ -362,10 +362,6 @@ class LDSScaleLoader(ScaleLoader):
     def scale_names_b(self) -> dict:
         return dict(self._scale_b_names)
 
-    def mfma_emitter(self, mfma: MfmaConfig) -> MFMAEmitter:
-        """VMEM scales: MFMA reads scale from VGPRs loaded via buffer_load."""
-        from .mfma_emitter import MFMAEmitter
-        return MFMAEmitter.for_vmem_scales(mfma, self.scale_names_a, self.scale_names_b)
 
     def alloc_registers(self) -> None:
         """Allocate VGPRs: 1 per group (2 mi/ni per group)."""
