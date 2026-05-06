@@ -25,6 +25,7 @@ from .emit.emitter import alloc_registers, alloc_registers_dtl, emit_header, emi
 from .emit.layouts import GemmLayouts
 from .emit.phases import default_mfma_visitor
 from .kernarg_layout import layout_for
+from .mainloop import Mainloop
 from .problem import DataType, GemmProblem, MfmaConfig, TileConfig
 from .tiling import GemmTiling
 from .tile.tree import TileLevel, walk_tile_tree
@@ -119,7 +120,8 @@ class GemmKernel:
               wg_mapping_xcc: int = 1,
               colmajor_output: bool = False,
               pipeline_strategy=None,
-              streamk: bool = False) -> GemmKernel:
+              streamk: bool = False,
+              mainloop: Optional[Mainloop] = None) -> GemmKernel:
         """Build a GemmKernel.  GemmTiling is the source of truth.
 
         Args:
@@ -168,28 +170,43 @@ class GemmKernel:
             kernel_name=kernel_name,
             mfma_visitor=default_mfma_visitor,
         )
-        # Derive real scales from data type (MX types always need scales)
-        k.use_real_scales = problem.dtype.value == 'mxfp4'
-        k.use_lds_scales = k.use_real_scales and use_dtl  # DTL scales when using DTL data
-        k.use_dtl = use_dtl
-        k.pgr2 = pgr2
-        k.pgr = pgr if pgr > 1 else (2 if pgr2 else 1)
-        k.pipeline_strategy = pipeline_strategy
-        # Validate PGR vs buffer count (double-buffered = 2)
-        num_lds_buffers = 2
-        if k.pgr > num_lds_buffers:
-            raise ValueError(
-                f"PGR={k.pgr} exceeds num_lds_buffers={num_lds_buffers}. "
-                f"Cannot preload more tiles than available buffers.")
-        k.wg_mapping_xcc = wg_mapping_xcc
-        k.colmajor_output = colmajor_output
-        k.streamk = streamk
 
-        # StreamK: swap epilogue to conditional store
-        if streamk:
-            from .emit.phases import phase_store_streamk
-            k.tile_tree = k.tile_tree.replace_phase(
-                "store_d", phase_store_streamk)
+        # Construct mainloop if not provided (from legacy flags)
+        if mainloop is None:
+            from .mainloop import (mainloop_fp16, mainloop_bf16,
+                                   mainloop_mxfp4, mainloop_mxfp4_wave_abi)
+            effective_pgr = pgr if pgr > 1 else (2 if pgr2 else 1)
+            if wave_abi:
+                mainloop = mainloop_mxfp4_wave_abi(pgr=effective_pgr)
+            elif problem.dtype == DataType.MXFP4:
+                mainloop = mainloop_mxfp4(
+                    pgr=effective_pgr, streamk=streamk,
+                    wg_mapping_xcc=wg_mapping_xcc,
+                    colmajor_output=colmajor_output)
+            elif problem.dtype == DataType.BF16:
+                mainloop = mainloop_bf16(
+                    pgr=effective_pgr, streamk=streamk,
+                    wg_mapping_xcc=wg_mapping_xcc,
+                    colmajor_output=colmajor_output)
+            else:
+                mainloop = mainloop_fp16(
+                    pgr=effective_pgr, streamk=streamk,
+                    wg_mapping_xcc=wg_mapping_xcc,
+                    colmajor_output=colmajor_output)
+
+        k.mainloop = mainloop
+
+        # Validate PGR vs buffer count
+        if mainloop.pgr > mainloop.num_buffers:
+            raise ValueError(
+                f"PGR={mainloop.pgr} exceeds num_buffers={mainloop.num_buffers}.")
+
+        # Swap epilogue phase from mainloop
+        k.tile_tree = k.tile_tree.replace_phase(
+            "store_d", mainloop.epilogue.phase_func())
+
+        # Legacy: store pipeline_strategy for external use
+        k.pipeline_strategy = pipeline_strategy
 
         return k
 
@@ -214,15 +231,8 @@ class GemmKernel:
         else:
             lds_half = int((tile.wg_m + tile.wg_n) * lds_row_stride * elem)
 
-        # Scale LDS: when using LDS-based scale loading, reserve
-        # space for scale A + B (each padded to DTL coverage = 4096).
-        use_lds_scales = getattr(self, 'use_lds_scales', False)
-        if use_lds_scales and layout.has_scales:
-            scale_a_lds = max(tile.wg_m * (tile.unroll_k // layout.scale_block), 4096)
-            scale_b_lds = max(tile.wg_n * (tile.unroll_k // layout.scale_block), 4096)
-            lds_scale_half = scale_a_lds + scale_b_lds
-        else:
-            lds_scale_half = 0
+        # Scale LDS sizing from mainloop's scale strategy
+        lds_scale_half = self.mainloop.lds_scale_half(tile)
 
         # Double-buffered LDS: scales within each buffer (interlaced).
         # Buffer 0: [data A | data B | scale A | scale B]
@@ -234,25 +244,19 @@ class GemmKernel:
         lds_total = lds_half_total * 2 if is_db else lds_half_total
 
         ctx = AsmContext()
+        # Detect wave_abi from tile tree phases
+        is_wave_abi = any(p.name == "wave_abi_setup"
+                         for p in self.tile_tree.prologue_phases)
         ctx._metadata = {
             "tile": tile,
             "problem": self.problem,
             "layout": layout,
+            "mainloop": self.mainloop,
             "layouts": self.layouts,
             "kernel": self,
-            "use_dtl": getattr(self, 'use_dtl', True),
-            "use_real_scales": getattr(self, 'use_real_scales', False),
-            "use_lds_scales": getattr(self, 'use_lds_scales', False),
             "lds_scale_half": lds_scale_half,
-            "lds_data_half": lds_half,  # data portion (scales appended after)
-            "use_1d_grid": getattr(self, "use_1d_grid", False),
-            "swizzled_scales": getattr(self, "swizzled_scales", False),
-            "pgr2": getattr(self, "pgr2", False),
-            "pgr": getattr(self, "pgr", 1),
-            "wg_mapping_xcc": getattr(self, "wg_mapping_xcc", 1),
-            "colmajor_output": getattr(self, "colmajor_output", False),
-            "pipeline_strategy": getattr(self, "pipeline_strategy", None),
-            "streamk": getattr(self, "streamk", False),
+            "lds_data_half": lds_half,
+            "use_wave_abi": is_wave_abi,
         }
         if is_dtl:
             alloc_registers_dtl(ctx, self.problem, tile, layout)

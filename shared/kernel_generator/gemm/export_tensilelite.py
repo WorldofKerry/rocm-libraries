@@ -40,12 +40,13 @@ def generate_custom_kernel(
                                  mfma=mfma, lds_swizzle=True)
         p = GemmProblem(4096, 4096, 4096, dtype=DataType.MXFP4)
 
-    k = GemmKernel.build(p, tiling=t, pgr2=pgr2)
-
-    # Force 1D grid + column-major store for TensileLite compatibility
-    k.use_1d_grid = True
-    if dtype != "fp16":
-        k.swizzled_scales = False  # Use linear scale layout (MXScaleFormat: 0)
+    from .mainloop import mainloop_fp16, mainloop_mxfp4
+    effective_pgr = 2 if pgr2 else 1
+    if dtype == "fp16":
+        ml = mainloop_fp16(pgr=effective_pgr, wg_mapping_xcc=8, colmajor_output=True)
+    else:
+        ml = mainloop_mxfp4(pgr=effective_pgr, wg_mapping_xcc=8, colmajor_output=True)
+    k = GemmKernel.build(p, tiling=t, mainloop=ml)
 
     if kernel_name is None:
         if dtype == "fp16":

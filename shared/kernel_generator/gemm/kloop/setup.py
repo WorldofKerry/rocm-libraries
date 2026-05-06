@@ -590,61 +590,10 @@ def phase_dtl_interleaved_setup(level: TileLevel, ctx: AsmContext) -> None:
     ctx.s_waitcnt("lgkmcnt(0)", comment="wait kernargs")
     ctx.raw("")
 
-    # 1D WG decomposition (KernArgsVersion >= 1: grid flattened to 1D)
-    if ctx._metadata.get("use_1d_grid", False):
-        import math as _math
-        _log2_mt = int(_math.log2(tile.wg_m))
-
-        # WorkGroupMappingXCC: remap WG serial for L2 locality across XCCs
-        wgmxcc = ctx._metadata.get("wg_mapping_xcc", 1)
-        if wgmxcc > 1:
-            _log2_xcc = int(_math.log2(wgmxcc))
-            ctx.comment(f"WorkGroupMappingXCC={wgmxcc}: remap for L2 locality")
-            # Load numWG from kernarg offset 12
-            ctx.alloc_sgpr_permanent(1, "s_numWG")
-            ctx.inst("s_load_dword", ctx.sreg("s_numWG"), ctx.sreg("s_kernarg"),
-                     "12", comment="numWG (total workgroups)")
-            ctx.s_waitcnt("lgkmcnt(0)", comment="wait numWG")
-            # Interleave: new = (old >> K) + (old & (WGMXCC-1)) * (numWG >> K)
-            ctx.inst("s_lshr_b32", ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"),
-                     str(_log2_xcc), comment=f"old_wg / {wgmxcc}")
-            ctx.inst("s_and_b32", ctx.sreg("s_tmp1"), ctx.sreg("s_wg_id_x"),
-                     str(wgmxcc - 1), comment=f"old_wg % {wgmxcc} (XCC lane)")
-            ctx.inst("s_lshr_b32", ctx.sreg("s_numWG"), ctx.sreg("s_numWG"),
-                     str(_log2_xcc), comment=f"numWG / {wgmxcc}")
-            ctx.inst("s_mul_i32", ctx.sreg("s_tmp1"), ctx.sreg("s_tmp1"),
-                     ctx.sreg("s_numWG"), comment="XCC_lane * (numWG / WGMXCC)")
-            ctx.inst("s_add_u32", ctx.sreg("s_wg_id_x"), ctx.sreg("s_tmp0"),
-                     ctx.sreg("s_tmp1"), comment="remapped WG serial")
-            ctx.raw("")
-
-        # 1D WG decomposition: tile_m = serial % numWG_m, tile_n = serial / numWG_m
-        ctx.s_mov(ctx.sreg("s_tmp1"), ctx.sreg("s_wg_id_x"),
-                  comment="save wg_serial")
-        # numWG_m = (M + MT_M - 1) >> log2(MT_M)
-        ctx.inst("s_add_u32", ctx.sreg("s_tmp0"), ctx.sreg("s_M"),
-                 str(tile.wg_m - 1), comment=f"M + {tile.wg_m - 1}")
-        ctx.inst("s_lshr_b32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
-                 str(_log2_mt), comment=f"numWG_m = ceil(M/{tile.wg_m})")
-        # Division: tile_n = serial / numWG_m, tile_m = serial % numWG_m
-        # Use s_ff1 to detect if numWG_m is power-of-2 and use shift
-        ctx.inst("s_sub_u32", ctx.sreg("s_wg_id_x"),
-                 ctx.sreg("s_tmp0"), "1", comment="numWG_m - 1")
-        ctx.inst("s_and_b32", ctx.sreg("s_wg_id_y"),
-                 ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"),
-                 comment="numWG_m & (numWG_m-1) == 0 if power-of-2")
-        # For now assume power-of-2 (all our tiles/problems satisfy this)
-        ctx.inst("s_ff1_i32_b32", ctx.sreg("s_wg_id_y"),
-                 ctx.sreg("s_tmp0"), comment="log2(numWG_m)")
-        ctx.inst("s_lshr_b32", ctx.sreg("s_wg_id_y"),
-                 ctx.sreg("s_tmp1"), ctx.sreg("s_wg_id_y"),
-                 comment="tile_n = serial >> log2(numWG_m)")  # s3 = tile_n  (s_wg_id_y)
-        # tile_m = serial & (numWG_m - 1)
-        ctx.inst("s_sub_u32", ctx.sreg("s_wg_id_x"),
-                 ctx.sreg("s_tmp0"), "1", comment="numWG_m - 1")
-        ctx.inst("s_and_b32", ctx.sreg("s_wg_id_x"),
-                 ctx.sreg("s_tmp1"), ctx.sreg("s_wg_id_x"),
-                 comment="tile_m = serial & (numWG_m - 1)")
+    # Grid decomposition: mainloop.grid handles 2D (noop) or 1D+WGMXCC
+    mainloop = ctx._metadata.get("mainloop")
+    if mainloop is not None:
+        mainloop.grid.emit(ctx, tile)
 
 
 
@@ -679,8 +628,12 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
     """
     tile = ctx._metadata["tile"]
     mfma = tile.mfma
-    use_dtl = ctx._metadata.get("use_dtl", True)
-    use_swizzled_scales = ctx._metadata.get("swizzled_scales", False)
+    mainloop = ctx._metadata.get("mainloop")
+    use_dtl = True  # mainloop always uses DTL
+    mainloop = ctx._metadata.get("mainloop")
+    from ..mainloop import VMEMScaleStrategy
+    use_swizzled_scales = (isinstance(mainloop.scale_strategy, VMEMScaleStrategy)
+                           and mainloop.scale_strategy.swizzled if mainloop else False)
     layout = ctx._metadata.get("layout")
     if not layout.has_scales:
         return
@@ -753,13 +706,11 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
     ctx.raw("")
 
     # Allocate scale soffset SGPRs for swizzled mode
-    if ctx._metadata.get("use_1d_grid", False) or ctx._metadata.get("use_wave_abi", False):
+    if ctx._metadata.get("use_wave_abi", False):
         ctx.alloc_sgpr_permanent(1, "s_scale_soff_a0")
         ctx.alloc_sgpr_permanent(1, "s_scale_soff_a1")
         ctx.alloc_sgpr_permanent(1, "s_scale_soff_b0")
         ctx.alloc_sgpr_permanent(1, "s_scale_soff_b1")
-
-    use_swizzled_scales = ctx._metadata.get("swizzled_scales", False)
 
     if use_swizzled_scales:
         # Pre-swizzled scale layout (AITER e8m0_shuffle):
@@ -821,8 +772,7 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
         ctx.raw("")
 
     # LDS scale write bases (for LDSScaleLoader / DTL scale path)
-    use_lds_scales = ctx._metadata.get("use_lds_scales", False)
-    if use_lds_scales:
+    if mainloop and mainloop.scale_strategy.needs_lds:
         lds_data_half = ctx._metadata.get("lds_data_half", 0)
         mx_block = tile.mfma.mx_block
         scale_a_lds_size = max(tile.wg_m * (tile.unroll_k // mx_block), 4096)
