@@ -205,15 +205,7 @@ class GemmKernel:
         k.tile_tree = k.tile_tree.replace_phase(
             "store_d", mainloop.epilogue.phase_func())
 
-        # Legacy compat attributes (read by ctx._metadata during emit)
-        from .mainloop import StreamKStore
-        k.pgr = mainloop.pgr
-        k.use_lds_scales = mainloop.scale_strategy.needs_lds
-        k.use_real_scales = mainloop.layout.has_scales
-        k.use_dtl = True
-        k.colmajor_output = mainloop.colmajor_output
-        k.streamk = isinstance(mainloop.epilogue, StreamKStore)
-        k.wg_mapping_xcc = wg_mapping_xcc
+        # Legacy: store pipeline_strategy for external use
         k.pipeline_strategy = pipeline_strategy
 
         return k

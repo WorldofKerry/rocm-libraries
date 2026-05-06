@@ -712,8 +712,6 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
         ctx.alloc_sgpr_permanent(1, "s_scale_soff_b0")
         ctx.alloc_sgpr_permanent(1, "s_scale_soff_b1")
 
-    use_swizzled_scales = ctx._metadata.get("swizzled_scales", False)
-
     if use_swizzled_scales:
         # Pre-swizzled scale layout (AITER e8m0_shuffle):
         # Per-lane voffset = (lane_id % 16) * 4
