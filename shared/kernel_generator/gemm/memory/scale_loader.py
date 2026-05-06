@@ -171,11 +171,6 @@ class VMEMScaleLoader(ScaleLoader):
     def scale_names_a(self) -> dict:
         return dict(self._scale_a_names)
 
-    def streams(self, tile) -> list:
-        """LDS scale streams for DTL-based scale loading."""
-        from .streams import ScaleStream
-        return [ScaleStream("a", tile), ScaleStream("b", tile)]
-
     def mfma_emitter(self, mfma):
         """VMEM scales: MFMA reads scale from VGPRs loaded via buffer_load."""
         from .mfma_emitter import MFMAEmitter

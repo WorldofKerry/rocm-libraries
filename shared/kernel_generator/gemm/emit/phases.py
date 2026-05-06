@@ -62,9 +62,8 @@ def phase_store_d(level: TileLevel, ctx: AsmContext) -> None:
     elem = 2
     elem_int = 2
     # TensileLite uses column-major BF16; standalone uses row-major FP16
-    colmajor = (ctx._metadata.get("use_1d_grid", False) 
-                or ctx._metadata.get("use_wave_abi", False)
-                or ctx._metadata.get("colmajor_output", False))
+    mainloop = ctx._metadata.get("mainloop")
+    colmajor = mainloop.colmajor_output if mainloop else False
     layout = ctx._metadata.get("layout")
     use_bf16 = (problem.dtype == DataType.BF16) or (colmajor and layout.colmajor_output_bf16)
 
