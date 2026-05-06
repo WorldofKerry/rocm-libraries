@@ -1,12 +1,11 @@
 """Wire emit callbacks onto KLoopGraph ops.
 
 Takes a KLoopGraph (from graph_builder) and connects each op's emit
-callback to the actual codegen functions on LDSStreams, LDSReader,
-GlobalLoader, and MFMAEmitter.
-
-This is the bridge between the new stream-based graph and the existing
-assembly emission code. It allows the new PipelineScheduler/Emitter to
-produce real assembly using the existing tested codegen primitives.
+callback to the actual codegen functions.  Every producer/suffix op
+(advance, toggle, load, write) delegates uniformly to the owning
+LDSStream -- no stream-name special cases.  Consumer ops (data reads,
+MFMAs, scale reads) reference LDSReader, MFMAEmitter, and
+ScaleLoader directly since they are not stream-level operations.
 """
 from __future__ import annotations
 
@@ -45,20 +44,8 @@ def wire_emit_callbacks(
         reader: LDSReader for data reads.
         mfma_emitter: MFMAEmitter for MFMA instructions.
         ctx: AsmContext for register resolution.
-        scale_loader: Optional LDSScaleLoader for scale reads.
+        scale_loader: Optional ScaleLoader for scale reads.
     """
-    def _advance_srd(ctx: AsmContext, srd_name: str, stride: int) -> None:
-        ctx.inst("s_add_u32", ctx.sreg(srd_name, 0, 1),
-                 ctx.sreg(srd_name, 0, 1), str(stride),
-                 comment=f"{srd_name} += {stride}")
-        ctx.inst("s_addc_u32", ctx.sreg(srd_name, 1, 1),
-                 ctx.sreg(srd_name, 1, 1), "0", comment="carry")
-
-    def _toggle_write_sg(ctx: AsmContext, sg_name: str) -> None:
-        ctx.inst("s_add_u32", ctx.sreg(sg_name),
-                 ctx.sreg(sg_name), ctx.sreg("s_lds_db_step"),
-                 comment=f"{sg_name} += db")
-
     tile = ctx._metadata["tile"]
     mr = tile.mfma_m_repeat
     nr = tile.mfma_n_repeat
@@ -66,36 +53,30 @@ def wire_emit_callbacks(
 
     stream_map = {s.name: s for s in streams}
 
+    # Late-bind codegen references on DTLDataStreams so they can
+    # implement advance/toggle/load without emit_wiring special cases.
+    from ..memory.streams import DTLDataStream
+    for s in streams:
+        if isinstance(s, DTLDataStream):
+            s.set_codegen(loader, reader)
+
     for op_name, op in graph.ops.items():
-        # -- Producer ops --
+        # -- Producer ops (uniform stream dispatch) --
         if op_name.startswith("advance_"):
             sname = op_name[len("advance_"):]
-            if sname == "data_a":
-                op.emit = lambda: _advance_srd(ctx, "s_srd_a", loader.k_stride)
-            elif sname == "data_b":
-                op.emit = lambda: _advance_srd(ctx, "s_srd_b", loader.k_stride)
-            elif sname in stream_map:
+            if sname in stream_map:
                 s = stream_map[sname]
                 op.emit = lambda s=s: s.advance(ctx)
 
         elif op_name.startswith("toggle_wr_"):
             sname = op_name[len("toggle_wr_"):]
-            if sname == "data_a":
-                op.emit = lambda: _toggle_write_sg(ctx, "s_lds_wr_a_sg")
-            elif sname == "data_b":
-                op.emit = lambda: _toggle_write_sg(ctx, "s_lds_wr_b_sg")
-            elif sname in stream_map:
+            if sname in stream_map:
                 s = stream_map[sname]
                 op.emit = lambda s=s: s.toggle_write(ctx)
 
         elif op_name.startswith("load_"):
             sname = op_name[len("load_"):]
-            # Wire to actual loader methods (streams are stubs for loads)
-            if sname == "data_a":
-                op.emit = lambda: loader._emit_dtl_loads_a()
-            elif sname == "data_b":
-                op.emit = lambda: loader._emit_dtl_loads_b()
-            elif sname in stream_map:
+            if sname in stream_map:
                 s = stream_map[sname]
                 op.emit = lambda s=s: s.emit_global_loads(ctx)
 
@@ -109,7 +90,7 @@ def wire_emit_callbacks(
         elif op_name == "barrier":
             op.emit = lambda: buffer_mgr.emit_barrier(ctx)
 
-        # -- Data reads --
+        # -- Data reads (consumer ops, reference reader directly) --
         elif op_name.startswith("read_data_a_"):
             # read_data_a_m{mi}_k{ki}
             parts = op_name.replace("read_data_a_m", "").replace("_k", " ").split()
@@ -123,7 +104,7 @@ def wire_emit_callbacks(
             ni, ki = int(parts[0]), int(parts[1])
             op.emit = lambda ni=ni, ki=ki: reader.emit_read_b(ni, ki)
 
-        # -- Scale reads --
+        # -- Scale reads (consumer ops, reference scale_loader) --
         elif op_name.startswith("read_scale_a_"):
             # read_scale_a_g{group}
             group = int(op_name.replace("read_scale_a_g", ""))
@@ -137,7 +118,7 @@ def wire_emit_callbacks(
             if scale_loader is not None:
                 op.emit = lambda ni=ni: scale_loader.emit_read_b(ni, 0)
 
-        # -- MFMAs --
+        # -- MFMAs (consumer ops, reference mfma_emitter) --
         elif op_name.startswith("mfma_"):
             # mfma_m{mi}_n{ni}_k{ki}
             parts = op_name.replace("mfma_m", "").replace("_n", " ").replace("_k", " ").split()
@@ -153,15 +134,9 @@ def wire_emit_callbacks(
             op.emit = lambda acc=acc, a_reg=a_reg, b_reg=b_reg, mi=mi, ni=ni, ki=ki: \
                 mfma_emitter.emit(ctx, acc, a_reg, b_reg, mi, ni, ki)
 
-        # -- Suffix toggles --
+        # -- Suffix toggles (uniform stream dispatch) --
         elif op_name.startswith("toggle_rd_"):
             sname = op_name[len("toggle_rd_"):]
-            if sname == "data_a" or sname == "data_b":
-                # Only one toggle_read call covers both A and B
-                if sname == "data_a":
-                    op.emit = lambda: reader.toggle_read()
-                else:
-                    op.emit = None  # reader.toggle_read() handles both
-            elif sname in stream_map:
+            if sname in stream_map:
                 s = stream_map[sname]
                 op.emit = lambda s=s: s.toggle_read(ctx)

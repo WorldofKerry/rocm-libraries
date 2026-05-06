@@ -1,12 +1,10 @@
 """Concrete LDSStream implementations.
 
 Each stream handles one data channel (A data, B data, scale A,
-scale B) in the unified LDSStream interface.
-
-Actual instruction emission for advance/toggle/load is wired by
-``emit_wiring.py`` which delegates to the existing codegen primitives
-(GlobalLoader, LDSScaleLoader) for data streams, and to ScaleStream
-methods for scale streams.
+scale B) in the unified LDSStream interface.  Each stream fully
+owns its codegen -- advance, toggle, load, write -- so that
+``emit_wiring.py`` can wire every stream identically with no
+special-case branches.
 """
 from __future__ import annotations
 
@@ -30,6 +28,10 @@ class DTLDataStream(LDSStream):
     Data goes directly from global memory to LDS via hardware DTL path.
     No VGPR intermediate. LDS writes are implicit (no emit_lds_writes).
 
+    After construction, call :meth:`set_codegen` to wire a
+    ``GlobalLoader`` and ``LDSReader`` before the first K-loop
+    iteration.
+
     Args:
         matrix: "a" or "b".
         tile: Tile configuration.
@@ -40,6 +42,10 @@ class DTLDataStream(LDSStream):
                  problem: 'GemmProblem') -> None:
         assert matrix in ("a", "b")
         self._matrix = matrix
+        # Codegen references -- set via set_codegen() before emission
+        self._loader = None   # GlobalLoader (for emit_global_loads / advance)
+        self._reader = None   # LDSReader   (for toggle_read on "a")
+
         self._tile = tile
         self._elem = problem.element_bytes
         self._lds_offset = 0
@@ -52,6 +58,22 @@ class DTLDataStream(LDSStream):
 
         lds_row = int(rpl * tile.unroll_k * self._elem)
         self._region = lds_row * self._num_loads + tile.lds_pad * (self._num_loads - 1)
+
+    # -- late-binding codegen references --------------------------------
+
+    def set_codegen(self, loader: object, reader: object) -> None:
+        """Wire the GlobalLoader and LDSReader used for emission.
+
+        Called by ``wire_emit_callbacks`` before any ops fire, so the
+        stream can delegate load/advance/toggle to the real codegen
+        objects without emit_wiring needing special-case branches.
+
+        Args:
+            loader: ``GlobalLoader`` (DTLLoader or BufferLoader).
+            reader: ``LDSReader`` for toggle_read (A buffer ping-pong).
+        """
+        self._loader = loader
+        self._reader = reader
 
     @property
     def name(self) -> str:
@@ -70,15 +92,15 @@ class DTLDataStream(LDSStream):
         return False  # DTL: hardware writes directly to LDS
 
     def setup(self, ctx: 'AsmContext', lds_offset: int) -> None:
-        if self._region == 0:
-            return
+        """Record LDS base offset (SRD setup is in kloop/setup.py)."""
         self._lds_offset = lds_offset
-        # SRD, voffset, soffset setup delegated to existing kloop/setup.py
-        # (will be migrated here in Phase 4)
 
     def emit_global_loads(self, ctx: 'AsmContext') -> None:
-        # Delegated to existing DTLLoader._emit_dtl_loads_a/b
-        pass
+        """Issue DTL loads via the wired GlobalLoader."""
+        if self._matrix == "a":
+            self._loader._emit_dtl_loads_a()
+        else:
+            self._loader._emit_dtl_loads_b()
 
     def emit_lds_writes(self, ctx: 'AsmContext') -> None:
         pass  # DTL: no VGPR intermediate
@@ -88,12 +110,33 @@ class DTLDataStream(LDSStream):
         ki = self._tile.k_iterations
         return mr * ki
 
-    # advance/toggle_write/toggle_read are wired by emit_wiring.py
-    # to GlobalLoader/LDSReader methods. Stream only declares layout.
+    def advance(self, ctx: 'AsmContext') -> None:
+        """Advance the data SRD by one K-step."""
+        srd = f"s_srd_{self._matrix}"
+        stride = self._loader.k_stride
+        ctx.inst("s_add_u32", ctx.sreg(srd, 0, 1),
+                 ctx.sreg(srd, 0, 1), str(stride),
+                 comment=f"{srd} += {stride}")
+        ctx.inst("s_addc_u32", ctx.sreg(srd, 1, 1),
+                 ctx.sreg(srd, 1, 1), "0", comment="carry")
 
-    def advance(self, ctx: 'AsmContext') -> None: pass
-    def toggle_write(self, ctx: 'AsmContext') -> None: pass
-    def toggle_read(self, ctx: 'AsmContext') -> None: pass
+    def toggle_write(self, ctx: 'AsmContext') -> None:
+        """Toggle the LDS write base for double-buffering."""
+        sg = f"s_lds_wr_{self._matrix}_sg"
+        ctx.inst("s_add_u32", ctx.sreg(sg),
+                 ctx.sreg(sg), ctx.sreg("s_lds_db_step"),
+                 comment=f"{sg} += db")
+
+    def toggle_read(self, ctx: 'AsmContext') -> None:
+        """Toggle LDS read bases for double-buffering.
+
+        For matrix A: delegates to LDSReader.toggle_read() which
+        handles both A and B read pointers in one call.
+        For matrix B: no-op (already handled by the A toggle).
+        """
+        if self._matrix == "a":
+            self._reader.toggle_read()
+        # matrix "b": no-op -- reader.toggle_read() covers both
 
 
 class ScaleStream(LDSStream):
@@ -206,5 +249,3 @@ class ScaleStream(LDSStream):
         ctx.v_add(ctx.vreg(rd), ctx.vreg(rd),
                   ctx.sreg("s_lds_db_step"),
                   comment=f"scale_rd_{self._matrix} += db_step")
-
-
