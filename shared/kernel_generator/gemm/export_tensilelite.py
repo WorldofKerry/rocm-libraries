@@ -123,15 +123,13 @@ custom.config:
   MIBlock:
   - 16
   - 16
-  - 32
+  - 128
   - 1
   - 1
-  - 4
+  - 1
   MIInputPerThread: 32
   MIInputPerThreadA: 32
   MIInputPerThreadB: 32
-  MIInputPerThreadMXSA: 1
-  MIInputPerThreadMXSB: 1
   WavefrontSize: 64
   WorkGroupMapping: 16
   WorkGroupMappingXCC: 2
@@ -145,6 +143,9 @@ custom.config:
   - {mr}
   - {nr}
   DepthU: {unroll_k}
+  MacroTile:
+  - {waves_m * mr * 16}
+  - {waves_n * nr * 16}
   DirectToLds: 1
   LocalReadVectorWidth: -1
   GlobalReadVectorWidthA: 32
