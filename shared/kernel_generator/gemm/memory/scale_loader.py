@@ -244,20 +244,8 @@ class VMEMScaleLoader(ScaleLoader):
         mfma = self._mfma
         mr, nr = self._mr, self._nr
 
-        # Compute inner_stride = strideMXSA0 / 32 (bytes per individual M-row)
-        ctx.comment("Scale inner stride = stride / 32")
-        ctx.alloc_sgpr_permanent(1, "s_inner_stride_sa")
-        ctx.inst("s_lshr_b32", ctx.sreg("s_inner_stride_sa"),
-                 ctx.sreg("s_stride_scale_a"), "5",
-                 comment="inner_stride_a = stride_scale_a >> 5")
-        ctx.alloc_sgpr_permanent(1, "s_inner_stride_sb")
-        ctx.inst("s_lshr_b32", ctx.sreg("s_inner_stride_sb"),
-                 ctx.sreg("s_stride_scale_b"), "5",
-                 comment="inner_stride_b = stride_scale_b >> 5")
-        ctx.raw("")
-
-        # Per-lane voffset for scale A:
-        # v_scale_voff_a = (wave_m * mr * 16 + lane_id & 15) * inner_stride_a
+        # stride_scale_a/b = strideMXSA0 from kernarg = K/32 = per-M-row stride
+        # Per-lane voffset = (wave_m * mr * 16 + lane_id & 15) * stride
         ctx.comment("Scale A per-lane voffset")
         if not ctx.has("v_scale_voff_a"):
             ctx.alloc_vgpr_permanent(1, "v_scale_voff_a")
@@ -269,10 +257,10 @@ class VMEMScaleLoader(ScaleLoader):
                  comment="lane_id & 15 (M-row within MFMA tile)")
         ctx.inst("v_add_u32", ctx.vreg("v_tmp0"),
                  ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),
-                 comment="M-row relative to WG start")
+                 comment="M-row relative to wave's start")
         ctx.inst("v_mul_lo_u32", ctx.vreg("v_scale_voff_a"),
-                 ctx.sreg("s_inner_stride_sa"), ctx.vreg("v_tmp0"),
-                 comment="* inner_stride_a -> byte offset")
+                 ctx.sreg("s_stride_scale_a"), ctx.vreg("v_tmp0"),
+                 comment="* stride_scale_a -> byte offset")
         ctx.raw("")
 
         # Per-lane voffset for scale B:
@@ -287,28 +275,28 @@ class VMEMScaleLoader(ScaleLoader):
                  comment="lane_id & 15 (N-row within MFMA tile)")
         ctx.inst("v_add_u32", ctx.vreg("v_tmp0"),
                  ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),
-                 comment="N-row relative to WG start")
+                 comment="N-row relative to wave's start")
         ctx.inst("v_mul_lo_u32", ctx.vreg("v_scale_voff_b"),
-                 ctx.sreg("s_inner_stride_sb"), ctx.vreg("v_tmp0"),
-                 comment="* inner_stride_b -> byte offset")
+                 ctx.sreg("s_stride_scale_b"), ctx.vreg("v_tmp0"),
+                 comment="* stride_scale_b -> byte offset")
         ctx.raw("")
 
-        # Per-mi soffsets using inner_stride
-        ctx.comment("Precompute scale soffsets (inner_stride based)")
+        # Per-mi soffsets: mi * 16 * stride (16 M-rows per MFMA tile)
+        ctx.comment("Precompute scale soffsets")
         for mi_ in range(1, mr):
             soff_name = f"s_soff_sa_{mi_}"
             ctx.alloc_sgpr_permanent(1, soff_name)
             ctx.inst("s_mul_i32", ctx.sreg(soff_name),
-                     ctx.sreg("s_inner_stride_sa"),
+                     ctx.sreg("s_stride_scale_a"),
                      str(mi_ * mfma.m),
-                     comment=f"soff_a[{mi_}] = inner_stride * {mi_ * mfma.m}")
+                     comment=f"soff_a[{mi_}] = stride * {mi_ * mfma.m}")
         for ni_ in range(1, nr):
             soff_name = f"s_soff_sb_{ni_}"
             ctx.alloc_sgpr_permanent(1, soff_name)
             ctx.inst("s_mul_i32", ctx.sreg(soff_name),
-                     ctx.sreg("s_inner_stride_sb"),
+                     ctx.sreg("s_stride_scale_b"),
                      str(ni_ * mfma.n),
-                     comment=f"soff_b[{ni_}] = inner_stride * {ni_ * mfma.n}")
+                     comment=f"soff_b[{ni_}] = stride * {ni_ * mfma.n}")
         ctx.raw("")
 
 

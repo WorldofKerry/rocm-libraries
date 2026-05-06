@@ -61,12 +61,26 @@ class Grid1DXCC(GridDecomposition):
 
         if wgmxcc > 1:
             log2_xcc = int(math.log2(wgmxcc))
+            log2_mt_n = int(math.log2(tile.wg_n))
             ctx.comment(f"WorkGroupMappingXCC={wgmxcc}: remap for L2 locality")
             ctx.alloc_sgpr_permanent(1, "s_numWG")
-            ctx.inst("s_load_dword", ctx.sreg("s_numWG"),
-                     ctx.sreg("s_kernarg"), "12",
-                     comment="numWG (total workgroups)")
-            ctx.s_waitcnt("lgkmcnt(0)", comment="wait numWG")
+            # Compute numWG = ceil(M/MT_M) * ceil(N/MT_N) from M, N
+            ctx.inst("s_add_u32", ctx.sreg("s_numWG"),
+                     ctx.sreg("s_M"), str(tile.wg_m - 1),
+                     comment=f"M + {tile.wg_m - 1}")
+            ctx.inst("s_lshr_b32", ctx.sreg("s_numWG"),
+                     ctx.sreg("s_numWG"), str(log2_mt),
+                     comment=f"ceil(M/{tile.wg_m})")
+            ctx.inst("s_add_u32", ctx.sreg("s_tmp0"),
+                     ctx.sreg("s_N"), str(tile.wg_n - 1),
+                     comment=f"N + {tile.wg_n - 1}")
+            ctx.inst("s_lshr_b32", ctx.sreg("s_tmp0"),
+                     ctx.sreg("s_tmp0"), str(log2_mt_n),
+                     comment=f"ceil(N/{tile.wg_n})")
+            ctx.inst("s_mul_i32", ctx.sreg("s_numWG"),
+                     ctx.sreg("s_numWG"), ctx.sreg("s_tmp0"),
+                     comment="numWG = tiles_m * tiles_n")
+            # WGMXCC remap
             ctx.inst("s_lshr_b32", ctx.sreg("s_tmp0"),
                      ctx.sreg("s_wg_id_x"), str(log2_xcc),
                      comment=f"old_wg / {wgmxcc}")
