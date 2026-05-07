@@ -707,19 +707,22 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
     ctx.raw("")
 
     # Allocate scale soffset SGPRs for swizzled mode
+    # Need mr/2 groups for A, nr/2 for B (each group = 2 MFMA tiles = 32 M/N rows)
+    mr = tile.mfma_m_repeat
+    nr = tile.mfma_n_repeat
+    n_groups_a = mr // 2
+    n_groups_b = nr // 2
     if use_swizzled_scales or (mainloop_ref and mainloop_ref.wave_abi):
-        ctx.alloc_sgpr_permanent(1, "s_scale_soff_a0")
-        ctx.alloc_sgpr_permanent(1, "s_scale_soff_a1")
-        ctx.alloc_sgpr_permanent(1, "s_scale_soff_b0")
-        ctx.alloc_sgpr_permanent(1, "s_scale_soff_b1")
+        for g in range(n_groups_a):
+            ctx.alloc_sgpr_permanent(1, f"s_scale_soff_a{g}")
+        for g in range(n_groups_b):
+            ctx.alloc_sgpr_permanent(1, f"s_scale_soff_b{g}")
 
     if use_swizzled_scales:
-        # Pre-swizzled scale layout (AITER e8m0_shuffle):
-        # Per-lane voffset = (lane_id % 16) * 4
-        # Per-group soffset = (wave_m * 2 + group) * 256
-        # The 4 bytes at each position contain scales for:
-        #   byte[0]: (mi_lo, ki_lo), byte[1]: (mi_hi, ki_lo)
-        #   byte[2]: (mi_lo, ki_hi), byte[3]: (mi_hi, ki_hi)
+        # Pre-swizzled scale layout (e8m0_shuffle):
+        # Per-lane voffset = lane_id * 4
+        # Per-group soffset = (wave_m * n_groups_a + group) * 256
+        # Each 256-byte tile covers 32 M-rows (2 MFMA tiles of 16 rows)
         ctx.comment("Scale swizzled voffset: lane_id * 4")
         ctx.v_lshl(ctx.vreg("v_dtl_off_scale_a"),
                    ctx.vreg("v_lane_id"), 2,
@@ -729,28 +732,33 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
                  comment="scaleB voffset = same")
         ctx.raw("")
 
-        # Compute SGPR soffsets for each mi-group and ni-group
-        # group0: (wave_m * 2) * 256, group1: (wave_m * 2 + 1) * 256
-        ctx.comment("Scale group soffsets")
-        ctx.v_lshl(ctx.vreg("v_tmp0"), ctx.vreg("v_wave_m"), 1,
-                   comment="wave_m * 2")
+        # Compute SGPR soffsets for each group
+        # group_g: (wave_m * n_groups_a + g) * 256
+        ctx.comment("Scale A group soffsets")
+        ctx.v_mul(ctx.vreg("v_tmp0"),
+                  str(n_groups_a), ctx.vreg("v_wave_m"),
+                  comment=f"wave_m * {n_groups_a}")
         ctx.inst("v_readfirstlane_b32", ctx.sreg("s_tmp0"),
-                 ctx.vreg("v_tmp0"), comment="wave_m * 2 -> SGPR")
+                 ctx.vreg("v_tmp0"), comment=f"wave_m * {n_groups_a} -> SGPR")
         ctx.s_lshl(ctx.sreg("s_scale_soff_a0"), ctx.sreg("s_tmp0"), 8,
-                   comment="group0 soffset = wave_m*2 * 256")
-        ctx.inst("s_add_u32", ctx.sreg("s_scale_soff_a1"),
-                 ctx.sreg("s_scale_soff_a0"), "256",
-                 comment="group1 soffset = (wave_m*2+1) * 256")
-        # Same for B with wave_n
-        ctx.v_lshl(ctx.vreg("v_tmp0"), ctx.vreg("v_wave_n"), 1,
-                   comment="wave_n * 2")
+                   comment="group0 soffset A = base * 256")
+        for g in range(1, n_groups_a):
+            ctx.inst("s_add_u32", ctx.sreg(f"s_scale_soff_a{g}"),
+                     ctx.sreg("s_scale_soff_a0"), str(g * 256),
+                     comment=f"group{g} soffset A = base + {g*256}")
+
+        ctx.comment("Scale B group soffsets")
+        ctx.v_mul(ctx.vreg("v_tmp0"),
+                  str(n_groups_b), ctx.vreg("v_wave_n"),
+                  comment=f"wave_n * {n_groups_b}")
         ctx.inst("v_readfirstlane_b32", ctx.sreg("s_tmp0"),
-                 ctx.vreg("v_tmp0"), comment="wave_n * 2 -> SGPR")
+                 ctx.vreg("v_tmp0"), comment=f"wave_n * {n_groups_b} -> SGPR")
         ctx.s_lshl(ctx.sreg("s_scale_soff_b0"), ctx.sreg("s_tmp0"), 8,
-                   comment="group0 soffset B = wave_n*2 * 256")
-        ctx.inst("s_add_u32", ctx.sreg("s_scale_soff_b1"),
-                 ctx.sreg("s_scale_soff_b0"), "256",
-                 comment="group1 soffset B = (wave_n*2+1) * 256")
+                   comment="group0 soffset B = base * 256")
+        for g in range(1, n_groups_b):
+            ctx.inst("s_add_u32", ctx.sreg(f"s_scale_soff_b{g}"),
+                     ctx.sreg("s_scale_soff_b0"), str(g * 256),
+                     comment=f"group{g} soffset B = base + {g*256}")
         ctx.raw("")
     else:
         # Linear scale addressing (standalone path)

@@ -177,7 +177,9 @@ class VMEMScaleLoader(ScaleLoader):
     def mfma_emitter(self, mfma: MfmaConfig) -> MFMAEmitter:
         """VMEM scales: MFMA reads scale from VGPRs loaded via buffer_load."""
         from .mfma_emitter import MFMAEmitter
-        return MFMAEmitter.for_vmem_scales(mfma, self.scale_names_a, self.scale_names_b)
+        return MFMAEmitter.for_vmem_scales(
+            mfma, self.scale_names_a, self.scale_names_b,
+            swizzled=self._swizzled)
 
     @property
     def scale_names_b(self) -> dict:
@@ -339,10 +341,9 @@ class VMEMScaleLoader(ScaleLoader):
 
         if self._swizzled:
             # Swizzled: voff = lane_id * 4, soff = s_scale_soff_a{group}
-            # Group is relative to wave (0 or 1), soffsets encode wave offset
+            # Group = mi // 2, soffsets already encode wave offset
             voff = ctx.vreg("v_dtl_off_scale_a")
-            mi_per_wave = self._mr // 2  # waves_m = 2
-            group = (mi % mi_per_wave) // 2
+            group = mi // 2
             soff = ctx.sreg(f"s_scale_soff_a{group}")
             name = self._scale_a_names.get((mi, 0))
             if name:
@@ -378,8 +379,7 @@ class VMEMScaleLoader(ScaleLoader):
 
         if self._swizzled:
             voff = ctx.vreg("v_dtl_off_scale_b")
-            ni_per_wave = self._nr // 2  # waves_n = 2
-            group = (ni % ni_per_wave) // 2
+            group = ni // 2
             soff = ctx.sreg(f"s_scale_soff_b{group}")
             name = self._scale_b_names.get((ni, 0))
             if name:
