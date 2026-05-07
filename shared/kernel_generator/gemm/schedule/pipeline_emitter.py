@@ -59,6 +59,8 @@ class PipelineEmitter:
     def emit(self) -> None:
         """Emit the complete K-loop: ramp-up, body, drain."""
         self._emit_ramp_up()
+        if self.pipeline.ki_phased:
+            self._emit_pre_loop_ki0_reads()
         self._emit_body()
         # Drain iterations are handled by the body's skip-check
         # (producers are skipped when k_tiles is exhausted).
@@ -159,6 +161,31 @@ class PipelineEmitter:
         ctx.label(skip_label)
 
     # -- body ------------------------------------------------------
+
+
+    def _emit_pre_loop_ki0_reads(self) -> None:
+        """Emit initial ki=0 reads before the loop body.
+
+        For ki-phased scheduling, the loop body expects ki=0 reads
+        to be in-flight (issued by the previous copy's Phase B-2).
+        For the first iteration, this method issues those reads
+        after the ramp-up.  They are drained by lgkmcnt(0) at the
+        top of C0's Phase A.
+        """
+        ctx = self.ctx
+        body = self.pipeline.body
+        producer_start = len(self.pipeline.body)
+        for i, op in enumerate(body):
+            if op.iteration > 0:
+                producer_start = i
+                break
+
+        ctx.comment("Pre-loop ki=0 reads for first C0")
+        for i in range(producer_start):
+            op = body[i]
+            if op.kind == OpKind.DS_READ and '_k1' not in op.name:
+                self._emit_op(op)
+        ctx.raw("")
 
     def _emit_body(self) -> None:
         """Emit the steady-state K-loop body."""
@@ -271,11 +298,13 @@ class PipelineEmitter:
         if self.double_copy:
             if self.pipeline.ki_phased:
                 # -- Ki-phased double-copy --------------------------
+                # Both copies use Phase B-2 reads from the previous
+                # copy (or pre-loop reads for the first C0).
                 ctx.comment("=== Copy C0 (ki-phased) ===")
                 self._emit_copy_ki_phased(
                     body, producer_start, waitcnts,
                     skip_label="load_skip_all", pgr=pgr, copy_tag="C0",
-                    is_first_copy=True)
+                    is_first_copy=False)
                 ctx.raw("")
 
                 ctx.comment("=== Copy C1 (ki-phased) ===")
@@ -576,17 +605,23 @@ class PipelineEmitter:
         waitcnts: dict, skip_label: str, pgr: int,
         copy_tag: str, is_first_copy: bool,
     ) -> None:
-        """Emit one copy with ki-phased 2-barrier structure.
+        """Emit one copy with barrier-straddling ki-phased structure.
 
-        Structure per copy (2 barriers, 4 waitcnts):
-          1. vmcnt(0) + lgkmcnt(0) + s_barrier  (sync DTL from prev)
-          2. ki=0 reads (data+scale) + lgkmcnt(0)  (drain ki=0 reads)
-          3. ki=0 MFMAs with ki=1 reads interleaved
-          4. lgkmcnt(0) + s_barrier  (mid-copy: drain ki=1 reads)
-          5. ki=1 MFMAs with DTL loads interleaved + skip-check
+        The end-barrier straddles the ki=1 MFMAs: first half before,
+        second half after.  Post-barrier ki=1 MFMAs use VGPR data
+        from before the barrier, hiding the latency of next-copy
+        ki=0 reads that are interleaved among them.
 
-        The next copy's step 1 barrier also serves as this copy's
-        end-of-DTL sync.
+        Structure per copy:
+          1. lgkmcnt(0)  (drain ki=0 reads from prev Phase B-2)
+          2. ki=0 MFMAs with ki=1 reads interleaved
+          3. lgkmcnt(0) + s_barrier  (mid-copy: drain ki=1 reads)
+          4. ki=1 first half MFMAs + skip-check + DTL loads
+          5. vmcnt(14) + s_barrier  (end-barrier: straddles ki=1)
+          6. ki=1 second half MFMAs + next-copy ki=0 reads + LR swaps
+
+        For the FIRST copy in the loop, step 1 uses vmcnt(0)+lgkmcnt(0)
+        since there are no Phase B-2 reads yet (ramp-up loaded data).
         """
         ctx = self.ctx
         pipeline = self.pipeline
@@ -622,20 +657,30 @@ class PipelineEmitter:
         scalar_prods = [op for op in producers if op.kind == OpKind.SCALAR]
         load_prods = [op for op in producers if op.kind == OpKind.GLOBAL_LOAD]
 
-        # ── Step 1: barrier (sync DTL from prev copy) ────────────
-        ctx.s_waitcnt("vmcnt(0)", comment=f"wait DTL loads ({copy_tag})")
-        ctx.s_waitcnt("lgkmcnt(0)", comment=f"wait LDS ops ({copy_tag})")
-        if barrier_op:
-            self._emit_op(barrier_op)
+        # Split ki=1 MFMAs 50/50 for barrier straddling
+        ki1_half = len(ki1_mfmas) // 2
+        ki1_pre = ki1_mfmas[:ki1_half]   # before end-barrier
+        ki1_post = ki1_mfmas[ki1_half:]  # after end-barrier
 
-        # ── Step 2: ki=0 reads + drain ───────────────────────────
-        ctx.comment(f"ki=0 reads ({len(ki0_reads)} ops)")
-        for r in ki0_reads:
-            self._emit_op(r)
-        if ki0_reads:
-            ctx.s_waitcnt("lgkmcnt(0)", comment="drain ki=0 reads")
+        # ── Step 1: drain prev Phase B-2 reads ───────────────────
+        if is_first_copy:
+            # First copy: full sync from ramp-up
+            ctx.s_waitcnt("vmcnt(0)", comment=f"wait DTL ({copy_tag})")
+            ctx.s_waitcnt("lgkmcnt(0)", comment=f"wait LDS ({copy_tag})")
+            if barrier_op:
+                self._emit_op(barrier_op)
+            # First copy must read ki=0 data here (no Phase B-2 yet)
+            ctx.comment(f"ki=0 reads ({len(ki0_reads)} ops)")
+            for r in ki0_reads:
+                self._emit_op(r)
+            if ki0_reads:
+                ctx.s_waitcnt("lgkmcnt(0)", comment="drain ki=0 reads")
+        else:
+            # Subsequent copies: ki=0 reads were issued in prev B-2
+            ctx.s_waitcnt("lgkmcnt(0)",
+                          comment=f"drain ki=0 reads from prev B-2 ({copy_tag})")
 
-        # ── Step 3: ki=0 MFMAs + ki=1 reads interleaved ─────────
+        # ── Step 2: ki=0 MFMAs + ki=1 reads interleaved ─────────
         n_ki0 = len(ki0_mfmas)
         n_ki1_reads = len(ki1_reads)
         interval = max(1, n_ki0 // (n_ki1_reads + 1)) if n_ki1_reads > 0 else n_ki0 + 1
@@ -651,11 +696,11 @@ class PipelineEmitter:
             self._emit_op(ki1_reads[read_idx])
             read_idx += 1
 
-        # ── Step 4: mid-copy barrier (drain ki=1 reads) ──────────
+        # ── Step 3: mid-copy barrier ─────────────────────────────
         ctx.s_waitcnt("lgkmcnt(0)", comment="drain ki=1 reads")
         ctx.s_barrier(comment=f"mid-copy barrier ({copy_tag})")
 
-        # ── Step 5: skip-check + ki=1 MFMAs + DTL loads ─────────
+        # ── Step 4: ki=1 pre-barrier half + skip-check + DTL ────
         ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
                   comment=f"k_tiles-- ({copy_tag})")
         ctx.inst("s_cmp_gt_u32", ctx.sreg("s_k_tiles"),
@@ -666,15 +711,15 @@ class PipelineEmitter:
 
         self.buffer_mgr.emit_negate_step(ctx)
 
-        # Scalar producers (advance SRDs, toggle write ptrs)
+        # Scalar producers
         for op in scalar_prods:
             self._emit_op(op)
 
-        # ki=1 MFMAs with DTL loads interleaved
+        # ki=1 pre-barrier MFMAs with DTL loads interleaved
         loader = ctx._metadata.get("_dtl_loader")
-        n_ki1 = len(ki1_mfmas)
+        n_pre = len(ki1_pre)
 
-        if loader and n_ki1 >= 4 and hasattr(loader, 'emit_dtl_load_a_single'):
+        if loader and n_pre >= 4 and hasattr(loader, 'emit_dtl_load_a_single'):
             dtl_seq = []
             for op in load_prods:
                 if 'scale' in op.name:
@@ -688,13 +733,13 @@ class PipelineEmitter:
                     dtl_seq.append(('dtl_b', j))
 
             total_loads = len(dtl_seq)
-            dtl_interval = max(1, n_ki1 // (total_loads + 1))
+            dtl_interval = max(1, n_pre // (total_loads + 1))
             load_idx = 0
             m0_a_set = False
             m0_b_set = False
 
-            ctx.comment(f"ki=1 MFMAs ({n_ki1}) + DTL ({total_loads})")
-            for i, mfma_op in enumerate(ki1_mfmas):
+            ctx.comment(f"ki=1 pre-barrier ({n_pre}) + DTL ({total_loads})")
+            for i, mfma_op in enumerate(ki1_pre):
                 self._emit_op(mfma_op)
                 if (i + 1) % dtl_interval == 0 and load_idx < total_loads:
                     kind, payload = dtl_seq[load_idx]
@@ -727,10 +772,33 @@ class PipelineEmitter:
                     loader.emit_dtl_load_b_single(payload)
                 load_idx += 1
         else:
-            for mfma_op in ki1_mfmas:
+            for mfma_op in ki1_pre:
                 self._emit_op(mfma_op)
             for op in load_prods:
                 self._emit_op(op)
+
+        # ── Step 5: end-barrier (straddles ki=1) ─────────────────
+        ctx.s_waitcnt("vmcnt(14)", comment=f"wait DTL -14 inflight ({copy_tag})")
+        ctx.s_barrier(comment=f"end-barrier ({copy_tag})")
+
+        # ── Step 6: ki=1 post-barrier + next-copy ki=0 reads ────
+        # These MFMAs use VGPR data from before the barrier.
+        # Interleave next-copy ki=0 reads from the new READ buffer
+        # (buffer was swapped by the barrier).
+        n_post = len(ki1_post)
+        n_next_reads = len(ki0_reads)
+        next_interval = max(1, n_post // (n_next_reads + 1)) if n_next_reads > 0 else n_post + 1
+        next_read_idx = 0
+
+        ctx.comment(f"ki=1 post-barrier ({n_post}) + next ki=0 reads ({n_next_reads})")
+        for i, mfma_op in enumerate(ki1_post):
+            self._emit_op(mfma_op)
+            if (i + 1) % next_interval == 0 and next_read_idx < n_next_reads:
+                self._emit_op(ki0_reads[next_read_idx])
+                next_read_idx += 1
+        while next_read_idx < n_next_reads:
+            self._emit_op(ki0_reads[next_read_idx])
+            next_read_idx += 1
 
         # Suffix ops (toggle_rd)
         for op in suffix_ops:
