@@ -37,6 +37,8 @@ class PipelineEmitter:
         pipeline: Scheduled pipeline from ``PipelineScheduler``.
         buffer_mgr: LDS buffer manager (for barrier / negate helpers).
         ctx: Assembly emission context.
+        double_copy: If True, emit two copies of the body per loop
+            iteration (2x MFMAs, processing 2 DepthU chunks).
     """
 
     def __init__(
@@ -44,12 +46,15 @@ class PipelineEmitter:
         pipeline: ScheduledPipeline,
         buffer_mgr: 'LDSBufferManager',
         ctx: 'AsmContext',
+        *,
+        double_copy: bool = False,
     ) -> None:
         self.pipeline = pipeline
         self.buffer_mgr = buffer_mgr
         self.ctx = ctx
+        self.double_copy = double_copy
 
-    # ── public ────────────────────────────────────────────────────
+    # -- public ----------------------------------------------------
 
     def emit(self) -> None:
         """Emit the complete K-loop: ramp-up, body, drain."""
@@ -63,7 +68,7 @@ class PipelineEmitter:
         if self.pipeline.drain:
             self._emit_drain()
 
-    # ── ramp-up ───────────────────────────────────────────────────
+    # -- ramp-up ---------------------------------------------------
 
     def _emit_ramp_up(self) -> None:
         """Emit prologue stages that prefetch tiles before the loop."""
@@ -153,7 +158,7 @@ class PipelineEmitter:
 
         ctx.label(skip_label)
 
-    # ── body ──────────────────────────────────────────────────────
+    # -- body ------------------------------------------------------
 
     def _emit_body(self) -> None:
         """Emit the steady-state K-loop body."""
@@ -173,7 +178,7 @@ class PipelineEmitter:
     def _emit_body_produce_first(
         self, body: List[KLoopOp], pgr: int
     ) -> None:
-        """Produce-first body: pre-body → skip-check → producers → barrier → consumers.
+        """Produce-first body: pre-body -> skip-check -> producers -> barrier -> consumers.
 
         Pre-body reads (B ki=0) go before the skip check to overlap
         with the barrier stall.  Producer ops (iteration > 0) are
@@ -242,69 +247,88 @@ class PipelineEmitter:
     def _emit_body_consume_first(
         self, body: List[KLoopOp], pgr: int
     ) -> None:
-        """Consume-first body: barrier → consumers → skip-check → producers.
+        """Consume-first body: barrier -> consumers -> skip-check -> producers.
 
         Barrier is at the top of the loop, syncing loads from the
         previous iteration.  Producers are at the bottom, wrapped
         in a skip-check.
+
+        When ``double_copy`` is enabled, the consumers and producers
+        are emitted twice (C0 then C1).  Each copy decrements
+        k_tiles by 1 and has its own skip-check.  If C0 skips,
+        C1 is bypassed entirely (jump to ``load_skip_all``).
         """
         ctx = self.ctx
         waitcnts = self.pipeline.waitcnts
 
-        # Find where producers start (first op with iteration > 0).
+        # Find where producers start (first op with iteration > 0)
         producer_start = len(body)
         for i, op in enumerate(body):
             if op.iteration > 0:
                 producer_start = i
                 break
 
-        # Emit consumer ops (barrier + reads + MFMAs + toggles).
-        for i in range(producer_start):
-            op = body[i]
-            if i in waitcnts:
-                ctx.s_waitcnt(waitcnts[i],
-                              comment=f"auto-wait at pos {i}")
-            # In consume-first mode the barrier syncs DTL loads and
-            # scale ds_writes issued by the previous iteration's
-            # producers.  Wait for both counters before the barrier.
-            if op.kind == OpKind.BARRIER:
-                ctx.s_waitcnt("vmcnt(0)",
-                              comment="wait DTL loads from prev iter")
-                ctx.s_waitcnt("lgkmcnt(0)",
-                              comment="wait LDS writes from prev iter")
-            self._emit_op(op)
+        if self.double_copy:
+            # -- Double-copy: C0 then C1 per iteration -------------
+            # C0: barrier -> consumers -> skip -> negate -> producers
+            ctx.comment("=== Copy C0 ===")
+            self._emit_copy_consumers(body, producer_start, waitcnts)
 
-        # k_tiles-- and skip check before producers.
-        ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
-                  comment="k_tiles--")
-        ctx.inst("s_cmp_gt_u32", ctx.sreg("s_k_tiles"),
-                 str(pgr - 1),
-                 comment=f"k_tiles > {pgr - 1}?")
-        ctx.inst("s_cbranch_scc0", "load_skip_all",
-                 comment="skip producers (drain)")
+            ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
+                      comment="k_tiles-- (C0)")
+            ctx.inst("s_cmp_gt_u32", ctx.sreg("s_k_tiles"),
+                     str(pgr - 1),
+                     comment=f"k_tiles > {pgr - 1}? (C0)")
+            ctx.inst("s_cbranch_scc0", "load_skip_all",
+                     comment="skip C0 prods + all of C1 (drain)")
 
-        # Negate DB step BEFORE producer toggles so write pointers
-        # alternate correctly. In consume-first mode, the ramp-up
-        # left the step at +offset after toggling writes to buf 1.
-        # The first body producer needs -offset to toggle back to
-        # buf 0.  Subsequent iterations alternate naturally.
-        self.buffer_mgr.emit_negate_step(ctx)
+            self.buffer_mgr.emit_negate_step(ctx)
+            self._emit_copy_producers(body, producer_start, waitcnts)
+            ctx.raw("")
 
-        # Emit producer ops.
-        for i in range(producer_start, len(body)):
-            op = body[i]
-            if i in waitcnts:
-                ctx.s_waitcnt(waitcnts[i],
-                              comment=f"auto-wait at pos {i}")
-            self._emit_op(op)
+            # C1: barrier -> consumers -> skip -> negate -> producers
+            ctx.comment("=== Copy C1 ===")
+            self._emit_copy_consumers(body, producer_start, waitcnts)
 
-        ctx.raw("")
-        ctx.label("load_skip_all")
+            ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
+                      comment="k_tiles-- (C1)")
+            ctx.inst("s_cmp_gt_u32", ctx.sreg("s_k_tiles"),
+                     str(pgr - 1),
+                     comment=f"k_tiles > {pgr - 1}? (C1)")
+            ctx.inst("s_cbranch_scc0", "load_skip_c1",
+                     comment="skip C1 producers (drain)")
 
-        # Loop tail.
-        self._emit_loop_tail()
+            self.buffer_mgr.emit_negate_step(ctx)
+            self._emit_copy_producers(body, producer_start, waitcnts)
+            ctx.raw("")
 
-    # ── drain ─────────────────────────────────────────────────────
+            # C1 skip target + loop tail
+            ctx.label("load_skip_c1")
+            self._emit_loop_tail()
+            # C0 skip target (after loop exit, drain follows)
+            ctx.label("load_skip_all")
+        else:
+            # -- Single-copy (original) ----------------------------
+            self._emit_copy_consumers(body, producer_start, waitcnts)
+
+            ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
+                      comment="k_tiles--")
+            ctx.inst("s_cmp_gt_u32", ctx.sreg("s_k_tiles"),
+                     str(pgr - 1),
+                     comment=f"k_tiles > {pgr - 1}?")
+            ctx.inst("s_cbranch_scc0", "load_skip_all",
+                     comment="skip producers (drain)")
+
+            self.buffer_mgr.emit_negate_step(ctx)
+            self._emit_copy_producers(body, producer_start, waitcnts)
+
+            ctx.raw("")
+            ctx.label("load_skip_all")
+
+            # Loop tail.
+            self._emit_loop_tail()
+
+    # -- drain -----------------------------------------------------
 
     def _emit_drain(self) -> None:
         """Emit drain iterations (consumer-only, no producers).
@@ -362,7 +386,43 @@ class PipelineEmitter:
             ctx.label(skip_label)
             ctx.raw("")
 
-    # ── helpers ───────────────────────────────────────────────────
+    # -- helpers ---------------------------------------------------
+
+    def _emit_copy_consumers(
+        self, body: List[KLoopOp], producer_start: int,
+        waitcnts: dict,
+    ) -> None:
+        """Emit consumer ops for one copy (barrier + reads + MFMAs + toggles).
+
+        Reusable for both C0 and C1 in double-copy mode.  The
+        vmcnt(0) + lgkmcnt(0) before the barrier resets hw counter
+        state, so the same *waitcnts* dict applies to every copy.
+        """
+        ctx = self.ctx
+        for i in range(producer_start):
+            op = body[i]
+            if i in waitcnts:
+                ctx.s_waitcnt(waitcnts[i],
+                              comment=f"auto-wait at pos {i}")
+            if op.kind == OpKind.BARRIER:
+                ctx.s_waitcnt("vmcnt(0)",
+                              comment="wait DTL loads from prev iter")
+                ctx.s_waitcnt("lgkmcnt(0)",
+                              comment="wait LDS writes from prev iter")
+            self._emit_op(op)
+
+    def _emit_copy_producers(
+        self, body: List[KLoopOp], producer_start: int,
+        waitcnts: dict,
+    ) -> None:
+        """Emit producer ops for one copy."""
+        ctx = self.ctx
+        for i in range(producer_start, len(body)):
+            op = body[i]
+            if i in waitcnts:
+                ctx.s_waitcnt(waitcnts[i],
+                              comment=f"auto-wait at pos {i}")
+            self._emit_op(op)
 
     def _emit_op(self, op: KLoopOp) -> None:
         """Emit a single op. Handles None callbacks gracefully."""

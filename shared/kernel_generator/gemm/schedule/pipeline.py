@@ -511,4 +511,5 @@ def pipeline_v2_kloop_phase(level: TileLevel, ctx: AsmContext) -> None:
         ctx.raw("")
 
     # Emit K-loop
-    PipelineEmitter(scheduled, buffer_mgr, ctx).emit()
+    PipelineEmitter(scheduled, buffer_mgr, ctx,
+                    double_copy=(scheduled.pgr >= 2)).emit()
