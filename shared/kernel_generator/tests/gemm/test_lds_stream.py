@@ -133,13 +133,13 @@ class TestScaleStream:
         tiling = GemmTiling.mxfp4_standard(wg_m=128, wg_n=128, unroll_k=256)
         tile = tiling.to_tile_config()
         s = ScaleStream("a", tile)
-        assert s.num_global_loads == 4
+        assert s.num_global_loads == 1  # true DTL: single dwordx4 load
 
     def test_needs_lds_write_true(self):
         tiling = GemmTiling.mxfp4_standard(wg_m=128, wg_n=128, unroll_k=256)
         tile = tiling.to_tile_config()
         s = ScaleStream("a", tile)
-        assert s.needs_lds_write is True
+        assert s.needs_lds_write is False  # true DTL: no ds_write needed
 
     def test_read_op_count(self):
         """read_op_count = ceil(mfma_{m,n}_repeat / 2) for scale streams."""

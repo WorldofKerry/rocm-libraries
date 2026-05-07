@@ -140,11 +140,15 @@ class DTLDataStream(LDSStream):
 
 
 class ScaleStream(LDSStream):
-    """MX scale data loaded via buffer_load_dword + ds_write (2-step).
+    """MX scale data loaded via true DTL (buffer_load_dwordx4 ... lds).
 
-    Each thread loads 16 bytes from global into VGPRs, then writes to
-    LDS via ds_write_b32. Uses strided voffset matching the pre-swizzled
-    scale layout: (tid%16)*16 + (tid/16)*stride.
+    Uses hardware DirectToLDS to load pre-swizzled scale data from
+    global memory directly into LDS, bypassing VGPRs entirely.  Each
+    of 256 threads loads 16 bytes -> 4096 bytes per matrix per K-step.
+
+    DTL voffset = (tid%16)*16 + (tid/16)*strideMXS.
+    m0 = LDS write base for this matrix's scale region.
+    ds_read base = wave_partition*512 + laneId*4 + lds_scale_base.
 
     Args:
         matrix: "a" or "b".
@@ -173,13 +177,12 @@ class ScaleStream(LDSStream):
     def num_global_loads(self) -> int:
         if self._region == 0:
             return 0
-        return 4  # 4 x buffer_load_dword per matrix
+        return 1  # single buffer_load_dwordx4 ... lds per matrix
 
     @property
     def needs_lds_write(self) -> bool:
-        if self._region == 0:
-            return False  # VMEM path: no LDS
-        return True  # 2-step: buffer_load to VGPRs then ds_write
+        # True DTL: data goes directly from global to LDS, no ds_write
+        return False
 
     def setup(self, ctx: 'AsmContext', lds_offset: int) -> None:
         if self._region == 0:
@@ -188,35 +191,23 @@ class ScaleStream(LDSStream):
 
     def emit_global_loads(self, ctx: 'AsmContext') -> None:
         if self._region == 0:
-            return  # VMEM path: scales loaded directly to VGPRs
-        # Issue 4 buffer_load_dword into tmp VGPRs
+            return
+        # Set m0 to LDS write base for this matrix's scale region
+        wr_base = f"s_lds_wr_scale_{self._matrix}"
+        ctx.inst("s_mov_b32", "m0", ctx.sreg(wr_base),
+                 comment=f"m0 = scale {self._matrix.upper()} LDS write base")
+        # True DTL: buffer_load_dwordx4 vaddr, srd, soffset, offen lds
+        # vaddr = per-lane offset, data goes to LDS at m0+vaddr
         srd = f"s_srd_scale_{self._matrix}"
         voff = f"v_dtl_off_scale_{self._matrix}_lds"
-        base_tmp = 0 if self._matrix == "a" else 4
-        for dw in range(4):
-            ctx.inst("buffer_load_dword", ctx.vreg(f"v_tmp{base_tmp + dw}"),
-                     ctx.vreg(voff), ctx.sreg(srd, 0, 4),
-                     "0", f"offen offset:{dw * 4}",
-                     comment=f"scale {self._matrix.upper()} dword {dw}")
+        ctx.inst("buffer_load_dwordx4",
+                 ctx.vreg(voff), ctx.sreg(srd, 0, 4),
+                 "0", "offen offset:0, lds",
+                 comment=f"scale {self._matrix.upper()} DTL to LDS")
 
     def emit_lds_writes(self, ctx: 'AsmContext') -> None:
-        if self._region == 0:
-            return  # VMEM path: no LDS writes for scales
-        # Write 4 dwords to LDS at tid*16 + lds_write_base
-        wr_base = f"s_lds_wr_scale_{self._matrix}"
-        tmp_addr = "v_tmp8" if self._matrix == "a" else "v_tmp9"
-        base_tmp = 0 if self._matrix == "a" else 4
-        ctx.v_lshl(ctx.vreg("v_tmp8" if self._matrix == "a" else "v_tmp9"),
-                    ctx.vreg("v_tid"), 4,
-                    comment="tid * 16")
-        ctx.v_add(ctx.vreg(tmp_addr), ctx.vreg(tmp_addr),
-                  ctx.sreg(wr_base),
-                  comment=f"LDS addr = wr_base_{self._matrix} + tid*16")
-        for dw in range(4):
-            ctx.inst("ds_write_b32",
-                     ctx.vreg(tmp_addr), ctx.vreg(f"v_tmp{base_tmp + dw}"),
-                     f"offset:{dw * 4}",
-                     comment=f"scale {self._matrix.upper()} dw{dw} -> LDS")
+        # No-op: true DTL writes directly to LDS
+        pass
 
     def read_op_count(self) -> int:
         # One read per 2-mi group (LDS scales group 2 mi values)
