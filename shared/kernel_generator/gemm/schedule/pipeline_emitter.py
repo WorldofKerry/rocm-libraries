@@ -437,7 +437,7 @@ class PipelineEmitter:
 
         # Split at ~60% of MFMAs: first part is pure consume,
         # second part interleaves global loads
-        split_mfma = int(total_mfmas * 0.75)
+        split_mfma = int(total_mfmas * 0.50)
         if split_mfma < 1:
             split_mfma = total_mfmas
         split_pos = consumer_mfma_indices[split_mfma - 1] + 1 if split_mfma > 0 else producer_start
@@ -488,7 +488,7 @@ class PipelineEmitter:
                 if op.kind == OpKind.MFMA:
                     mfma_since_load += 1
                     # Insert a load every ~4 MFMAs
-                    if mfma_since_load >= 3 and load_idx < len(load_prods):
+                    if mfma_since_load >= 2 and load_idx < len(load_prods):
                         self._emit_op(load_prods[load_idx])
                         load_idx += 1
                         mfma_since_load = 0
