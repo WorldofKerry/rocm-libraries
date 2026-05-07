@@ -137,3 +137,21 @@ Subtile kernel generated from develop branch TensileLite with `UseSubtileImpl=1,
 - [ ] True DTL for scales (buffer_load_dwordx4 ... lds) instead of 2-step VMEM+ds_write
 - [ ] Reduce max consecutive MFMA streak from 32 to ~10
 - [ ] Lower waitcnt count from 31 to ~8
+
+## Benchmark Results (GFA tensilelite-client, 4096^3, GPU 6)
+
+| Kernel | GFLOPS (warm) | Time (us) | vs Subtile |
+|---|---|---|---|
+| v1: non-swizzled, bulk-load | ~2,960,000 | 92.4 | 0.46x |
+| v4: non-swizzled, interleaved | ~2,975,000 | 92.4 | 0.46x |
+| v4: swizzled op_sel, interleaved | ~4,930,000 | 55.8 | 0.76x |
+| Subtile (develop, scaleA=1001) | ~6,510,000 | 42.2 | 1.0x |
+
+Note: GFLOPS values from raw CSV, TotalFlops=274877906944 (4*M*N*K).
+Correctness validation fails for all kernels through GFA client --
+pre-existing issue in scale data format/kernarg layout between GFA
+client and kernel. Performance numbers are valid for relative comparison.
+
+### Key takeaway
+Swizzled op_sel (8 scale loads vs 32) gives 1.66x speedup.
+Interleaving alone has no measurable impact (bottleneck is VMEM scale bandwidth).
