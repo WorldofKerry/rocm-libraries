@@ -325,6 +325,7 @@ class StreamKPartitioner(TilePartitioner):
         # Recompute scale SRDs for MX types
         if layout.has_scales and ctx.has("s_srd_scale_a"):
             from ..mainloop import VMEMScaleStrategy
+            mainloop = ctx._metadata["mainloop"]
             use_swizzled = (isinstance(mainloop.scale_strategy, VMEMScaleStrategy)
                            and mainloop.scale_strategy.swizzled)
             ctx.comment("Recompute scale SRD A/B for corrected tile coords")

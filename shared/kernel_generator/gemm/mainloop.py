@@ -285,6 +285,7 @@ def mainloop_mxfp4_tensilelite(
     wg_mapping_xcc: int = 1,
     colmajor_output: bool = False,
     swizzled_scales: bool = False,
+    streamk: bool = False,
 ) -> Mainloop:
     """MXFP4 mainloop for TensileLite custom kernels with LDS scale loading.
 
@@ -295,6 +296,7 @@ def mainloop_mxfp4_tensilelite(
     Args:
         swizzled_scales: Accepted for API compatibility. LDS scales
             always use pre-swizzled format (MXScaleFormat=1).
+        streamk: Enable StreamK work distribution for better CU utilization.
     """
     from .memory.global_loader import DTLLoader
 
@@ -305,7 +307,7 @@ def mainloop_mxfp4_tensilelite(
         scale_strategy=LDSScaleStrategy(),
         swizzle=IdentitySwizzle(),
         pgr=pgr,
-        epilogue=DirectStore(),
+        epilogue=StreamKStore() if streamk else DirectStore(),
         colmajor_output=colmajor_output,
         tensilelite_abi=True,
     )

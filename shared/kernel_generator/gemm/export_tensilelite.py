@@ -83,8 +83,10 @@ def _format_mxfp4_custom_kernel(
     mr: int,
     nr: int,
     pgr: int,
+    streamk: bool = False,
 ) -> str:
     """Format the complete .s file for an MXFP4 custom kernel."""
+    sk_val = 3 if streamk else 0
     return f""".amdgcn_target "amdgcn-amd-amdhsa--gfx950"
 .text
 .globl {kernel_name}
@@ -172,7 +174,7 @@ custom.config:
   GlobalSplitUWorkGroupMappingRoundRobin: false
   PrefetchGlobalRead: {pgr}
   PrefetchLocalRead: 1
-  StreamK: 0
+  StreamK: {sk_val}
   StreamKAtomic: 0
   StreamKXCCMapping: 0
   TransposeLDS: 0
@@ -388,7 +390,7 @@ custom.config:
   GlobalSplitUWorkGroupMappingRoundRobin: false
   PrefetchGlobalRead: {pgr}
   PrefetchLocalRead: 1
-  StreamK: 0
+  StreamK: {sk_val}
   StreamKAtomic: 0
   StreamKXCCMapping: 0
   TransposeLDS: 0
@@ -517,6 +519,7 @@ def generate_custom_kernel(
     dtype: str = "mxfp4",
     pgr2: bool = False,
     swizzled_scales: bool = True,
+    streamk: bool = False,
 ) -> str:
     """Generate a TensileLite custom kernel .s file contents.
 
@@ -526,6 +529,7 @@ def generate_custom_kernel(
         dtype: Data type -- ``"mxfp4"`` or ``"fp16"``.
         pgr2: Enable PGR=2 double-prefetch (FP16 only; MXFP4 always uses 2).
         swizzled_scales: Use pre-swizzled MX scale layout (MXScaleFormat=1).
+        streamk: Enable StreamK work distribution.
 
     Returns:
         The full .s file text including assembly body,
@@ -556,6 +560,7 @@ def generate_custom_kernel(
         ml = mainloop_mxfp4_tensilelite(
             pgr=effective_pgr, wg_mapping_xcc=2, colmajor_output=True,
             swizzled_scales=swizzled_scales,
+            streamk=streamk,
         )
 
     k = GemmKernel.build(p, tiling=t, mainloop=ml)
@@ -602,6 +607,7 @@ def generate_custom_kernel(
             nr=nr,
             mfma=mfma,
             pgr=effective_pgr,
+            streamk=streamk,
         )
     else:
         return _format_mxfp4_custom_kernel(
@@ -618,4 +624,5 @@ def generate_custom_kernel(
             mr=mr,
             nr=nr,
             pgr=effective_pgr,
+            streamk=streamk,
         )
