@@ -661,14 +661,9 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
 
     # Scale SRD A
     ctx.comment("Scale SRD A")
-    if use_swizzled_scales:
-        # Swizzled: offset = wg_id * (wg_m / 32) * stride
-        ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"),
-                  str(tile.wg_m // 32),
-                  comment=f"wg_id_x * {tile.wg_m // 32}")
-    else:
-        ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"), str(tile.wg_m // 32),
-                  comment=f"wg_id_x * {tile.wg_m // 32} (MT/32)")
+    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"),
+              str(tile.wg_m // 32),
+              comment=f"wg_id_x * {tile.wg_m // 32} (MT/32)")
     ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
              ctx.sreg("s_stride_scale_a"), comment="* stride_scale_a")
     ctx.inst("s_add_u32", ctx.sreg("s_srd_scale_a", 0, 1),
@@ -685,13 +680,9 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
 
     # Scale SRD B
     ctx.comment("Scale SRD B")
-    if use_swizzled_scales:
-        ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"),
-                  str(tile.wg_n // 32),
-                  comment=f"wg_id_y * {tile.wg_n // 32}")
-    else:
-        ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"), str(tile.wg_n // 32),
-                  comment=f"wg_id_y * {tile.wg_n // 32} (MT/32)")
+    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"),
+              str(tile.wg_n // 32),
+              comment=f"wg_id_y * {tile.wg_n // 32} (MT/32)")
     ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
              ctx.sreg("s_stride_scale_b"), comment="* stride_scale_b")
     ctx.inst("s_add_u32", ctx.sreg("s_srd_scale_b", 0, 1),
