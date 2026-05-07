@@ -193,8 +193,10 @@ class VMEMScaleLoader(ScaleLoader):
         mr, nr, ki_count = self._mr, self._nr, self._ki_count
 
         if self._swizzled:
-            # 2 VGPRs per dimension (group0, group1)
-            for g in range(2):
+            # 1 VGPR per group of 2 mi/ni values (op_sel selects byte)
+            num_groups_a = (mr + 1) // 2
+            num_groups_b = (nr + 1) // 2
+            for g in range(num_groups_a):
                 name = f"v_scale_a_g{g}"
                 if not ctx.has(name):
                     ctx.alloc_vgpr_permanent(1, name)
@@ -203,7 +205,7 @@ class VMEMScaleLoader(ScaleLoader):
                     if mi_ < mr:
                         for ki in range(ki_count):
                             self._scale_a_names[(mi_, ki)] = name
-            for g in range(2):
+            for g in range(num_groups_b):
                 name = f"v_scale_b_g{g}"
                 if not ctx.has(name):
                     ctx.alloc_vgpr_permanent(1, name)
