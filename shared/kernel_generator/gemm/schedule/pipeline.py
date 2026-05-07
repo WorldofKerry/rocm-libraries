@@ -502,5 +502,13 @@ def pipeline_v2_kloop_phase(level: TileLevel, ctx: AsmContext) -> None:
     else:
         GridPartitioner().emit(ctx)
 
+    # Save initial k_tiles for drain guard (PGR>=2 needs to
+    # know if enough tiles existed for each ramp-up stage)
+    if scheduled.pgr >= 2:
+        ctx.alloc_sgpr_permanent(1, "s_k_tiles_init")
+        ctx.s_mov(ctx.sreg("s_k_tiles_init"), ctx.sreg("s_k_tiles"),
+                  comment="save initial k_tiles for drain guard")
+        ctx.raw("")
+
     # Emit K-loop
     PipelineEmitter(scheduled, buffer_mgr, ctx).emit()

@@ -307,19 +307,59 @@ class PipelineEmitter:
     # ── drain ─────────────────────────────────────────────────────
 
     def _emit_drain(self) -> None:
-        """Emit drain iterations (consumer-only, no producers)."""
+        """Emit drain iterations (consumer-only, no producers).
+
+        Each drain stage d corresponds to ramp-up stage d+1.
+        If that ramp-up stage was skipped (k_tiles_initial <= d+1),
+        the drain stage must also be skipped to avoid reading
+        from an uninitialized LDS buffer.
+
+        Uses s_k_tiles_init (saved at loop entry) for the guard.
+        """
         ctx = self.ctx
+        pgr = self.pipeline.pgr
+
+        # Save initial k_tiles before the loop decrements it.
+        # This is emitted just before the drain (after the loop
+        # exits), but the value was saved at loop entry.
+        # Actually, k_tiles at this point = 0 or 1 (post-loop).
+        # We need to compare against the ORIGINAL k_tiles.
+        # Solution: use the pgr_skip labels -- if stage s was
+        # skipped, k_tiles_init <= s. After the loop, k_tiles
+        # has been decremented, but we can recover the original
+        # from the fact that the loop ran (k_tiles_init - pgr)
+        # iterations, consuming (k_tiles_init - pgr) tiles.
+        # Simpler: just check if the ramp-up skip label was taken.
+        # Even simpler: guard each drain stage with the same
+        # condition as the corresponding ramp-up stage, but using
+        # a saved register.
+
+        # Guard: save initial k_tiles before loop decrements it
+        # (emitted by the caller in pipeline.py)
         for d_idx, drain_ops in enumerate(self.pipeline.drain):
+            skip_label = f"drain_skip_{d_idx}"
+            ramp_stage = d_idx + 1  # drain[0] matches ramp-up[1]
+
+            # Guard: skip drain if the corresponding ramp-up was skipped.
+            # s_k_tiles_init is saved by the pipeline phase before
+            # the loop starts. If it doesn't exist (unit tests),
+            # drain runs unconditionally (assumes enough tiles).
+            if ctx.has("s_k_tiles_init"):
+                ctx.inst("s_cmp_le_u32", ctx.sreg("s_k_tiles_init"),
+                         str(ramp_stage),
+                         comment=f"skip drain if k_tiles_init <= {ramp_stage}")
+                ctx.inst("s_cbranch_scc1", skip_label,
+                         comment=f"drain stage {d_idx} not needed")
+
             ctx.comment(f"Drain stage {d_idx}")
             for op in drain_ops:
-                # Barrier in drain must wait for any in-flight loads
-                # and LDS writes from the last producer iteration.
                 if op.kind == OpKind.BARRIER:
                     ctx.s_waitcnt("vmcnt(0)",
                                  comment="wait DTL loads")
                     ctx.s_waitcnt("lgkmcnt(0)",
                                  comment="wait LDS writes")
                 self._emit_op(op)
+            ctx.label(skip_label)
             ctx.raw("")
 
     # ── helpers ───────────────────────────────────────────────────
