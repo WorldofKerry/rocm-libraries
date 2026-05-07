@@ -249,9 +249,9 @@ class VMEMScaleLoader(ScaleLoader):
         ctx.comment("Scale A per-lane voffset")
         if not ctx.has("v_scale_voff_a"):
             ctx.alloc_vgpr_permanent(1, "v_scale_voff_a")
-        ctx.inst("v_mul_lo_u32", ctx.vreg("v_tmp0"),
-                 str(mr * mfma.m), ctx.vreg("v_wave_m"),
-                 comment=f"wave_m * {mr * mfma.m}")
+        ctx.v_mul(ctx.vreg("v_tmp0"),
+                  str(mr * mfma.m), ctx.vreg("v_wave_m"),
+                  comment=f"wave_m * {mr * mfma.m}")
         ctx.inst("v_and_b32", ctx.vreg("v_tmp1"),
                  ctx.vreg("v_lane_id"), "15",
                  comment="lane_id & 15 (M-row within MFMA tile)")
@@ -267,9 +267,9 @@ class VMEMScaleLoader(ScaleLoader):
         ctx.comment("Scale B per-lane voffset")
         if not ctx.has("v_scale_voff_b"):
             ctx.alloc_vgpr_permanent(1, "v_scale_voff_b")
-        ctx.inst("v_mul_lo_u32", ctx.vreg("v_tmp0"),
-                 str(nr * mfma.n), ctx.vreg("v_wave_n"),
-                 comment=f"wave_n * {nr * mfma.n}")
+        ctx.v_mul(ctx.vreg("v_tmp0"),
+                  str(nr * mfma.n), ctx.vreg("v_wave_n"),
+                  comment=f"wave_n * {nr * mfma.n}")
         ctx.inst("v_and_b32", ctx.vreg("v_tmp1"),
                  ctx.vreg("v_lane_id"), "15",
                  comment="lane_id & 15 (N-row within MFMA tile)")
