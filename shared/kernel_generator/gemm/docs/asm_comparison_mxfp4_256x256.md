@@ -155,3 +155,20 @@ client and kernel. Performance numbers are valid for relative comparison.
 ### Key takeaway
 Swizzled op_sel (8 scale loads vs 32) gives 1.66x speedup.
 Interleaving alone has no measurable impact (bottleneck is VMEM scale bandwidth).
+
+## Post P0+P1+P2 Results
+
+| Metric | v1 (old) | v4+P2 (new) | Subtile | 
+|---|---|---|---|
+| MFMAs/loop body | 128 | 256 | 256 |
+| Scale VMEM loads/body | 32 | 16 | 0 |
+| Barriers/body | 1 | 2 | 4 |
+| MFMA/mem ratio | 1.60 | 2.29 | 2.21 |
+| Max MFMA streak | 128 | 32 | 10 |
+| Time (4096^3 us) | 92.4 | 56.6 | 42.2 |
+| vs subtile | 0.46x | 0.75x | 1.0x |
+
+### Remaining 1.34x gap root causes
+1. **8 VMEM scale loads per copy** -- contends with DTL loads on VMEM port
+2. **32-MFMA streak** -- caused by A ping-pong WAR deps; subtile has max 10
+3. **1 barrier per copy** vs subtile's 2 -- less overlap between compute and loads
