@@ -205,7 +205,13 @@ class PipelineScheduler:
 
     def _sort_consumers(self, consumers: List[KLoopOp],
                         g: KLoopGraph) -> List[KLoopOp]:
-        """Sort consumer ops: reads → MFMAs → suffix."""
+        """Sort consumer ops: interleave reads among MFMAs.
+
+        Places each ds_read DS_READ_LEAD MFMAs before its earliest
+        consumer MFMA, hiding LDS latency under MFMA execution.
+        WAR-constrained reads (A ping-pong) are placed right after
+        the WAR-dep MFMA.  Suffix ops (toggle_rd) go last.
+        """
 
         reads: List[KLoopOp] = []
         mfmas: List[KLoopOp] = []
@@ -219,7 +225,7 @@ class PipelineScheduler:
             else:
                 suffix.append(op)
 
-        # MFMAs: canonical order (m, ki, ni) — matches existing scheduler.
+        # MFMAs: canonical order (m, ki, ni).
         tile = g.tile
         mr = tile.mfma_m_repeat
         nr = tile.mfma_n_repeat
@@ -234,8 +240,7 @@ class PipelineScheduler:
                     if name in mfma_by_name:
                         mfma_order.append(mfma_by_name[name])
 
-        # Reads: schedule each read before the first MFMA that needs it.
-        # Build a map: read_name → earliest MFMA position that depends on it.
+        # Build read -> earliest consuming MFMA position map.
         mfma_positions = {op.name: i for i, op in enumerate(mfma_order)}
         read_earliest: Dict[str, int] = {}
         for dep in g.deps:
@@ -245,8 +250,7 @@ class PipelineScheduler:
                     cur = read_earliest.get(dep.producer, len(mfma_order))
                     read_earliest[dep.producer] = min(cur, pos)
 
-        # Also handle reads with WAR deps (ping-pong):
-        # read must come after the WAR-dep MFMA.
+        # WAR deps (ping-pong): read must come after WAR-dep MFMA.
         read_war_after: Dict[str, int] = {}
         for dep in g.deps:
             if dep.kind == DepKind.WAR and dep.consumer in {r.name for r in reads}:
@@ -255,49 +259,35 @@ class PipelineScheduler:
                     cur = read_war_after.get(dep.consumer, -1)
                     read_war_after[dep.consumer] = max(cur, pos)
 
-        # Three-phase read placement matching v1 pattern:
-        # 1. Early preamble: reads consumed by first MFMAs (urgent)
-        # 2. Late preamble: remaining non-WAR reads (less urgent,
-        #    issued in bulk, gives LDS pipeline time to drain early)
-        # 3. Interleaved: WAR-constrained reads after WAR MFMA
-        #
-        # The split between early/late is at nr*ki_count MFMAs
-        # (one subtile of B reads). This matches v1's pre_body +
-        # preamble split where B ki=0 is issued first, then A+B ki=1.
-        DS_READ_LEAD = 5
-        mfmas_per_mi = nr * ki_count  # MFMAs per mi group
-
-        early_preamble: List[KLoopOp] = []
-        late_preamble: List[KLoopOp] = []
-        interleaved: List[tuple] = []
-
+        # Place each read DS_READ_LEAD MFMAs before its consumer,
+        # or right after its WAR-dep MFMA for ping-pong reads.
+        DS_READ_LEAD = 4
+        reads_at_pos: Dict[int, List[KLoopOp]] = {}
         for r in reads:
             war_pos = read_war_after.get(r.name, -1)
             target = read_earliest.get(r.name, 0)
             if war_pos >= 0:
-                interleaved.append((war_pos, r))
-            elif target < mfmas_per_mi:
-                # Consumed in first subtile: urgent
-                early_preamble.append(r)
+                # WAR-constrained: place right after WAR MFMA
+                place = war_pos + 1
             else:
-                # Consumed later: can go in late preamble
-                late_preamble.append(r)
+                # Place DS_READ_LEAD MFMAs before consumer
+                place = max(target - DS_READ_LEAD, 0)
+            reads_at_pos.setdefault(place, []).append(r)
 
-        # Sort by urgency
-        early_preamble.sort(key=lambda r: (read_earliest.get(r.name, 999), r.name))
-        late_preamble.sort(key=lambda r: (read_earliest.get(r.name, 999), r.name))
-        interleaved.sort(key=lambda x: (x[0], read_earliest.get(x[1].name, 999)))
+        # Sort reads within each position by urgency
+        for pos in reads_at_pos:
+            reads_at_pos[pos].sort(
+                key=lambda r: (read_earliest.get(r.name, 999), r.name))
 
-        # Group interleaved reads by target MFMA position
-        reads_after: Dict[int, List[KLoopOp]] = {}
-        for pos, r in interleaved:
-            reads_after.setdefault(pos, []).append(r)
-
-        # Build result: early preamble, late preamble, MFMA + interleaved
-        result: List[KLoopOp] = list(early_preamble) + list(late_preamble)
+        # Build result: reads interleaved among MFMAs
+        result: List[KLoopOp] = []
+        # Reads at position 0 go before first MFMA
+        for r in reads_at_pos.get(0, []):
+            result.append(r)
         for i, mfma_op in enumerate(mfma_order):
             result.append(mfma_op)
-            for r in reads_after.get(i, []):
+            # Reads placed after MFMA at position i (targeting i+1)
+            for r in reads_at_pos.get(i + 1, []):
                 result.append(r)
         result.extend(suffix)
         return result

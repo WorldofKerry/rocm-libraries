@@ -286,15 +286,14 @@ def mainloop_mxfp4_tensilelite(
     colmajor_output: bool = False,
     swizzled_scales: bool = False,
 ) -> Mainloop:
-    """MXFP4 mainloop for TensileLite custom kernels.
+    """MXFP4 mainloop for TensileLite custom kernels with LDS scale loading.
 
-    Uses VMEM scale loading (direct buffer_load to VGPRs, no LDS for
-    scales).
+    Uses LDS-based scale loading (global load -> ds_write -> ds_read with
+    op_sel) for optimal scale throughput.
 
     Args:
-        swizzled_scales: If True, expect pre-swizzled scale layout
-            (MXScaleFormat=1 / scaleA=1001). If False, raw scales
-            (MXScaleFormat=0 / scaleA=3).
+        swizzled_scales: Accepted for API compatibility but ignored;
+            LDS scales always use pre-swizzled format.
     """
     from .memory.global_loader import DTLLoader
 
@@ -302,7 +301,7 @@ def mainloop_mxfp4_tensilelite(
         layout=MXFP4_LAYOUT,
         grid=_make_grid(wg_mapping_xcc),
         loader_cls=DTLLoader,
-        scale_strategy=VMEMScaleStrategy(swizzled=swizzled_scales),
+        scale_strategy=LDSScaleStrategy(),
         swizzle=IdentitySwizzle(),
         pgr=pgr,
         epilogue=DirectStore(),

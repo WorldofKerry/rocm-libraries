@@ -516,7 +516,7 @@ def generate_custom_kernel(
     kernel_name: Optional[str] = None,
     dtype: str = "mxfp4",
     pgr2: bool = False,
-    swizzled_scales: bool = False,
+    swizzled_scales: bool = True,
 ) -> str:
     """Generate a TensileLite custom kernel .s file contents.
 
