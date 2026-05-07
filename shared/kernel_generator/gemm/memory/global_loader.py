@@ -174,6 +174,49 @@ class DTLLoader(GlobalLoader):
                     ctx.inst("s_add_u32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
                              ctx.sreg("s_soffset_b"), comment="soffset += stride")
 
+    # -- Per-line DTL helpers for interleaved emission --
+
+    def _dtl_lds_stride(self) -> int:
+        """LDS stride between DTL load lines."""
+        elem = self.elem
+        tpr = int(self.tile.unroll_k * elem) // 16
+        rpl = self.tile.block_size // tpr
+        return int(rpl * self.tile.unroll_k * elem) + self.tile.lds_pad
+
+    def emit_dtl_m0_a(self) -> None:
+        """Set m0 to LDS write base A (call once before dtl_load_a_single)."""
+        self.ctx.inst("s_mov_b32", "m0", self.ctx.sreg("s_lds_wr_a_sg"),
+                      comment="m0 = LDS base A")
+
+    def emit_dtl_m0_b(self) -> None:
+        """Set m0 to LDS write base B (call once before dtl_load_b_single)."""
+        self.ctx.inst("s_mov_b32", "m0", self.ctx.sreg("s_lds_wr_b_sg"),
+                      comment="m0 = LDS base B")
+
+    def emit_dtl_load_a_single(self, i: int) -> None:
+        """Emit a single DTL load for A line i, advancing m0 afterward."""
+        ctx = self.ctx
+        has_pre = ctx.has("s_dtl_soff_a1") if self.num_loads_a > 1 else False
+        soff = ("0" if i == 0 else ctx.sreg(f"s_dtl_soff_a{i}")) if has_pre else "0"
+        ctx.inst("buffer_load_dwordx4",
+                 ctx.vreg("v_dtl_off_a"), ctx.sreg("s_srd_a", 0, 4),
+                 soff, "offen offset:0, lds", comment=f"DTL A[{i}]")
+        if i < self.num_loads_a - 1:
+            ctx.inst("s_add_u32", "m0", "m0", str(self._dtl_lds_stride()),
+                     comment=f"m0 += {self._dtl_lds_stride()}")
+
+    def emit_dtl_load_b_single(self, i: int) -> None:
+        """Emit a single DTL load for B line i, advancing m0 afterward."""
+        ctx = self.ctx
+        has_pre = ctx.has("s_dtl_soff_b1") if self.num_loads_b > 1 else False
+        soff = ("0" if i == 0 else ctx.sreg(f"s_dtl_soff_b{i}")) if has_pre else "0"
+        ctx.inst("buffer_load_dwordx4",
+                 ctx.vreg("v_dtl_off_b"), ctx.sreg("s_srd_b", 0, 4),
+                 soff, "offen offset:0, lds", comment=f"DTL B[{i}]")
+        if i < self.num_loads_b - 1:
+            ctx.inst("s_add_u32", "m0", "m0", str(self._dtl_lds_stride()),
+                     comment=f"m0 += {self._dtl_lds_stride()}")
+
 
 class BufferLoader(GlobalLoader):
     """Traditional global_load + ds_write loader.

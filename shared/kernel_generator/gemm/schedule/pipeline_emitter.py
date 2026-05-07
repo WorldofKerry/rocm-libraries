@@ -470,13 +470,36 @@ class PipelineEmitter:
         for op in scalar_prods:
             self._emit_op(op)
 
-        # Phase 2: remaining consumers interleaved with global loads
-        remaining_consumer_count = producer_start - split_pos
-        if load_prods and remaining_consumer_count > 0:
-            # Spread loads evenly among remaining consumers
-            loads_per_gap = max(1, len(load_prods) // max(1, remaining_consumer_count // 8))
+        # Phase 2: remaining consumers with fine-grained DTL interleaving
+        # Use per-line DTL methods to spread individual loads among MFMAs
+        remaining_mfmas = sum(1 for i in range(split_pos, producer_start)
+                              if body[i].kind == OpKind.MFMA)
+
+        # Get the loader for per-line DTL
+        loader = ctx._metadata.get("_dtl_loader")
+
+        if loader and remaining_mfmas >= 4 and hasattr(loader, 'emit_dtl_load_a_single'):
+            # Build individual DTL load sequence: scale_a, scale_b,
+            # then alternating A[0..n] and B[0..n]
+            dtl_seq = []
+            for op in load_prods:
+                if 'scale' in op.name:
+                    dtl_seq.append(('scale_op', op))
+            n_a = loader.num_loads_a
+            n_b = loader.num_loads_b
+            for j in range(max(n_a, n_b)):
+                if j < n_a:
+                    dtl_seq.append(('dtl_a', j))
+                if j < n_b:
+                    dtl_seq.append(('dtl_b', j))
+
+            # Spread across remaining MFMAs
+            total_loads = len(dtl_seq)
+            interval = max(1, remaining_mfmas // (total_loads + 1))
             load_idx = 0
-            mfma_since_load = 0
+            mfma_ct = 0
+            m0_a_set = False
+            m0_b_set = False
 
             for i in range(split_pos, producer_start):
                 op = body[i]
@@ -486,19 +509,41 @@ class PipelineEmitter:
                 self._emit_op(op)
 
                 if op.kind == OpKind.MFMA:
-                    mfma_since_load += 1
-                    # Insert a load every ~4 MFMAs
-                    if mfma_since_load >= 2 and load_idx < len(load_prods):
-                        self._emit_op(load_prods[load_idx])
+                    mfma_ct += 1
+                    if mfma_ct % interval == 0 and load_idx < total_loads:
+                        kind, payload = dtl_seq[load_idx]
+                        if kind == 'scale_op':
+                            self._emit_op(payload)
+                        elif kind == 'dtl_a':
+                            if not m0_a_set:
+                                loader.emit_dtl_m0_a()
+                                m0_a_set = True
+                            loader.emit_dtl_load_a_single(payload)
+                        elif kind == 'dtl_b':
+                            if not m0_b_set:
+                                loader.emit_dtl_m0_b()
+                                m0_b_set = True
+                            loader.emit_dtl_load_b_single(payload)
                         load_idx += 1
-                        mfma_since_load = 0
 
-            # Emit any remaining loads
-            while load_idx < len(load_prods):
-                self._emit_op(load_prods[load_idx])
+            # Remaining loads
+            while load_idx < total_loads:
+                kind, payload = dtl_seq[load_idx]
+                if kind == 'scale_op':
+                    self._emit_op(payload)
+                elif kind == 'dtl_a':
+                    if not m0_a_set:
+                        loader.emit_dtl_m0_a()
+                        m0_a_set = True
+                    loader.emit_dtl_load_a_single(payload)
+                elif kind == 'dtl_b':
+                    if not m0_b_set:
+                        loader.emit_dtl_m0_b()
+                        m0_b_set = True
+                    loader.emit_dtl_load_b_single(payload)
                 load_idx += 1
         else:
-            # Fallback: emit remaining consumers then all loads
+            # Fallback: emit remaining consumers then bulk loads
             for i in range(split_pos, producer_start):
                 op = body[i]
                 if i in waitcnts:
@@ -507,6 +552,7 @@ class PipelineEmitter:
                 self._emit_op(op)
             for op in load_prods:
                 self._emit_op(op)
+
 
     def _emit_op(self, op: KLoopOp) -> None:
         """Emit a single op. Handles None callbacks gracefully."""

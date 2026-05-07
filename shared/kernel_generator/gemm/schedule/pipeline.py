@@ -435,6 +435,7 @@ def pipeline_v2_kloop_phase(level: TileLevel, ctx: AsmContext) -> None:
 
     loader, reader, scale_loader, pgr = \
         _build_loader_reader_scale(ctx)
+    ctx._metadata["_dtl_loader"] = loader
 
     # --- New architecture ---
     from ..memory.streams import DTLDataStream
