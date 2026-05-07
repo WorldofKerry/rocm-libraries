@@ -118,3 +118,22 @@ Subtile kernel generated from develop branch TensileLite with `UseSubtileImpl=1,
 | AITER/rocRoller (scaleA=3) | 44.7 |
 | **Our 256x256** | **91.2** |
 | Our 128x128 | 152.6 |
+
+## Post-Optimization: P0+P1 Applied
+
+| Metric | Before (v1) | After (v3) | Subtile | Remaining gap |
+|---|---|---|---|---|
+| Scale VMEM loads/loop | 32 | 8 | 0 | 8 (ds_write path) |
+| Scale ds_read/loop | 0 | 8 | 8 per copy | matched |
+| Reads before 1st MFMA | 52 | 10 | ~0 | 10 (preamble) |
+| s_waitcnt/loop | 26 | 31 | 8 | high (autocomputed) |
+| op_sel MFMAs | 0 | 128 | 256 | matched per copy |
+| VGPRs | 448 | 424 | 512 | better |
+| LDS | 128 KB | 144 KB | 144 KB | matched |
+| Max consecutive MFMAs | 128 | 32 | 10 | 3x gap |
+
+### Remaining items
+- [ ] P2: Double-copy unrolling (2x MFMAs per loop body)
+- [ ] True DTL for scales (buffer_load_dwordx4 ... lds) instead of 2-step VMEM+ds_write
+- [ ] Reduce max consecutive MFMA streak from 32 to ~10
+- [ ] Lower waitcnt count from 31 to ~8
