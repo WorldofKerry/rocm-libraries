@@ -516,6 +516,7 @@ def generate_custom_kernel(
     kernel_name: Optional[str] = None,
     dtype: str = "mxfp4",
     pgr2: bool = False,
+    swizzled_scales: bool = False,
 ) -> str:
     """Generate a TensileLite custom kernel .s file contents.
 
@@ -524,6 +525,7 @@ def generate_custom_kernel(
         kernel_name: Override kernel function name.
         dtype: Data type -- ``"mxfp4"`` or ``"fp16"``.
         pgr2: Enable PGR=2 double-prefetch (FP16 only; MXFP4 always uses 2).
+        swizzled_scales: Use pre-swizzled MX scale layout (MXScaleFormat=1).
 
     Returns:
         The full .s file text including assembly body,
@@ -553,6 +555,7 @@ def generate_custom_kernel(
         effective_pgr = 2  # MXFP4 always PGR=2
         ml = mainloop_mxfp4_tensilelite(
             pgr=effective_pgr, wg_mapping_xcc=2, colmajor_output=True,
+            swizzled_scales=swizzled_scales,
         )
 
     k = GemmKernel.build(p, tiling=t, mainloop=ml)

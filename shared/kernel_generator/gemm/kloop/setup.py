@@ -707,7 +707,7 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
     ctx.raw("")
 
     # Allocate scale soffset SGPRs for swizzled mode
-    if mainloop_ref and mainloop_ref.wave_abi:
+    if use_swizzled_scales or (mainloop_ref and mainloop_ref.wave_abi):
         ctx.alloc_sgpr_permanent(1, "s_scale_soff_a0")
         ctx.alloc_sgpr_permanent(1, "s_scale_soff_a1")
         ctx.alloc_sgpr_permanent(1, "s_scale_soff_b0")

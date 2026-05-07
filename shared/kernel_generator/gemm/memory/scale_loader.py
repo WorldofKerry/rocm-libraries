@@ -331,42 +331,64 @@ class VMEMScaleLoader(ScaleLoader):
         return [sa, sb]
 
     def emit_read_a(self, mi: int, ki: int) -> None:
-        """Emit buffer_load_dword for scale A at (mi, ki).
-
-        Uses per-lane v_scale_voff_a for M-row addressing and per-mi
-        soffset for tile offset. Each ki adds offset:(ki*4) to select
-        the correct 4-byte group of k-block scales.
-        """
+        """Emit buffer_load_dword for scale A at (mi, ki)."""
         if mi % 2 != 0:
             return
         ctx = self._ctx
-        voff = ctx.vreg("v_scale_voff_a")
         srd = ctx.sreg("s_srd_scale_a", 0, 4)
-        for ki2 in range(self._ki_count):
-            name = self._scale_a_names.get((mi, ki2))
-            if name is None:
-                continue
-            soff = ctx.sreg(f"s_soff_sa_{mi}") if mi > 0 else "0"
-            k_off = ki2 * 4  # 4 bytes per ki (4 k-blocks of 32)
-            off_str = f"offen offset:{k_off}" if k_off > 0 else "offen"
-            ctx.inst("buffer_load_dword",
-                     ctx.vreg(name), voff, srd, soff, off_str,
-                     comment=f"scale A m{mi} k{ki2}")
-            # Also load mi+1 if it exists (different VGPR)
-            name2 = self._scale_a_names.get((mi + 1, ki2))
-            if name2 and name2 != name:
-                soff2 = ctx.sreg(f"s_soff_sa_{mi+1}")
+
+        if self._swizzled:
+            # Swizzled: voff = lane_id * 4, soff = s_scale_soff_a{group}
+            # Group is relative to wave (0 or 1), soffsets encode wave offset
+            voff = ctx.vreg("v_dtl_off_scale_a")
+            mi_per_wave = self._mr // 2  # waves_m = 2
+            group = (mi % mi_per_wave) // 2
+            soff = ctx.sreg(f"s_scale_soff_a{group}")
+            name = self._scale_a_names.get((mi, 0))
+            if name:
                 ctx.inst("buffer_load_dword",
-                         ctx.vreg(name2), voff, srd, soff2, off_str,
-                         comment=f"scale A m{mi+1} k{ki2}")
+                         ctx.vreg(name), voff, srd, soff, "offen",
+                         comment=f"scale A group{group} (m{mi}-m{mi+1})")
+        else:
+            # Linear: voff = wave_m-based offset, soff = per-mi
+            voff = ctx.vreg("v_scale_voff_a")
+            for ki2 in range(self._ki_count):
+                name = self._scale_a_names.get((mi, ki2))
+                if name is None:
+                    continue
+                soff = ctx.sreg(f"s_soff_sa_{mi}") if mi > 0 else "0"
+                k_off = ki2 * 4
+                off_str = f"offen offset:{k_off}" if k_off > 0 else "offen"
+                ctx.inst("buffer_load_dword",
+                         ctx.vreg(name), voff, srd, soff, off_str,
+                         comment=f"scale A m{mi} k{ki2}")
+                name2 = self._scale_a_names.get((mi + 1, ki2))
+                if name2 and name2 != name:
+                    soff2 = ctx.sreg(f"s_soff_sa_{mi+1}")
+                    ctx.inst("buffer_load_dword",
+                             ctx.vreg(name2), voff, srd, soff2, off_str,
+                             comment=f"scale A m{mi+1} k{ki2}")
 
     def emit_read_b(self, ni: int, ki: int) -> None:
         """Emit buffer_load_dword for scale B at (ni, ki)."""
         if ni % 2 != 0:
             return
         ctx = self._ctx
-        voff = ctx.vreg("v_scale_voff_b")
         srd = ctx.sreg("s_srd_scale_b", 0, 4)
+
+        if self._swizzled:
+            voff = ctx.vreg("v_dtl_off_scale_b")
+            ni_per_wave = self._nr // 2  # waves_n = 2
+            group = (ni % ni_per_wave) // 2
+            soff = ctx.sreg(f"s_scale_soff_b{group}")
+            name = self._scale_b_names.get((ni, 0))
+            if name:
+                ctx.inst("buffer_load_dword",
+                         ctx.vreg(name), voff, srd, soff, "offen",
+                         comment=f"scale B group{group} (n{ni}-n{ni+1})")
+            return
+
+        voff = ctx.vreg("v_scale_voff_b")
         for ki2 in range(self._ki_count):
             name = self._scale_b_names.get((ni, ki2))
             if name is None:
