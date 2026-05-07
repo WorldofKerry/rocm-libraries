@@ -437,7 +437,7 @@ class PipelineEmitter:
 
         # Split at ~60% of MFMAs: first part is pure consume,
         # second part interleaves global loads
-        split_mfma = int(total_mfmas * 0.50)
+        split_mfma = int(total_mfmas * 0.25)
         if split_mfma < 1:
             split_mfma = total_mfmas
         split_pos = consumer_mfma_indices[split_mfma - 1] + 1 if split_mfma > 0 else producer_start
