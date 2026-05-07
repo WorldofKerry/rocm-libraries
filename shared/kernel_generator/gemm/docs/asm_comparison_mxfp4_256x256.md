@@ -172,3 +172,36 @@ Interleaving alone has no measurable impact (bottleneck is VMEM scale bandwidth)
 1. **8 VMEM scale loads per copy** -- contends with DTL loads on VMEM port
 2. **32-MFMA streak** -- caused by A ping-pong WAR deps; subtile has max 10
 3. **1 barrier per copy** vs subtile's 2 -- less overlap between compute and loads
+
+## Final Results (all optimizations applied)
+
+| Step | Time (us) | vs Subtile | Speedup |
+|---|---|---|---|
+| Baseline | 92.4 | 0.46x | -- |
+| P0: op_sel scales (32->8 loads) | 55.8 | 0.76x | 1.66x |
+| P2: Double-copy (256 MFMAs/body) | 56.6 | 0.75x | +0x |
+| True DTL for scales (0 VMEM) | 56.6 | 0.75x | +0x |
+| Coarse producer interleave | 51.9 | 0.81x | 1.09x |
+| Fine per-line DTL interleave | **49.0** | **0.86x** | 1.06x |
+| **Total** | **49.0** | **0.86x** | **1.88x** |
+| Subtile (target) | 42.2 | 1.0x | -- |
+
+### Architecture match
+| Metric | Our kernel | Subtile |
+|---|---|---|
+| MFMAs/body | 256 | 256 |
+| VMEM scale loads | 0 | 0 |
+| Scale DTL loads | 4 | 4 |
+| Data DTL loads | 32 | 32 |
+| ds_read_b128 | 64 | 64 |
+| ds_read_b32 (scales) | 16 | 16 |
+| op_sel MFMAs | 256 | 256 |
+| Barriers/body | 2 | 4 |
+| Max MFMA streak | 16 | 10 |
+| LDS | 147 KB | 144 KB |
+| VGPRs | 424 | 512 |
+
+### Remaining 1.16x gap
+- Max MFMA streak: 16 (ours) vs 10 (subtile)
+- Subtile has 4 barriers/body (2 per copy) vs our 2
+- Subtile's finer interleaving hides more latency
