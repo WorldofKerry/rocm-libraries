@@ -132,35 +132,8 @@ class PipelineScheduler:
             body: List[KLoopOp] = []
             if barrier_op:
                 body.append(barrier_op)
-            # Interleave producers among consumer MFMAs.
-            # Find MFMA positions in sorted_consumers, then spread
-            # producers evenly across the second half of MFMAs.
-            mfma_indices = [i for i, op in enumerate(sorted_consumers)
-                            if op.kind == OpKind.MFMA]
-            if mfma_indices and sorted_producers:
-                # Place producers in the back half of MFMAs so reads
-                # in the front half have time to complete first.
-                n_mfma = len(mfma_indices)
-                n_prod = len(sorted_producers)
-                # Start interleaving after 1/3 of MFMAs
-                start_mfma = n_mfma // 3
-                avail_slots = n_mfma - start_mfma
-                stride = max(avail_slots // n_prod, 1)
-                # Map each producer to an MFMA index (insert after)
-                insert_after: Dict[int, List[KLoopOp]] = {}
-                for pi, prod in enumerate(sorted_producers):
-                    slot = start_mfma + pi * stride
-                    slot = min(slot, n_mfma - 1)
-                    mfma_pos = mfma_indices[slot]
-                    insert_after.setdefault(mfma_pos, []).append(prod)
-                # Build body with interleaved producers
-                for ci, cop in enumerate(sorted_consumers):
-                    body.append(cop)
-                    for p in insert_after.get(ci, []):
-                        body.append(p)
-            else:
-                body.extend(sorted_consumers)
-                body.extend(sorted_producers)
+            body.extend(sorted_consumers)
+            body.extend(sorted_producers)
         else:
             # produce-first: pre_body → producers → barrier → rest
             body = list(pre_body) + list(sorted_producers)
@@ -232,12 +205,7 @@ class PipelineScheduler:
 
     def _sort_consumers(self, consumers: List[KLoopOp],
                         g: KLoopGraph) -> List[KLoopOp]:
-        """Schedule consumer ops with reads interleaved among MFMAs.
-
-        Each read is placed DS_READ_LEAD MFMAs before the first MFMA
-        that consumes it, keeping the MFMA pipeline continuously fed
-        while overlapping LDS read latency.
-        """
+        """Sort consumer ops: reads → MFMAs → suffix."""
 
         reads: List[KLoopOp] = []
         mfmas: List[KLoopOp] = []
@@ -251,7 +219,7 @@ class PipelineScheduler:
             else:
                 suffix.append(op)
 
-        # MFMAs: canonical order (mi, ki, ni).
+        # MFMAs: canonical order (m, ki, ni) — matches existing scheduler.
         tile = g.tile
         mr = tile.mfma_m_repeat
         nr = tile.mfma_n_repeat
@@ -266,7 +234,8 @@ class PipelineScheduler:
                     if name in mfma_by_name:
                         mfma_order.append(mfma_by_name[name])
 
-        # Build read dependency maps.
+        # Reads: schedule each read before the first MFMA that needs it.
+        # Build a map: read_name → earliest MFMA position that depends on it.
         mfma_positions = {op.name: i for i, op in enumerate(mfma_order)}
         read_earliest: Dict[str, int] = {}
         for dep in g.deps:
@@ -276,6 +245,8 @@ class PipelineScheduler:
                     cur = read_earliest.get(dep.producer, len(mfma_order))
                     read_earliest[dep.producer] = min(cur, pos)
 
+        # Also handle reads with WAR deps (ping-pong):
+        # read must come after the WAR-dep MFMA.
         read_war_after: Dict[str, int] = {}
         for dep in g.deps:
             if dep.kind == DepKind.WAR and dep.consumer in {r.name for r in reads}:
@@ -284,37 +255,50 @@ class PipelineScheduler:
                     cur = read_war_after.get(dep.consumer, -1)
                     read_war_after[dep.consumer] = max(cur, pos)
 
-        # Compute placement position for each read:
-        #   place = max(war_after + 1, deadline - LEAD)
-        # where deadline is the first MFMA consuming it.
-        DS_READ_LEAD = 5  # issue read this many MFMAs before deadline
+        # Three-phase read placement matching v1 pattern:
+        # 1. Early preamble: reads consumed by first MFMAs (urgent)
+        # 2. Late preamble: remaining non-WAR reads (less urgent,
+        #    issued in bulk, gives LDS pipeline time to drain early)
+        # 3. Interleaved: WAR-constrained reads after WAR MFMA
+        #
+        # The split between early/late is at nr*ki_count MFMAs
+        # (one subtile of B reads). This matches v1's pre_body +
+        # preamble split where B ki=0 is issued first, then A+B ki=1.
+        DS_READ_LEAD = 5
+        mfmas_per_mi = nr * ki_count  # MFMAs per mi group
 
-        read_placements: List[tuple] = []  # (place_pos, deadline, read_op)
+        early_preamble: List[KLoopOp] = []
+        late_preamble: List[KLoopOp] = []
+        interleaved: List[tuple] = []
+
         for r in reads:
             war_pos = read_war_after.get(r.name, -1)
-            deadline = read_earliest.get(r.name, len(mfma_order))
-            earliest_start = war_pos + 1 if war_pos >= 0 else 0
-            place = max(earliest_start, deadline - DS_READ_LEAD)
-            place = min(place, deadline)  # can't place after deadline
-            read_placements.append((place, deadline, r))
+            target = read_earliest.get(r.name, 0)
+            if war_pos >= 0:
+                interleaved.append((war_pos, r))
+            elif target < mfmas_per_mi:
+                # Consumed in first subtile: urgent
+                early_preamble.append(r)
+            else:
+                # Consumed later: can go in late preamble
+                late_preamble.append(r)
 
-        # Sort by placement position, then deadline (most urgent first)
-        read_placements.sort(key=lambda x: (x[0], x[1], x[2].name))
+        # Sort by urgency
+        early_preamble.sort(key=lambda r: (read_earliest.get(r.name, 999), r.name))
+        late_preamble.sort(key=lambda r: (read_earliest.get(r.name, 999), r.name))
+        interleaved.sort(key=lambda x: (x[0], read_earliest.get(x[1].name, 999)))
 
-        # Group reads by the MFMA position they should precede
-        reads_before: Dict[int, List[KLoopOp]] = {}
-        for place, _deadline, r in read_placements:
-            reads_before.setdefault(place, []).append(r)
+        # Group interleaved reads by target MFMA position
+        reads_after: Dict[int, List[KLoopOp]] = {}
+        for pos, r in interleaved:
+            reads_after.setdefault(pos, []).append(r)
 
-        # Build interleaved result
-        result: List[KLoopOp] = []
+        # Build result: early preamble, late preamble, MFMA + interleaved
+        result: List[KLoopOp] = list(early_preamble) + list(late_preamble)
         for i, mfma_op in enumerate(mfma_order):
-            for r in reads_before.get(i, []):
-                result.append(r)
             result.append(mfma_op)
-        # Any reads targeting past the last MFMA
-        for r in reads_before.get(len(mfma_order), []):
-            result.append(r)
+            for r in reads_after.get(i, []):
+                result.append(r)
         result.extend(suffix)
         return result
 
