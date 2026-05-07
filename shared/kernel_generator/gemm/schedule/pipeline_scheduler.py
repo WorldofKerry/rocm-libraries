@@ -54,6 +54,12 @@ class ScheduledPipeline:
     pre_body_count: int = 0
     """Number of ops at the start of *body* that go before the skip check."""
 
+    ki_phased: bool = False
+    """If True, consumers are sorted ki-first with a mid-copy barrier."""
+
+    ki_phase_split: int = 0
+    """Body position of the first ki=1 MFMA (divides ki=0 from ki=1)."""
+
     # ── helpers ────────────────────────────────────────────────────
 
     @property
@@ -79,8 +85,9 @@ class PipelineScheduler:
         pipeline = PipelineScheduler(graph).schedule()
     """
 
-    def __init__(self, graph: KLoopGraph) -> None:
+    def __init__(self, graph: KLoopGraph, *, ki_phased: bool = False) -> None:
         self.graph = graph
+        self.ki_phased = ki_phased
 
     # ── public ────────────────────────────────────────────────────
 
@@ -99,12 +106,16 @@ class PipelineScheduler:
         # Determine body order from distances.
         is_consume_first = pgr >= 2
 
+        ki_count = g.tile.k_iterations
+
         # Sort producers following ORDER/RAW chains.
         sorted_producers = self._topo_sort(producers, g)
 
-        # Sort consumers: ds_reads before MFMAs, MFMAs in canonical
-        # order, suffix (toggle_rd) last.
-        sorted_consumers = self._sort_consumers(consumers, g)
+        # Sort consumers: ki-phased or standard interleaving.
+        if self.ki_phased and ki_count > 1:
+            sorted_consumers = self._sort_consumers_ki_phased(consumers, g)
+        else:
+            sorted_consumers = self._sort_consumers(consumers, g)
 
         # ── Pre-body split (produce-first only) ─────────────────
         # B data reads for ki=0 with no WAR deps go before the
@@ -162,6 +173,14 @@ class PipelineScheduler:
         # min_cycles; for now fall back to 2.
         num_buffers = max(war_dists) if war_dists else 2
 
+        # Ki-phase split: index of first ki=1 MFMA in body
+        ki_split = 0
+        if self.ki_phased and ki_count > 1:
+            for i, op in enumerate(body):
+                if op.kind == OpKind.MFMA and '_k1' in op.name:
+                    ki_split = i
+                    break
+
         return ScheduledPipeline(
             ramp_up=ramp_up,
             body=body,
@@ -172,6 +191,8 @@ class PipelineScheduler:
             num_buffers=num_buffers,
             is_consume_first=is_consume_first,
             pre_body_count=pre_body_count,
+            ki_phased=self.ki_phased and ki_count > 1,
+            ki_phase_split=ki_split,
         )
 
     # ── private helpers ───────────────────────────────────────────
@@ -289,6 +310,85 @@ class PipelineScheduler:
             # Reads placed after MFMA at position i (targeting i+1)
             for r in reads_at_pos.get(i + 1, []):
                 result.append(r)
+        result.extend(suffix)
+        return result
+
+
+    def _sort_consumers_ki_phased(
+        self, consumers: List[KLoopOp], g: KLoopGraph,
+    ) -> List[KLoopOp]:
+        """Sort consumers with ki-phased ordering.
+
+        All ki=0 MFMAs first (with ki=1 reads interleaved), then
+        all ki=1 MFMAs.  A single lgkmcnt(0) at the ki boundary
+        drains all ki=1 reads, eliminating per-MFMA waitcnts.
+
+        ki=0 reads + scale reads go at position 0 (before any MFMA).
+        ki=1 reads are interleaved among ki=0 MFMAs.
+        """
+        tile = g.tile
+        mr = tile.mfma_m_repeat
+        nr = tile.mfma_n_repeat
+        ki_count = tile.k_iterations
+
+        reads: List[KLoopOp] = []
+        mfmas: List[KLoopOp] = []
+        suffix: List[KLoopOp] = []
+
+        for op in consumers:
+            if op.kind == OpKind.DS_READ:
+                reads.append(op)
+            elif op.kind == OpKind.MFMA:
+                mfmas.append(op)
+            else:
+                suffix.append(op)
+
+        mfma_by_name = {op.name: op for op in mfmas}
+
+        # Build ki-phased MFMA order: all ki=0 first, then all ki=1
+        ki0_mfmas: List[KLoopOp] = []
+        ki1_mfmas: List[KLoopOp] = []
+        for ki in range(ki_count):
+            for mi in range(mr):
+                for ni in range(nr):
+                    name = f"mfma_m{mi}_n{ni}_k{ki}"
+                    if name in mfma_by_name:
+                        if ki == 0:
+                            ki0_mfmas.append(mfma_by_name[name])
+                        else:
+                            ki1_mfmas.append(mfma_by_name[name])
+
+        # Partition reads by ki value
+        ki0_reads: List[KLoopOp] = []
+        ki1_reads: List[KLoopOp] = []
+        for r in reads:
+            if '_k1' in r.name:
+                ki1_reads.append(r)
+            else:
+                ki0_reads.append(r)
+
+        # Result: ki=0 reads, ki=0 MFMAs with ki=1 reads interleaved,
+        # ki=1 MFMAs, suffix ops
+        result: List[KLoopOp] = list(ki0_reads)
+
+        # Interleave ki=1 reads among ki=0 MFMAs
+        n_ki0 = len(ki0_mfmas)
+        n_ki1_reads = len(ki1_reads)
+        if n_ki1_reads > 0 and n_ki0 > 0:
+            interval = max(1, n_ki0 // (n_ki1_reads + 1))
+            read_idx = 0
+            for i, mfma_op in enumerate(ki0_mfmas):
+                result.append(mfma_op)
+                if (i + 1) % interval == 0 and read_idx < n_ki1_reads:
+                    result.append(ki1_reads[read_idx])
+                    read_idx += 1
+            while read_idx < n_ki1_reads:
+                result.append(ki1_reads[read_idx])
+                read_idx += 1
+        else:
+            result.extend(ki0_mfmas)
+
+        result.extend(ki1_mfmas)
         result.extend(suffix)
         return result
 

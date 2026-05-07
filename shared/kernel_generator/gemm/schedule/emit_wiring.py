@@ -95,7 +95,7 @@ def wire_emit_callbacks(
             # read_data_a_m{mi}_k{ki}
             parts = op_name.replace("read_data_a_m", "").replace("_k", " ").split()
             mi, ki = int(parts[0]), int(parts[1])
-            buf = mi % 2  # ping-pong buffer index
+            buf = mi % reader.num_a_buffers  # ping-pong buffer index
             op.emit = lambda mi=mi, ki=ki, buf=buf: reader.emit_read_a(mi, ki, buf)
 
         elif op_name.startswith("read_data_b_"):
@@ -123,7 +123,7 @@ def wire_emit_callbacks(
             # mfma_m{mi}_n{ni}_k{ki}
             parts = op_name.replace("mfma_m", "").replace("_n", " ").replace("_k", " ").split()
             mi, ni, ki = int(parts[0]), int(parts[1]), int(parts[2])
-            buf = mi % 2
+            buf = mi % reader.num_a_buffers
             a_names = reader.a_names
             b_names = reader.b_names
             a_reg = ctx.vreg(a_names[(buf, ki)])

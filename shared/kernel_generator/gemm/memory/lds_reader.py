@@ -81,6 +81,8 @@ class LDSReader:
         self.av = av
         self.bv = bv
 
+        # Number of A ping-pong buffers (2 = classic, mr = ki-phased)
+        self.num_a_buffers = 2
         # Resolve swizzle
         if swizzle is not None:
             self._swizzle = swizzle
@@ -117,12 +119,23 @@ class LDSReader:
                 self.b_names[(ni, ki)] = name
 
         self.a_names = {}
-        for buf in range(2):
+        for buf in range(self.num_a_buffers):
             for ki in range(ki_count):
                 name = f"v_a_b{buf}k{ki}"
                 if not ctx.has(name):
                     ctx.alloc_vgpr_permanent(av, name)
                 self.a_names[(buf, ki)] = name
+
+    def set_num_a_buffers(self, n: int) -> None:
+        """Expand A buffer count (e.g. from 2 to mr for ki-phased)."""
+        ctx = self.ctx
+        for buf in range(self.num_a_buffers, n):
+            for ki in range(self.ki_count):
+                name = f"v_a_b{buf}k{ki}"
+                if not ctx.has(name):
+                    ctx.alloc_vgpr_permanent(self.av, name)
+                self.a_names[(buf, ki)] = name
+        self.num_a_buffers = n
 
     def emit_read_a(self, mi: int, ki: int, buf: int) -> None:
         """Emit ds_read for A operand at (mi, ki) into buffer buf."""

@@ -461,8 +461,17 @@ def pipeline_v2_kloop_phase(level: TileLevel, ctx: AsmContext) -> None:
     buffer_mgr = LDSBufferManager(streams, num_buffers=num_buffers)
     buffer_mgr.compute_layout()
 
+    # Enable ki-phased scheduling for double-copy (PGR>=2, ki>1)
+    ki_phased = pgr >= 2 and tile.k_iterations > 1
+    mr = tile.mfma_m_repeat
+
+    # For ki-phased: use mr A buffers (no ping-pong WAR deps)
+    a_buf_count = mr if ki_phased else num_buffers
+    if ki_phased:
+        reader.set_num_a_buffers(mr)
+
     graph = build_kloop_graph(streams, tile, pgr=pgr,
-                              num_buffers=num_buffers, problem=problem)
+                              num_buffers=a_buf_count, problem=problem)
 
     # Setup: soffsets, swizzle (must happen before MFMAEmitter
     # creation so scale_names are populated)
@@ -485,7 +494,7 @@ def pipeline_v2_kloop_phase(level: TileLevel, ctx: AsmContext) -> None:
     wire_emit_callbacks(graph, streams, buffer_mgr, loader, reader,
                         emitter, ctx, scale_loader=scale_loader)
 
-    scheduled = PipelineScheduler(graph).schedule()
+    scheduled = PipelineScheduler(graph, ki_phased=ki_phased).schedule()
 
     ctx.alloc_sgpr_permanent(1, "s_lds_db_step")
     lds_half_total = mainloop.lds_half_total(tile)

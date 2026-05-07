@@ -269,18 +269,34 @@ class PipelineEmitter:
                 break
 
         if self.double_copy:
-            # -- Double-copy with interleaved producers -------------
-            ctx.comment("=== Copy C0 ===")
-            self._emit_copy_interleaved(
-                body, producer_start, waitcnts,
-                skip_label="load_skip_all", pgr=pgr, copy_tag="C0")
-            ctx.raw("")
+            if self.pipeline.ki_phased:
+                # -- Ki-phased double-copy --------------------------
+                ctx.comment("=== Copy C0 (ki-phased) ===")
+                self._emit_copy_ki_phased(
+                    body, producer_start, waitcnts,
+                    skip_label="load_skip_all", pgr=pgr, copy_tag="C0",
+                    is_first_copy=True)
+                ctx.raw("")
 
-            ctx.comment("=== Copy C1 ===")
-            self._emit_copy_interleaved(
-                body, producer_start, waitcnts,
-                skip_label="load_skip_c1", pgr=pgr, copy_tag="C1")
-            ctx.raw("")
+                ctx.comment("=== Copy C1 (ki-phased) ===")
+                self._emit_copy_ki_phased(
+                    body, producer_start, waitcnts,
+                    skip_label="load_skip_c1", pgr=pgr, copy_tag="C1",
+                    is_first_copy=False)
+                ctx.raw("")
+            else:
+                # -- Standard interleaved double-copy ---------------
+                ctx.comment("=== Copy C0 ===")
+                self._emit_copy_interleaved(
+                    body, producer_start, waitcnts,
+                    skip_label="load_skip_all", pgr=pgr, copy_tag="C0")
+                ctx.raw("")
+
+                ctx.comment("=== Copy C1 ===")
+                self._emit_copy_interleaved(
+                    body, producer_start, waitcnts,
+                    skip_label="load_skip_c1", pgr=pgr, copy_tag="C1")
+                ctx.raw("")
 
             # C1 skip target + loop tail
             ctx.label("load_skip_c1")
@@ -552,6 +568,173 @@ class PipelineEmitter:
                 self._emit_op(op)
             for op in load_prods:
                 self._emit_op(op)
+
+
+
+    def _emit_copy_ki_phased(
+        self, body: List[KLoopOp], producer_start: int,
+        waitcnts: dict, skip_label: str, pgr: int,
+        copy_tag: str, is_first_copy: bool,
+    ) -> None:
+        """Emit one copy with ki-phased 2-barrier structure.
+
+        Structure per copy (2 barriers, 4 waitcnts):
+          1. vmcnt(0) + lgkmcnt(0) + s_barrier  (sync DTL from prev)
+          2. ki=0 reads (data+scale) + lgkmcnt(0)  (drain ki=0 reads)
+          3. ki=0 MFMAs with ki=1 reads interleaved
+          4. lgkmcnt(0) + s_barrier  (mid-copy: drain ki=1 reads)
+          5. ki=1 MFMAs with DTL loads interleaved + skip-check
+
+        The next copy's step 1 barrier also serves as this copy's
+        end-of-DTL sync.
+        """
+        ctx = self.ctx
+        pipeline = self.pipeline
+
+        # Classify consumer ops
+        consumers = [body[i] for i in range(producer_start)]
+        producers = [body[i] for i in range(producer_start, len(body))]
+
+        barrier_op = None
+        ki0_reads = []
+        ki1_reads = []
+        ki0_mfmas = []
+        ki1_mfmas = []
+        suffix_ops = []
+
+        for op in consumers:
+            if op.kind == OpKind.BARRIER:
+                barrier_op = op
+            elif op.kind == OpKind.DS_READ:
+                if '_k1' in op.name:
+                    ki1_reads.append(op)
+                else:
+                    ki0_reads.append(op)
+            elif op.kind == OpKind.MFMA:
+                if '_k1' in op.name:
+                    ki1_mfmas.append(op)
+                else:
+                    ki0_mfmas.append(op)
+            else:
+                suffix_ops.append(op)
+
+        # Separate producers
+        scalar_prods = [op for op in producers if op.kind == OpKind.SCALAR]
+        load_prods = [op for op in producers if op.kind == OpKind.GLOBAL_LOAD]
+
+        # ── Step 1: barrier (sync DTL from prev copy) ────────────
+        ctx.s_waitcnt("vmcnt(0)", comment=f"wait DTL loads ({copy_tag})")
+        ctx.s_waitcnt("lgkmcnt(0)", comment=f"wait LDS ops ({copy_tag})")
+        if barrier_op:
+            self._emit_op(barrier_op)
+
+        # ── Step 2: ki=0 reads + drain ───────────────────────────
+        ctx.comment(f"ki=0 reads ({len(ki0_reads)} ops)")
+        for r in ki0_reads:
+            self._emit_op(r)
+        if ki0_reads:
+            ctx.s_waitcnt("lgkmcnt(0)", comment="drain ki=0 reads")
+
+        # ── Step 3: ki=0 MFMAs + ki=1 reads interleaved ─────────
+        n_ki0 = len(ki0_mfmas)
+        n_ki1_reads = len(ki1_reads)
+        interval = max(1, n_ki0 // (n_ki1_reads + 1)) if n_ki1_reads > 0 else n_ki0 + 1
+        read_idx = 0
+
+        ctx.comment(f"ki=0 MFMAs ({n_ki0}) + ki=1 reads ({n_ki1_reads})")
+        for i, mfma_op in enumerate(ki0_mfmas):
+            self._emit_op(mfma_op)
+            if (i + 1) % interval == 0 and read_idx < n_ki1_reads:
+                self._emit_op(ki1_reads[read_idx])
+                read_idx += 1
+        while read_idx < n_ki1_reads:
+            self._emit_op(ki1_reads[read_idx])
+            read_idx += 1
+
+        # ── Step 4: mid-copy barrier (drain ki=1 reads) ──────────
+        ctx.s_waitcnt("lgkmcnt(0)", comment="drain ki=1 reads")
+        ctx.s_barrier(comment=f"mid-copy barrier ({copy_tag})")
+
+        # ── Step 5: skip-check + ki=1 MFMAs + DTL loads ─────────
+        ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
+                  comment=f"k_tiles-- ({copy_tag})")
+        ctx.inst("s_cmp_gt_u32", ctx.sreg("s_k_tiles"),
+                 str(pgr - 1),
+                 comment=f"k_tiles > {pgr - 1}? ({copy_tag})")
+        ctx.inst("s_cbranch_scc0", skip_label,
+                 comment=f"skip {copy_tag} producers (drain)")
+
+        self.buffer_mgr.emit_negate_step(ctx)
+
+        # Scalar producers (advance SRDs, toggle write ptrs)
+        for op in scalar_prods:
+            self._emit_op(op)
+
+        # ki=1 MFMAs with DTL loads interleaved
+        loader = ctx._metadata.get("_dtl_loader")
+        n_ki1 = len(ki1_mfmas)
+
+        if loader and n_ki1 >= 4 and hasattr(loader, 'emit_dtl_load_a_single'):
+            dtl_seq = []
+            for op in load_prods:
+                if 'scale' in op.name:
+                    dtl_seq.append(('scale_op', op))
+            n_a = loader.num_loads_a
+            n_b = loader.num_loads_b
+            for j in range(max(n_a, n_b)):
+                if j < n_a:
+                    dtl_seq.append(('dtl_a', j))
+                if j < n_b:
+                    dtl_seq.append(('dtl_b', j))
+
+            total_loads = len(dtl_seq)
+            dtl_interval = max(1, n_ki1 // (total_loads + 1))
+            load_idx = 0
+            m0_a_set = False
+            m0_b_set = False
+
+            ctx.comment(f"ki=1 MFMAs ({n_ki1}) + DTL ({total_loads})")
+            for i, mfma_op in enumerate(ki1_mfmas):
+                self._emit_op(mfma_op)
+                if (i + 1) % dtl_interval == 0 and load_idx < total_loads:
+                    kind, payload = dtl_seq[load_idx]
+                    if kind == 'scale_op':
+                        self._emit_op(payload)
+                    elif kind == 'dtl_a':
+                        if not m0_a_set:
+                            loader.emit_dtl_m0_a()
+                            m0_a_set = True
+                        loader.emit_dtl_load_a_single(payload)
+                    elif kind == 'dtl_b':
+                        if not m0_b_set:
+                            loader.emit_dtl_m0_b()
+                            m0_b_set = True
+                        loader.emit_dtl_load_b_single(payload)
+                    load_idx += 1
+            while load_idx < total_loads:
+                kind, payload = dtl_seq[load_idx]
+                if kind == 'scale_op':
+                    self._emit_op(payload)
+                elif kind == 'dtl_a':
+                    if not m0_a_set:
+                        loader.emit_dtl_m0_a()
+                        m0_a_set = True
+                    loader.emit_dtl_load_a_single(payload)
+                elif kind == 'dtl_b':
+                    if not m0_b_set:
+                        loader.emit_dtl_m0_b()
+                        m0_b_set = True
+                    loader.emit_dtl_load_b_single(payload)
+                load_idx += 1
+        else:
+            for mfma_op in ki1_mfmas:
+                self._emit_op(mfma_op)
+            for op in load_prods:
+                self._emit_op(op)
+
+        # Suffix ops (toggle_rd)
+        for op in suffix_ops:
+            self._emit_op(op)
 
 
     def _emit_op(self, op: KLoopOp) -> None:

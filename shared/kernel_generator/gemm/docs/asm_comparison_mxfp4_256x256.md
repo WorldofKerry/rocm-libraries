@@ -205,3 +205,48 @@ Interleaving alone has no measurable impact (bottleneck is VMEM scale bandwidth)
 - Max MFMA streak: 16 (ours) vs 10 (subtile)
 - Subtile has 4 barriers/body (2 per copy) vs our 2
 - Subtile's finer interleaving hides more latency
+
+## Current Baseline (established 2026-05-07)
+
+**47.6 us at 4096x4096x4096 MXFP4 on gfx950 (GPU 6)**
+
+Measured via GFA tensilelite-client, 20 iterations, median of warm samples.
+
+| Metric | Value |
+|---|---|
+| Time | 47.6 us |
+| GFLOPS | 5,774,000 |
+| vs Subtile (42.2 us) | 0.88x (1.13x gap) |
+| vs Old Baseline (92.4 us) | 1.94x speedup |
+
+### Kernel configuration
+- 256x256 macro tile, DepthU=256, PGR=2, double-copy
+- 256 MFMAs per loop body (128 per copy x 2 copies)
+- 0 VMEM scale loads (true DTL to LDS)
+- 4 scale DTL + 32 data DTL per body
+- 16 scale ds_read_b32 + 64 data ds_read_b128 per body
+- op_sel/op_sel_hi on all MFMAs
+- Max MFMA streak: 8
+- 58 waitcnts per body (fine-grained lgkmcnt)
+- 2 barriers per body
+- 147 KB LDS, 424 VGPRs, 76 SGPRs
+
+### Optimization history
+| Step | Time (us) | Speedup |
+|---|---|---|
+| Baseline (32 VMEM scale loads, bulk scheduling) | 92.4 | 1.0x |
+| P0: op_sel byte packing (32->8 scale loads) | 55.8 | 1.66x |
+| Coarse producer interleaving | 51.9 | 1.78x |
+| Fine per-line DTL interleaving | 49.0 | 1.89x |
+| 25% split (max streak 8) | 47.6 | 1.94x |
+
+Note: P1 (ds_read interleaving), P2 (double-copy 256 MFMAs), and
+true DTL for scales contributed no solo perf improvement but are
+architecturally correct and enable the interleaving optimizations.
+
+### Attempted but not beneficial
+- Batch-based scheduling (coarse lgkmcnt(0)): 50.5 us (6% slower)
+  - Reduces waitcnts 58->8 but increases max streak 8->19
+  - MFMA stalls from long streaks cost more than waitcnt overhead
+- DS_READ_LEAD=8/12: no measurable impact
+- 12.5% split: 47.8 us (worse streaks due to loads running out early)
