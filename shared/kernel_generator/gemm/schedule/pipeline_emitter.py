@@ -269,37 +269,17 @@ class PipelineEmitter:
                 break
 
         if self.double_copy:
-            # -- Double-copy: C0 then C1 per iteration -------------
-            # C0: barrier -> consumers -> skip -> negate -> producers
+            # -- Double-copy with interleaved producers -------------
             ctx.comment("=== Copy C0 ===")
-            self._emit_copy_consumers(body, producer_start, waitcnts)
-
-            ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
-                      comment="k_tiles-- (C0)")
-            ctx.inst("s_cmp_gt_u32", ctx.sreg("s_k_tiles"),
-                     str(pgr - 1),
-                     comment=f"k_tiles > {pgr - 1}? (C0)")
-            ctx.inst("s_cbranch_scc0", "load_skip_all",
-                     comment="skip C0 prods + all of C1 (drain)")
-
-            self.buffer_mgr.emit_negate_step(ctx)
-            self._emit_copy_producers(body, producer_start, waitcnts)
+            self._emit_copy_interleaved(
+                body, producer_start, waitcnts,
+                skip_label="load_skip_all", pgr=pgr, copy_tag="C0")
             ctx.raw("")
 
-            # C1: barrier -> consumers -> skip -> negate -> producers
             ctx.comment("=== Copy C1 ===")
-            self._emit_copy_consumers(body, producer_start, waitcnts)
-
-            ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
-                      comment="k_tiles-- (C1)")
-            ctx.inst("s_cmp_gt_u32", ctx.sreg("s_k_tiles"),
-                     str(pgr - 1),
-                     comment=f"k_tiles > {pgr - 1}? (C1)")
-            ctx.inst("s_cbranch_scc0", "load_skip_c1",
-                     comment="skip C1 producers (drain)")
-
-            self.buffer_mgr.emit_negate_step(ctx)
-            self._emit_copy_producers(body, producer_start, waitcnts)
+            self._emit_copy_interleaved(
+                body, producer_start, waitcnts,
+                skip_label="load_skip_c1", pgr=pgr, copy_tag="C1")
             ctx.raw("")
 
             # C1 skip target + loop tail
@@ -423,6 +403,110 @@ class PipelineEmitter:
                 ctx.s_waitcnt(waitcnts[i],
                               comment=f"auto-wait at pos {i}")
             self._emit_op(op)
+
+    def _emit_copy_interleaved(
+        self, body: List[KLoopOp], producer_start: int,
+        waitcnts: dict, skip_label: str, pgr: int,
+        copy_tag: str,
+    ) -> None:
+        """Emit one copy with producers interleaved among later MFMAs.
+
+        Structure:
+          barrier -> first-half consumers -> skip-check -> negate ->
+          scalar producers -> second-half consumers interleaved with
+          global-load producers
+
+        This hides global load latency under MFMA execution instead
+        of batching all loads after all MFMAs.
+        """
+        ctx = self.ctx
+        producers = [body[i] for i in range(producer_start, len(body))]
+
+        # Separate producers into scalar (advance/toggle) and loads
+        scalar_prods = [op for op in producers
+                        if op.kind in (OpKind.SCALAR,)]
+        load_prods = [op for op in producers
+                      if op.kind == OpKind.GLOBAL_LOAD]
+
+        # Find the MFMA midpoint in consumers (where to insert skip-check)
+        consumer_mfma_indices = []
+        for i in range(producer_start):
+            if body[i].kind == OpKind.MFMA:
+                consumer_mfma_indices.append(i)
+        total_mfmas = len(consumer_mfma_indices)
+
+        # Split at ~60% of MFMAs: first part is pure consume,
+        # second part interleaves global loads
+        split_mfma = int(total_mfmas * 0.75)
+        if split_mfma < 1:
+            split_mfma = total_mfmas
+        split_pos = consumer_mfma_indices[split_mfma - 1] + 1 if split_mfma > 0 else producer_start
+
+        # Phase 1: barrier + first-half consumers
+        for i in range(split_pos):
+            op = body[i]
+            if i in waitcnts:
+                ctx.s_waitcnt(waitcnts[i],
+                              comment=f"auto-wait at pos {i}")
+            if op.kind == OpKind.BARRIER:
+                ctx.s_waitcnt("vmcnt(0)",
+                              comment="wait DTL loads from prev iter")
+                ctx.s_waitcnt("lgkmcnt(0)",
+                              comment="wait LDS writes from prev iter")
+            self._emit_op(op)
+
+        # Skip check + negate + scalar producers
+        ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
+                  comment=f"k_tiles-- ({copy_tag})")
+        ctx.inst("s_cmp_gt_u32", ctx.sreg("s_k_tiles"),
+                 str(pgr - 1),
+                 comment=f"k_tiles > {pgr - 1}? ({copy_tag})")
+        ctx.inst("s_cbranch_scc0", skip_label,
+                 comment=f"skip {copy_tag} producers (drain)")
+
+        self.buffer_mgr.emit_negate_step(ctx)
+
+        # Emit scalar producers (advance SRDs, toggle write ptrs)
+        for op in scalar_prods:
+            self._emit_op(op)
+
+        # Phase 2: remaining consumers interleaved with global loads
+        remaining_consumer_count = producer_start - split_pos
+        if load_prods and remaining_consumer_count > 0:
+            # Spread loads evenly among remaining consumers
+            loads_per_gap = max(1, len(load_prods) // max(1, remaining_consumer_count // 8))
+            load_idx = 0
+            mfma_since_load = 0
+
+            for i in range(split_pos, producer_start):
+                op = body[i]
+                if i in waitcnts:
+                    ctx.s_waitcnt(waitcnts[i],
+                                  comment=f"auto-wait at pos {i}")
+                self._emit_op(op)
+
+                if op.kind == OpKind.MFMA:
+                    mfma_since_load += 1
+                    # Insert a load every ~4 MFMAs
+                    if mfma_since_load >= 3 and load_idx < len(load_prods):
+                        self._emit_op(load_prods[load_idx])
+                        load_idx += 1
+                        mfma_since_load = 0
+
+            # Emit any remaining loads
+            while load_idx < len(load_prods):
+                self._emit_op(load_prods[load_idx])
+                load_idx += 1
+        else:
+            # Fallback: emit remaining consumers then all loads
+            for i in range(split_pos, producer_start):
+                op = body[i]
+                if i in waitcnts:
+                    ctx.s_waitcnt(waitcnts[i],
+                                  comment=f"auto-wait at pos {i}")
+                self._emit_op(op)
+            for op in load_prods:
+                self._emit_op(op)
 
     def _emit_op(self, op: KLoopOp) -> None:
         """Emit a single op. Handles None callbacks gracefully."""
