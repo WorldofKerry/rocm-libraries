@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "OperandSlot", "KernargLayout",
-    "FP16_LAYOUT", "BF16_LAYOUT", "MXFP4_LAYOUT",
+    "FP16_LAYOUT", "BF16_LAYOUT", "MXFP4_LAYOUT", "MXFP4_STREAMK_LAYOUT",
     "layout_for",
 ]
 
@@ -139,10 +139,31 @@ MXFP4_LAYOUT = KernargLayout(
     ),
 )
 
+MXFP4_STREAMK_LAYOUT = KernargLayout(
+    name="mxfp4_streamk",
+    kernarg_size=152,
+    element_bytes_numer=1,
+    element_bytes_denom=2,
+    strides_offset=96,
+    scale_block=32,
+    mfma_has_scale_operands=True,
+    colmajor_output_bf16=True,
+    operands=(
+        OperandSlot("D", 32), OperandSlot("C", 40),
+        OperandSlot("A", 48),
+        OperandSlot("ScaleA", 56, is_scale=True, scale_for="A"),
+        OperandSlot("B", 64),
+        OperandSlot("ScaleB", 72, is_scale=True, scale_for="B"),
+        OperandSlot("Workspace", 80),
+        OperandSlot("Flags", 88),
+    ),
+)
+
 _LAYOUT_MAP = {
     "f16": FP16_LAYOUT,
     "bf16": BF16_LAYOUT,
     "mxfp4": MXFP4_LAYOUT,
+    "mxfp4_streamk": MXFP4_STREAMK_LAYOUT,
 }
 
 

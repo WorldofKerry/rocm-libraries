@@ -652,9 +652,12 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
                  comment="scale A ptr (MXSA)")
         ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_scale_b"), karg, str(hdr + 56),
                  comment="scale B ptr (MXSB)")
-        ctx.inst("s_load_dword", ctx.sreg("s_stride_scale_a"), karg, str(hdr + 88),
+        # Scale stride offsets depend on layout (StreamK shifts strides by 16)
+        layout = ctx._metadata.get("layout")
+        stride_base = layout.strides_offset - 16 if (layout and ml and getattr(ml, 'tensilelite_abi', False)) else layout.strides_offset if layout else 80
+        ctx.inst("s_load_dword", ctx.sreg("s_stride_scale_a"), karg, str(stride_base + 24),
                  comment="strideMXSA0")
-        ctx.inst("s_load_dword", ctx.sreg("s_stride_scale_b"), karg, str(hdr + 104),
+        ctx.inst("s_load_dword", ctx.sreg("s_stride_scale_b"), karg, str(stride_base + 40),
                  comment="strideMXSB0")
         ctx.s_waitcnt("lgkmcnt(0)", comment="wait scale kernargs")
         ctx.raw("")

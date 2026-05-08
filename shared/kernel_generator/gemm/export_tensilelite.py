@@ -87,6 +87,22 @@ def _format_mxfp4_custom_kernel(
 ) -> str:
     """Format the complete .s file for an MXFP4 custom kernel."""
     sk_val = 3 if streamk else 0
+    if streamk:
+        return _format_mxfp4_streamk_custom_kernel(
+            kernel_name=kernel_name,
+            body=body,
+            sgpr=sgpr,
+            vgpr=vgpr,
+            agpr=agpr,
+            lds=lds,
+            accum_off=accum_off,
+            unroll_k=unroll_k,
+            waves_m=waves_m,
+            waves_n=waves_n,
+            mr=mr,
+            nr=nr,
+            pgr=pgr,
+        )
     return f""".amdgcn_target "amdgcn-amd-amdhsa--gfx950"
 .text
 .globl {kernel_name}
@@ -303,6 +319,271 @@ amdhsa.kernels:
 
 # ---------------------------------------------------------------------------
 # FP16 custom kernel formatter
+# ---------------------------------------------------------------------------
+
+def _format_mxfp4_streamk_custom_kernel(
+    kernel_name: str,
+    body: str,
+    sgpr: int,
+    vgpr: int,
+    agpr: int,
+    lds: int,
+    accum_off: int,
+    unroll_k: int,
+    waves_m: int,
+    waves_n: int,
+    mr: int,
+    nr: int,
+    pgr: int,
+) -> str:
+    """Format the complete .s file for an MXFP4 StreamK custom kernel."""
+    return f""".amdgcn_target "amdgcn-amd-amdhsa--gfx950"
+.text
+.globl {kernel_name}
+.p2align 8
+.type {kernel_name},@function
+
+{body}
+
+.rodata
+.p2align 6
+.amdhsa_kernel {kernel_name}
+    .amdhsa_group_segment_fixed_size {lds}
+    .amdhsa_private_segment_fixed_size 0
+    .amdhsa_kernarg_size 152
+    .amdhsa_user_sgpr_kernarg_segment_ptr 1
+    .amdhsa_system_sgpr_workgroup_id_x 1
+    .amdhsa_system_sgpr_workgroup_id_y 1
+    .amdhsa_system_vgpr_workitem_id 0
+    .amdhsa_next_free_vgpr {vgpr}
+    .amdhsa_next_free_sgpr {sgpr}
+    .amdhsa_accum_offset {accum_off}
+    .amdhsa_float_denorm_mode_32 3
+    .amdhsa_float_denorm_mode_16_64 3
+.end_amdhsa_kernel
+
+.amdgpu_metadata
+---
+custom.config:
+  InternalSupportParams:
+    KernArgsVersion: 2
+    UseUniversalArgs: false
+    SupportUserGSU: false
+    SupportCustomWGM: false
+    SupportCustomStaggerU: false
+  ProblemType:
+    OperationType: GEMM
+    DataType: F4
+    DestDataType: B
+    ComputeDataType: S
+    HighPrecisionAccumulate: true
+    TransposeA: 1
+    TransposeB: 0
+    UseBeta: true
+    Batched: true
+    MXBlockA: 32
+    MXBlockB: 32
+  MatrixInstruction:
+  - 16
+  - 16
+  - 128
+  - 1
+  MIBlock:
+  - 16
+  - 16
+  - 128
+  - 1
+  - 1
+  - 1
+  MIInputPerThread: 32
+  MIInputPerThreadA: 32
+  MIInputPerThreadB: 32
+  WavefrontSize: 64
+  WorkGroupMapping: 16
+  WorkGroupMappingXCC: 2
+  WorkGroupMappingXCCGroup: -1
+  StaggerU: 0
+  EnableMatrixInstruction: true
+  MIWaveGroup:
+  - {waves_m}
+  - {waves_n}
+  MIWaveTile:
+  - {mr}
+  - {nr}
+  DepthU: {unroll_k}
+  MacroTile:
+  - {waves_m * mr * 16}
+  - {waves_n * nr * 16}
+  DirectToLds: 1
+  LocalReadVectorWidth: -1
+  GlobalReadVectorWidthA: 32
+  GlobalReadVectorWidthB: 32
+  GlobalSplitU: 1
+  GlobalSplitUAlgorithm: MultipleBuffer
+  GlobalSplitUCoalesced: false
+  GlobalSplitUWorkGroupMappingRoundRobin: false
+  PrefetchGlobalRead: {pgr}
+  PrefetchLocalRead: 1
+  StreamK: 3
+  StreamKAtomic: 0
+  StreamKXCCMapping: 0
+  TransposeLDS: 0
+  PreloadKernArgs: False
+  NoReject: true
+  args:
+    - {{ type: address, semantic: AddressWorkspace }}
+    - {{ type: address, semantic: AddressFlags }}
+    - {{ type: uint32, semantic: NumWorkGroups }}
+    - {{ type: uint32, semantic: ItersPerTile }}
+    - {{ type: uint32, semantic: SKItersPerWG }}
+    - {{ type: uint32, semantic: SKGrid }}
+amdhsa.version: [ 1, 1 ]
+amdhsa.kernels:
+  - .name:            {kernel_name}
+    .symbol:          {kernel_name}.kd
+    .sgpr_count:      {sgpr}
+    .vgpr_count:      {vgpr}
+    .agpr_count:      {agpr}
+    .kernarg_segment_size: 152
+    .kernarg_segment_align: 8
+    .group_segment_fixed_size: {lds}
+    .private_segment_fixed_size: 0
+    .wavefront_size:  64
+    .max_flat_workgroup_size: 256
+    .args:
+      - .name:           SizesFree0
+        .offset:         0
+        .size:           4
+        .value_kind:     by_value
+      - .name:           SizesFree1
+        .offset:         4
+        .size:           4
+        .value_kind:     by_value
+      - .name:           SizesFree2
+        .offset:         8
+        .size:           4
+        .value_kind:     by_value
+      - .name:           SizesSum0
+        .offset:         12
+        .size:           4
+        .value_kind:     by_value
+      - .name:           D
+        .offset:         16
+        .size:           8
+        .value_kind:     global_buffer
+        .address_space:  generic
+      - .name:           C
+        .offset:         24
+        .size:           8
+        .value_kind:     global_buffer
+        .address_space:  generic
+      - .name:           A
+        .offset:         32
+        .size:           8
+        .value_kind:     global_buffer
+        .address_space:  generic
+      - .name:           MXSA
+        .offset:         40
+        .size:           8
+        .value_kind:     global_buffer
+        .address_space:  generic
+      - .name:           B
+        .offset:         48
+        .size:           8
+        .value_kind:     global_buffer
+        .address_space:  generic
+      - .name:           MXSB
+        .offset:         56
+        .size:           8
+        .value_kind:     global_buffer
+        .address_space:  generic
+      - .name:           AddressWorkspace
+        .offset:         64
+        .size:           8
+        .value_kind:     global_buffer
+        .address_space:  generic
+      - .name:           AddressFlags
+        .offset:         72
+        .size:           8
+        .value_kind:     global_buffer
+        .address_space:  generic
+      - .name:           strideD0
+        .offset:         80
+        .size:           4
+        .value_kind:     by_value
+      - .name:           strideD1
+        .offset:         84
+        .size:           4
+        .value_kind:     by_value
+      - .name:           strideC0
+        .offset:         88
+        .size:           4
+        .value_kind:     by_value
+      - .name:           strideC1
+        .offset:         92
+        .size:           4
+        .value_kind:     by_value
+      - .name:           strideA0
+        .offset:         96
+        .size:           4
+        .value_kind:     by_value
+      - .name:           strideA1
+        .offset:         100
+        .size:           4
+        .value_kind:     by_value
+      - .name:           strideMXSA0
+        .offset:         104
+        .size:           4
+        .value_kind:     by_value
+      - .name:           strideMXSA1
+        .offset:         108
+        .size:           4
+        .value_kind:     by_value
+      - .name:           strideB0
+        .offset:         112
+        .size:           4
+        .value_kind:     by_value
+      - .name:           strideB1
+        .offset:         116
+        .size:           4
+        .value_kind:     by_value
+      - .name:           strideMXSB0
+        .offset:         120
+        .size:           4
+        .value_kind:     by_value
+      - .name:           strideMXSB1
+        .offset:         124
+        .size:           4
+        .value_kind:     by_value
+      - .name:           alpha
+        .offset:         128
+        .size:           4
+        .value_kind:     by_value
+      - .name:           beta
+        .offset:         132
+        .size:           4
+        .value_kind:     by_value
+      - .name:           NumWorkGroups
+        .offset:         136
+        .size:           4
+        .value_kind:     by_value
+      - .name:           ItersPerTile
+        .offset:         140
+        .size:           4
+        .value_kind:     by_value
+      - .name:           SKItersPerWG
+        .offset:         144
+        .size:           4
+        .value_kind:     by_value
+      - .name:           SKGrid
+        .offset:         148
+        .size:           4
+        .value_kind:     by_value
+...
+.end_amdgpu_metadata
+"""
+
+
 # ---------------------------------------------------------------------------
 
 def _format_fp16_custom_kernel(

@@ -214,7 +214,7 @@ class GemmKernel:
     def emit(self) -> AsmKernel:
         """Generate the full kernel assembly."""
         tile = self.tile
-        layout = layout_for(self.problem.dtype)
+        layout = self.mainloop.layout if self.mainloop else layout_for(self.problem.dtype)
         mainloop = self.mainloop
 
         elem = self.problem.element_bytes

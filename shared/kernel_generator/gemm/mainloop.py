@@ -19,7 +19,7 @@ from typing import Callable, Optional, Type
 
 from .grid import GridDecomposition, Grid2D, Grid1DXCC
 from .kernarg_layout import (
-    KernargLayout, FP16_LAYOUT, BF16_LAYOUT, MXFP4_LAYOUT,
+    KernargLayout, FP16_LAYOUT, BF16_LAYOUT, MXFP4_LAYOUT, MXFP4_STREAMK_LAYOUT,
 )
 from .memory.swizzle import Swizzle, IdentitySwizzle
 from .problem import TileConfig
@@ -300,8 +300,9 @@ def mainloop_mxfp4_tensilelite(
     """
     from .memory.global_loader import DTLLoader
 
+    layout = MXFP4_STREAMK_LAYOUT if streamk else MXFP4_LAYOUT
     return Mainloop(
-        layout=MXFP4_LAYOUT,
+        layout=layout,
         grid=_make_grid(wg_mapping_xcc),
         loader_cls=DTLLoader,
         scale_strategy=LDSScaleStrategy(),
