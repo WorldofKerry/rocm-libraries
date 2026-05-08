@@ -350,7 +350,7 @@ def _format_mxfp4_streamk_custom_kernel(
 .amdhsa_kernel {kernel_name}
     .amdhsa_group_segment_fixed_size {lds}
     .amdhsa_private_segment_fixed_size 0
-    .amdhsa_kernarg_size 152
+    .amdhsa_kernarg_size 156
     .amdhsa_user_sgpr_kernarg_segment_ptr 1
     .amdhsa_system_sgpr_workgroup_id_x 1
     .amdhsa_system_sgpr_workgroup_id_y 1
@@ -437,6 +437,7 @@ custom.config:
     - {{ type: uint32, semantic: ItersPerTile }}
     - {{ type: uint32, semantic: SKItersPerWG }}
     - {{ type: uint32, semantic: SKGrid }}
+    - {{ type: uint32, semantic: SKTilesAndSplit }}
 amdhsa.version: [ 1, 1 ]
 amdhsa.kernels:
   - .name:            {kernel_name}
@@ -577,6 +578,10 @@ amdhsa.kernels:
         .value_kind:     by_value
       - .name:           SKGrid
         .offset:         148
+        .size:           4
+        .value_kind:     by_value
+      - .name:           SKTilesAndSplit
+        .offset:         152
         .size:           4
         .value_kind:     by_value
 ...

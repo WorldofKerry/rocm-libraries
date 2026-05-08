@@ -136,20 +136,29 @@ class StreamKPartitioner(TilePartitioner):
         self.num_cus = num_cus
 
     def emit(self, ctx: AsmContext) -> None:
-        """Emit StreamK work decomposition using TensileLite SK protocol.
+        """Emit Two-Tile StreamK=3 work decomposition.
 
         Reads pre-computed SK scheduling args from kernargs:
           offset 64:  workspace_ptr (u64)
           offset 72:  flags_ptr (u64)
-          offset 136: num_wgs (u32) - total WGs (for tile decomp)
-          offset 140: iters_per_tile (u32)
-          offset 144: sk_iters_per_wg (u32)
-          offset 148: sk_grid (u32)
+          offset 140: iters_per_tile (u32) -- K / unroll_k
+          offset 144: sk_iters_per_wg (u32) -- K iters per SK WG
+          offset 148: sk_grid (u32) -- total WGs launched
+          offset 152: sk_tiles (u32) -- tiles that need K-splitting
 
-        GPU-side computation:
-          If sk_grid == 0: data-parallel mode (full K per WG)
-          Else: compute tile_idx, iter_start, s_k_tiles from
-                wg_serial, sk_iters_per_wg, iters_per_tile.
+        Two-Tile SK=3 dispatch (DP-first):
+          total_tiles = tiles_m * tiles_n
+          dp_tiles = total_tiles - sk_tiles
+          if wg_idx < dp_tiles:
+            DP mode: tile = wg_idx, full K, direct store
+          else:
+            SK mode: compute K-slice from global iteration space
+            sk_idx = wg_idx - dp_tiles
+            global_iter = sk_idx * sk_iters_per_wg (+ extra distribution)
+            tile_idx = dp_tiles + (global_iter / iters_per_tile)
+            local_k_start = global_iter % iters_per_tile
+            s_k_tiles = min(sk_iters_per_wg, iters_per_tile - local_k_start)
+            partial store to workspace + set flag
         """
         tile = ctx._metadata["tile"]
         problem = ctx._metadata["problem"]
@@ -158,7 +167,7 @@ class StreamKPartitioner(TilePartitioner):
         log2_uk = int(math.log2(tile.unroll_k))
         log2_wgm = int(math.log2(tile.wg_m))
 
-        ctx.comment("=== StreamK Work Decomposition ===")
+        ctx.comment("=== StreamK Two-Tile Dispatch ===")
 
         # Allocate persistent SGPRs for epilogue
         karg = ctx.sreg("s_kernarg")
@@ -168,39 +177,30 @@ class StreamKPartitioner(TilePartitioner):
         ctx.alloc_sgpr_permanent(1, "s_partition_idx")
         ctx.alloc_sgpr_permanent(2, "s_flags_ptr")
         ctx.alloc_sgpr_permanent(1, "s_num_partitions")
-        ctx.alloc_sgpr_permanent(1, "s_iters_per_tile")
-        ctx.alloc_sgpr_permanent(1, "s_sk_iters_per_wg")
-        ctx.alloc_sgpr_permanent(1, "s_sk_grid")
 
-        # Load StreamK args from kernargs
+        # Load SK args from kernargs
         ctx.inst("s_load_dwordx2", ctx.sreg("s_workspace_ptr"), karg,
                  "64", comment="workspace ptr")
         ctx.inst("s_load_dwordx2", ctx.sreg("s_flags_ptr"), karg,
                  "72", comment="flags ptr")
+        # Load 4 dwords: iters_per_tile, sk_iters_per_wg, sk_grid, sk_tiles
+        # from offsets 140-155
+        ctx.alloc_sgpr_permanent(1, "s_iters_per_tile")
+        ctx.alloc_sgpr_permanent(1, "s_sk_iters_per_wg")
+        ctx.alloc_sgpr_permanent(1, "s_sk_grid")
+        ctx.alloc_sgpr_permanent(1, "s_sk_tiles")
         ctx.inst("s_load_dword", ctx.sreg("s_iters_per_tile"), karg,
                  "140", comment="iters_per_tile")
         ctx.inst("s_load_dword", ctx.sreg("s_sk_iters_per_wg"), karg,
                  "144", comment="sk_iters_per_wg")
         ctx.inst("s_load_dword", ctx.sreg("s_sk_grid"), karg,
                  "148", comment="sk_grid")
+        ctx.inst("s_load_dword", ctx.sreg("s_sk_tiles"), karg,
+                 "152", comment="sk_tiles")
         ctx.s_waitcnt("lgkmcnt(0)", comment="wait SK kernargs")
         ctx.raw("")
 
-        # Compute total K tiles
-        ctx.s_lshr(ctx.sreg("s_k_tiles"), ctx.sreg("s_K"), log2_uk,
-                   comment=f"k_tiles = K / {tile.unroll_k}")
-
-        # Check if SK is active (sk_grid > 0 means K-splitting)
-        ctx.inst("s_cmp_eq_u32", ctx.sreg("s_sk_grid"), "0",
-                 comment="sk_grid == 0? (data-parallel)")
-        ctx.inst("s_cbranch_scc1", "sk_dp_mode",
-                 comment="pure DP mode")
-        ctx.raw("")
-
-        # ── StreamK mode: compute tile and K-range ───────────
-        ctx.comment("StreamK: derive tile and K-range from WG ID")
-
-        # Total tiles
+        # Compute total tiles and dp_tiles
         ctx.inst("s_lshr_b32", ctx.sreg("s_tmp0"),
                  ctx.sreg("s_M"), str(log2_wgm),
                  comment=f"tiles_m = M / {tile.wg_m}")
@@ -211,57 +211,104 @@ class StreamKPartitioner(TilePartitioner):
         ctx.s_mul(ctx.sreg("s_num_partitions"),
                   ctx.sreg("s_tmp0"), ctx.sreg("s_tmp1"),
                   comment="total_tiles = tiles_m * tiles_n")
-
-        # Derive num_partitions from sk_grid and total_tiles
-        # For SK=3 two-tile: num_partitions = ceil(sk_grid / sk_tiles)
-        # Simpler: num_partitions = k_tiles / sk_iters_per_wg
-        # (approximately -- handles remainder via iter_start)
-        ctx.inst("s_ff1_i32_b32", ctx.sreg("s_tmp0"),
-                 ctx.sreg("s_sk_iters_per_wg"),
-                 comment="log2(sk_iters_per_wg) (approx)")
-
-        # WG serial ID
-        # For StreamK two-tile (SK=3): first total_tiles WGs are DP,
-        # remaining sk_grid WGs are SK.
-        # tile_idx = wg_serial (for DP) or derived from SK iter range
-        ctx.inst("s_cmp_lt_u32", ctx.sreg("s_wg_id_x"),
-                 ctx.sreg("s_num_partitions"),
-                 comment="wg_id < total_tiles? (DP WG)")
-        ctx.inst("s_cbranch_scc1", "sk_dp_mode",
-                 comment="yes -> data-parallel mode")
+        ctx.inst("s_sub_u32", ctx.sreg("s_tmp0"),
+                 ctx.sreg("s_num_partitions"), ctx.sreg("s_sk_tiles"),
+                 comment="dp_tiles = total_tiles - sk_tiles")
         ctx.raw("")
 
-        # SK WG: compute which tile(s) this WG processes
-        # sk_idx = wg_serial - total_tiles
-        ctx.inst("s_sub_u32", ctx.sreg("s_partition_idx"),
-                 ctx.sreg("s_wg_id_x"), ctx.sreg("s_num_partitions"),
-                 comment="sk_idx = wg_id - total_tiles")
+        # Check if this WG is DP or SK
+        # s_tmp0 = dp_tiles
+        ctx.inst("s_cmp_lt_u32", ctx.sreg("s_wg_id_x"),
+                 ctx.sreg("s_tmp0"),
+                 comment="wg_idx < dp_tiles? (DP WG)")
+        ctx.inst("s_cbranch_scc1", "sk_dp_path",
+                 comment="yes -> data-parallel")
+        ctx.raw("")
 
-        # Global iteration range for this SK WG
-        # iter_start = sk_idx * sk_iters_per_wg
+        # ── SK path ──────────────────────────────────────────
+        ctx.comment("SK WG: compute K-slice from global iteration space")
+        # sk_idx = wg_idx - dp_tiles
+        ctx.inst("s_sub_u32", ctx.sreg("s_partition_idx"),
+                 ctx.sreg("s_wg_id_x"), ctx.sreg("s_tmp0"),
+                 comment="sk_idx = wg_idx - dp_tiles")
+
+        # Compute extra iterations for remainder distribution
+        # extra = sk_tiles * ipt - sk_iters_per_wg * sk_grid
+        ctx.s_mul(ctx.sreg("s_tmp1"),
+                  ctx.sreg("s_sk_tiles"), ctx.sreg("s_iters_per_tile"),
+                  comment="sk_tiles * iters_per_tile")
+        ctx.s_mul(ctx.sreg("s_tmp0"),
+                  ctx.sreg("s_sk_iters_per_wg"), ctx.sreg("s_sk_grid"),
+                  comment="sk_iters_per_wg * sk_grid")
+        ctx.inst("s_sub_u32", ctx.sreg("s_tmp0"),
+                 ctx.sreg("s_tmp1"), ctx.sreg("s_tmp0"),
+                 comment="extra = sk_total - sk_ipw*sk_grid")
+
+        # iter_start computation with extra iter spreading:
+        # if sk_idx < extra:
+        #   iter_start = sk_idx * (sk_iters_per_wg + 1)
+        #   num_iters = sk_iters_per_wg + 1
+        # else:
+        #   iter_start = sk_idx * sk_iters_per_wg + extra
+        #   num_iters = sk_iters_per_wg
+        ctx.inst("s_cmp_lt_u32", ctx.sreg("s_partition_idx"),
+                 ctx.sreg("s_tmp0"),
+                 comment="sk_idx < extra?")
+        # Case: sk_idx < extra
+        ctx.inst("s_add_u32", ctx.sreg("s_tmp1"),
+                 ctx.sreg("s_sk_iters_per_wg"), "1",
+                 comment="sk_ipw + 1")
         ctx.s_mul(ctx.sreg("s_iter_start"),
+                  ctx.sreg("s_partition_idx"), ctx.sreg("s_tmp1"),
+                  comment="iter_start = sk_idx * (sk_ipw+1)")
+        # Case: sk_idx >= extra
+        ctx.s_mul(ctx.sreg("s_tmp1"),
                   ctx.sreg("s_partition_idx"),
                   ctx.sreg("s_sk_iters_per_wg"),
-                  comment="iter_start = sk_idx * sk_iters_per_wg")
+                  comment="sk_idx * sk_ipw")
+        ctx.inst("s_add_u32", ctx.sreg("s_tmp1"),
+                 ctx.sreg("s_tmp1"), ctx.sreg("s_tmp0"),
+                 comment="+ extra")
+        # Select based on scc
+        ctx.inst("s_cselect_b32", ctx.sreg("s_iter_start"),
+                 ctx.sreg("s_iter_start"), ctx.sreg("s_tmp1"),
+                 comment="select iter_start")
+        ctx.inst("s_cselect_b32", ctx.sreg("s_tmp1"),
+                 ctx.sreg("s_sk_iters_per_wg"), ctx.sreg("s_sk_iters_per_wg"),
+                 comment="num_iters = sk_ipw (or +1 handled by iter_start)")
 
-        # tile_idx from iter_start
-        # tile_idx = iter_start / iters_per_tile
+        # Now derive tile_idx and local K range from iter_start
+        # tile_idx = dp_tiles + iter_start / iters_per_tile
+        ctx.inst("s_lshr_b32", ctx.sreg("s_tmp1"),
+                 ctx.sreg("s_iters_per_tile"), "0",
+                 comment="iters_per_tile (copy)")
+        # Use log2 division (iters_per_tile is power of 2)
         ctx.inst("s_ff1_i32_b32", ctx.sreg("s_tmp0"),
                  ctx.sreg("s_iters_per_tile"),
                  comment="log2(iters_per_tile)")
         ctx.inst("s_lshr_b32", ctx.sreg("s_tmp1"),
                  ctx.sreg("s_iter_start"), ctx.sreg("s_tmp0"),
-                 comment="tile_idx = iter_start / iters_per_tile")
+                 comment="iter_start / iters_per_tile")
+        # Compute dp_tiles again (was in s_tmp0 but got overwritten)
+        ctx.inst("s_sub_u32", ctx.sreg("s_tmp0"),
+                 ctx.sreg("s_num_partitions"), ctx.sreg("s_sk_tiles"),
+                 comment="dp_tiles (recompute)")
+        ctx.inst("s_add_u32", ctx.sreg("s_tmp1"),
+                 ctx.sreg("s_tmp1"), ctx.sreg("s_tmp0"),
+                 comment="tile_idx = dp_tiles + iter/ipt")
 
-        # local_iter_start = iter_start % iters_per_tile
+        # local_k_start = iter_start % iters_per_tile
+        ctx.inst("s_ff1_i32_b32", ctx.sreg("s_tmp0"),
+                 ctx.sreg("s_iters_per_tile"),
+                 comment="log2(iters_per_tile)")
         ctx.inst("s_sub_u32", ctx.sreg("s_tmp0"),
                  ctx.sreg("s_iters_per_tile"), "1",
-                 comment="iters_per_tile - 1 (mask)")
+                 comment="ipt - 1 (mask)")
         ctx.inst("s_and_b32", ctx.sreg("s_iter_start"),
                  ctx.sreg("s_iter_start"), ctx.sreg("s_tmp0"),
-                 comment="local_iter_start = iter_start & (ipt-1)")
+                 comment="local_k_start = iter_start & (ipt-1)")
 
-        # s_k_tiles = min(sk_iters_per_wg, iters_per_tile - local_start)
+        # s_k_tiles = min(sk_iters_per_wg, ipt - local_k_start)
         ctx.inst("s_sub_u32", ctx.sreg("s_tmp0"),
                  ctx.sreg("s_iters_per_tile"),
                  ctx.sreg("s_iter_start"),
@@ -269,66 +316,58 @@ class StreamKPartitioner(TilePartitioner):
         ctx.inst("s_min_u32", ctx.sreg("s_k_tiles"),
                  ctx.sreg("s_sk_iters_per_wg"),
                  ctx.sreg("s_tmp0"),
-                 comment="s_k_tiles = min(sk_iters_per_wg, remaining)")
+                 comment="s_k_tiles = min(sk_ipw, remaining)")
 
-        # is_partial = 1 (SK WGs are always partial)
         ctx.s_mov(ctx.sreg("s_is_partial"), "1",
                   comment="SK WG is partial")
 
-        # Decompose tile_idx -> tile_m, tile_n
-        # s_tmp1 = tile_idx
+        # Decompose tile_idx -> tile_m, tile_n (s_tmp1 = tile_idx)
         ctx.inst("s_lshr_b32", ctx.sreg("s_tmp0"),
                  ctx.sreg("s_M"), str(log2_wgm),
                  comment=f"tiles_m = M / {tile.wg_m}")
         ctx.inst("s_ff1_i32_b32", ctx.sreg("s_is_partial"),
-                 ctx.sreg("s_tmp0"),
-                 comment="log2(tiles_m)")
+                 ctx.sreg("s_tmp0"), comment="log2(tiles_m)")
         ctx.inst("s_sub_u32", ctx.sreg("s_tmp0"),
-                 ctx.sreg("s_tmp0"), "1",
-                 comment="tiles_m - 1 (mask)")
+                 ctx.sreg("s_tmp0"), "1", comment="mask")
         ctx.inst("s_and_b32", ctx.sreg("s_wg_id_x"),
                  ctx.sreg("s_tmp1"), ctx.sreg("s_tmp0"),
-                 comment="tile_m = tile_idx & (tiles_m-1)")
+                 comment="tile_m = tile_idx & mask")
         ctx.inst("s_lshr_b32", ctx.sreg("s_wg_id_y"),
                  ctx.sreg("s_tmp1"), ctx.sreg("s_is_partial"),
                  comment="tile_n = tile_idx >> log2(tiles_m)")
 
-        # Set is_partial back to 1
         ctx.s_mov(ctx.sreg("s_is_partial"), "1",
                   comment="SK WG is partial")
 
         ctx.inst("s_branch", "sk_recompute_srds",
-                 comment="recompute SRDs for SK tile")
+                 comment="recompute SRDs")
         ctx.raw("")
 
-        # ── Data-parallel mode ───────────────────────────────
-        ctx.label("sk_dp_mode")
-        ctx.comment("DP mode: full K, one tile per WG")
+        # ── DP path ──────────────────────────────────────────
+        ctx.label("sk_dp_path")
+        ctx.comment("DP WG: full K, one tile")
+        ctx.s_lshr(ctx.sreg("s_k_tiles"), ctx.sreg("s_K"), log2_uk,
+                   comment=f"k_tiles = K / {tile.unroll_k}")
         ctx.s_mov(ctx.sreg("s_iter_start"), "0",
-                  comment="iter_start = 0 (full K)")
+                  comment="iter_start = 0")
         ctx.s_mov(ctx.sreg("s_is_partial"), "0",
                   comment="not partial")
         ctx.s_mov(ctx.sreg("s_partition_idx"), "0",
                   comment="partition_idx = 0")
-
-        # For DP, tile_m/tile_n already set by setup phase
-        # s_k_tiles already computed above
-        # Check if we need to recompute SRDs (only if SK changed wg_id_x)
-        ctx.inst("s_branch", "sk_done",
-                 comment="skip SRD recompute")
+        # tile coords already set by setup phase for DP WGs
+        ctx.inst("s_branch", "sk_done", comment="skip SRD recompute")
         ctx.raw("")
 
-        # ── Recompute SRDs for corrected tile coords ─────────
+        # ── Recompute SRDs for SK tile coords ────────────────
         ctx.label("sk_recompute_srds")
-        ctx.comment("Recompute SRD A/B for corrected tile coords")
+        ctx.comment("Recompute SRD A/B for SK tile coords")
         ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"),
                   str(tile.wg_m), comment=f"tile_m * {tile.wg_m}")
         ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
-                 ctx.sreg("s_k_stride"),
-                 comment="* K_stride (K * elem)")
+                 ctx.sreg("s_k_stride"), comment="* K_stride")
         ctx.inst("s_add_u32", ctx.sreg("s_srd_a", 0, 1),
                  ctx.sreg("s_ptr_A", 0, 1), ctx.sreg("s_tmp0"),
-                 comment="SRD_A = ptr_A + row_offset")
+                 comment="SRD_A = ptr_A + row_off")
         ctx.inst("s_addc_u32", ctx.sreg("s_srd_a", 1, 1),
                  ctx.sreg("s_ptr_A", 1, 1), "0", comment="carry")
         ctx.inst("s_mov_b32", ctx.sreg("s_srd_a", 2, 1),
@@ -339,11 +378,10 @@ class StreamKPartitioner(TilePartitioner):
         ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"),
                   str(tile.wg_n), comment=f"tile_n * {tile.wg_n}")
         ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
-                 ctx.sreg("s_k_stride"),
-                 comment="* K_stride (K * elem)")
+                 ctx.sreg("s_k_stride"), comment="* K_stride")
         ctx.inst("s_add_u32", ctx.sreg("s_srd_b", 0, 1),
                  ctx.sreg("s_ptr_B", 0, 1), ctx.sreg("s_tmp0"),
-                 comment="SRD_B = ptr_B + row_offset")
+                 comment="SRD_B = ptr_B + row_off")
         ctx.inst("s_addc_u32", ctx.sreg("s_srd_b", 1, 1),
                  ctx.sreg("s_ptr_B", 1, 1), "0", comment="carry")
         ctx.inst("s_mov_b32", ctx.sreg("s_srd_b", 2, 1),
@@ -352,94 +390,83 @@ class StreamKPartitioner(TilePartitioner):
                  "0x20000", comment="flags")
         ctx.raw("")
 
-        # Recompute scale SRDs for MX types
+        # Scale SRDs for MX types
         if layout and layout.has_scales and ctx.has("s_srd_scale_a"):
             from ..mainloop import VMEMScaleStrategy
             mainloop = ctx._metadata["mainloop"]
             use_swizzled = (isinstance(mainloop.scale_strategy, VMEMScaleStrategy)
                            and mainloop.scale_strategy.swizzled)
-            ctx.comment("Recompute scale SRD A/B for corrected tile coords")
-            if use_swizzled:
-                ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"),
-                          str(tile.wg_m // 32),
-                          comment=f"tile_m * {tile.wg_m // 32}")
-            else:
-                ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"),
-                          str(tile.wg_m),
-                          comment=f"tile_m * {tile.wg_m}")
+            ctx.comment("Recompute scale SRDs for SK tile")
+            mul_m = tile.wg_m // 32 if use_swizzled else tile.wg_m
+            ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"),
+                      str(mul_m), comment=f"tile_m * {mul_m}")
             ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
-                     ctx.sreg("s_stride_scale_a"),
-                     comment="* stride_scale_a")
+                     ctx.sreg("s_stride_scale_a"), comment="* stride")
             ctx.inst("s_add_u32", ctx.sreg("s_srd_scale_a", 0, 1),
                      ctx.sreg("s_ptr_scale_a", 0, 1), ctx.sreg("s_tmp0"),
                      comment="SRD_scaleA lo")
             ctx.inst("s_addc_u32", ctx.sreg("s_srd_scale_a", 1, 1),
-                     ctx.sreg("s_ptr_scale_a", 1, 1), "0",
-                     comment="SRD_scaleA hi")
+                     ctx.sreg("s_ptr_scale_a", 1, 1), "0", comment="hi")
             ctx.inst("s_mov_b32", ctx.sreg("s_srd_scale_a", 2, 1),
                      "0xFFFFFFFF", comment="limit")
             ctx.inst("s_mov_b32", ctx.sreg("s_srd_scale_a", 3, 1),
                      "0x20000", comment="flags")
 
-            if use_swizzled:
-                ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"),
-                          str(tile.wg_n // 32),
-                          comment=f"tile_n * {tile.wg_n // 32}")
-            else:
-                ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"),
-                          str(tile.wg_n),
-                          comment=f"tile_n * {tile.wg_n}")
+            mul_n = tile.wg_n // 32 if use_swizzled else tile.wg_n
+            ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"),
+                      str(mul_n), comment=f"tile_n * {mul_n}")
             ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
-                     ctx.sreg("s_stride_scale_b"),
-                     comment="* stride_scale_b")
+                     ctx.sreg("s_stride_scale_b"), comment="* stride")
             ctx.inst("s_add_u32", ctx.sreg("s_srd_scale_b", 0, 1),
                      ctx.sreg("s_ptr_scale_b", 0, 1), ctx.sreg("s_tmp0"),
                      comment="SRD_scaleB lo")
             ctx.inst("s_addc_u32", ctx.sreg("s_srd_scale_b", 1, 1),
-                     ctx.sreg("s_ptr_scale_b", 1, 1), "0",
-                     comment="SRD_scaleB hi")
+                     ctx.sreg("s_ptr_scale_b", 1, 1), "0", comment="hi")
             ctx.inst("s_mov_b32", ctx.sreg("s_srd_scale_b", 2, 1),
                      "0xFFFFFFFF", comment="limit")
             ctx.inst("s_mov_b32", ctx.sreg("s_srd_scale_b", 3, 1),
                      "0x20000", comment="flags")
             ctx.raw("")
 
-        # Apply K-offset for SK WGs (iter_start > 0)
+        # Apply K-offset for SK WGs
         ctx.inst("s_cmp_eq_u32", ctx.sreg("s_iter_start"), "0",
                  comment="skip K-offset if iter_start == 0")
-        ctx.inst("s_cbranch_scc1", "sk_done",
-                 comment="no K-offset needed")
-        k_bytes_per_iter = layout.k_offset_bytes(1, tile.unroll_k) if layout else int(tile.unroll_k * elem)
+        ctx.inst("s_cbranch_scc1", "sk_done", comment="no offset")
+        k_bytes = layout.k_offset_bytes(1, tile.unroll_k) if layout else int(tile.unroll_k * elem)
         ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_iter_start"),
-                  str(k_bytes_per_iter),
-                  comment=f"k_offset = iter_start * {k_bytes_per_iter}")
+                  str(k_bytes), comment=f"k_off = iter_start * {k_bytes}")
         ctx.inst("s_add_u32", ctx.sreg("s_srd_a", 0, 1),
                  ctx.sreg("s_srd_a", 0, 1), ctx.sreg("s_tmp0"),
-                 comment="SRD_A += k_offset")
+                 comment="SRD_A += k_off")
         ctx.inst("s_addc_u32", ctx.sreg("s_srd_a", 1, 1),
                  ctx.sreg("s_srd_a", 1, 1), "0", comment="carry")
         ctx.inst("s_add_u32", ctx.sreg("s_srd_b", 0, 1),
                  ctx.sreg("s_srd_b", 0, 1), ctx.sreg("s_tmp0"),
-                 comment="SRD_B += k_offset")
+                 comment="SRD_B += k_off")
         ctx.inst("s_addc_u32", ctx.sreg("s_srd_b", 1, 1),
                  ctx.sreg("s_srd_b", 1, 1), "0", comment="carry")
-        # Scale K-offset
         if layout and layout.has_scales and ctx.has("s_srd_scale_a"):
-            scale_block = layout.scale_block
-            scale_k_bytes = tile.unroll_k // scale_block
+            scale_k = tile.unroll_k // layout.scale_block
             ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_iter_start"),
-                      str(scale_k_bytes),
-                      comment=f"scale_k_offset = iter_start * {scale_k_bytes}")
+                      str(scale_k), comment=f"scale_k_off = iter*{scale_k}")
             ctx.inst("s_add_u32", ctx.sreg("s_srd_scale_a", 0, 1),
                      ctx.sreg("s_srd_scale_a", 0, 1), ctx.sreg("s_tmp0"),
-                     comment="SRD_scaleA += scale_k_offset")
+                     comment="scaleA += off")
             ctx.inst("s_addc_u32", ctx.sreg("s_srd_scale_a", 1, 1),
                      ctx.sreg("s_srd_scale_a", 1, 1), "0", comment="carry")
             ctx.inst("s_add_u32", ctx.sreg("s_srd_scale_b", 0, 1),
                      ctx.sreg("s_srd_scale_b", 0, 1), ctx.sreg("s_tmp0"),
-                     comment="SRD_scaleB += scale_k_offset")
+                     comment="scaleB += off")
             ctx.inst("s_addc_u32", ctx.sreg("s_srd_scale_b", 1, 1),
                      ctx.sreg("s_srd_scale_b", 1, 1), "0", comment="carry")
+
+        # Also need s_k_tiles for SK path (compute from iters_per_tile)
+        ctx.inst("s_sub_u32", ctx.sreg("s_tmp0"),
+                 ctx.sreg("s_iters_per_tile"), ctx.sreg("s_iter_start"),
+                 comment="remaining = ipt - local_start")
+        ctx.inst("s_min_u32", ctx.sreg("s_k_tiles"),
+                 ctx.sreg("s_sk_iters_per_wg"), ctx.sreg("s_tmp0"),
+                 comment="s_k_tiles = min(ipw, remaining)")
 
         ctx.label("sk_done")
         ctx.raw("")

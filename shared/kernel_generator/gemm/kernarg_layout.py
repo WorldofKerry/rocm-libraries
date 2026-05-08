@@ -141,7 +141,7 @@ MXFP4_LAYOUT = KernargLayout(
 
 MXFP4_STREAMK_LAYOUT = KernargLayout(
     name="mxfp4_streamk",
-    kernarg_size=152,
+    kernarg_size=156,
     element_bytes_numer=1,
     element_bytes_denom=2,
     strides_offset=96,
