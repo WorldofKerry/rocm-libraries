@@ -18,6 +18,10 @@ from typing import List, TYPE_CHECKING
 
 from .kloop_graph import KLoopOp, OpKind
 from .pipeline_scheduler import ScheduledPipeline
+from .interleave import (
+    classify_body_ops, build_dtl_sequence,
+    emit_mfmas_with_dtl_interleaved, emit_mfmas_with_reads_interleaved,
+)
 
 if TYPE_CHECKING:
     from ..emit.context import AsmContext
@@ -465,22 +469,17 @@ class PipelineEmitter:
         of batching all loads after all MFMAs.
         """
         ctx = self.ctx
-        producers = [body[i] for i in range(producer_start, len(body))]
-
-        # Separate producers into scalar (advance/toggle) and loads
-        scalar_prods = [op for op in producers
-                        if op.kind in (OpKind.SCALAR,)]
-        load_prods = [op for op in producers
-                      if op.kind == OpKind.GLOBAL_LOAD]
+        ops = classify_body_ops(body, producer_start)
+        scalar_prods = ops["scalar_prods"]
+        load_prods = ops["load_prods"]
 
         # Find the MFMA midpoint in consumers (where to insert skip-check)
-        consumer_mfma_indices = []
-        for i in range(producer_start):
-            if body[i].kind == OpKind.MFMA:
-                consumer_mfma_indices.append(i)
+        consumer_mfma_indices = [
+            i for i in range(producer_start) if body[i].kind == OpKind.MFMA
+        ]
         total_mfmas = len(consumer_mfma_indices)
 
-        # Split at ~60% of MFMAs: first part is pure consume,
+        # Split at ~25% of MFMAs: first part is pure consume,
         # second part interleaves global loads
         split_mfma = int(total_mfmas * 0.25)
         if split_mfma < 1:
@@ -511,90 +510,37 @@ class PipelineEmitter:
 
         self.buffer_mgr.emit_negate_step(ctx)
 
-        # Emit scalar producers (advance SRDs, toggle write ptrs)
         for op in scalar_prods:
             self._emit_op(op)
 
-        # Phase 2: remaining consumers with fine-grained DTL interleaving
-        # Use per-line DTL methods to spread individual loads among MFMAs
-        remaining_mfmas = sum(1 for i in range(split_pos, producer_start)
-                              if body[i].kind == OpKind.MFMA)
-
-        # Get the loader for per-line DTL
+        # Phase 2: remaining consumers with DTL interleaving
+        remaining_mfma_ops = [
+            body[i] for i in range(split_pos, producer_start)
+            if body[i].kind == OpKind.MFMA
+        ]
+        remaining_non_mfma = [
+            body[i] for i in range(split_pos, producer_start)
+            if body[i].kind != OpKind.MFMA
+        ]
         loader = ctx._metadata.get("_dtl_loader")
 
-        if loader and remaining_mfmas >= 4 and hasattr(loader, 'emit_dtl_load_a_single'):
-            # Build individual DTL load sequence: scale_a, scale_b,
-            # then alternating A[0..n] and B[0..n]
-            dtl_seq = []
-            for op in load_prods:
-                if 'scale' in op.name:
-                    dtl_seq.append(('scale_op', op))
-            n_a = loader.num_loads_a
-            n_b = loader.num_loads_b
-            for j in range(max(n_a, n_b)):
-                if j < n_a:
-                    dtl_seq.append(('dtl_a', j))
-                if j < n_b:
-                    dtl_seq.append(('dtl_b', j))
-
-            # Spread across remaining MFMAs
-            total_loads = len(dtl_seq)
-            interval = max(1, remaining_mfmas // (total_loads + 1))
-            load_idx = 0
-            mfma_ct = 0
-            m0_a_set = False
-            m0_b_set = False
-
-            for i in range(split_pos, producer_start):
-                op = body[i]
+        # Emit non-MFMA ops first (reads with waitcnts)
+        for i in range(split_pos, producer_start):
+            op = body[i]
+            if op.kind != OpKind.MFMA:
                 if i in waitcnts:
                     ctx.s_waitcnt(waitcnts[i],
                                   comment=f"auto-wait at pos {i}")
                 self._emit_op(op)
 
-                if op.kind == OpKind.MFMA:
-                    mfma_ct += 1
-                    if mfma_ct % interval == 0 and load_idx < total_loads:
-                        kind, payload = dtl_seq[load_idx]
-                        if kind == 'scale_op':
-                            self._emit_op(payload)
-                        elif kind == 'dtl_a':
-                            if not m0_a_set:
-                                loader.emit_dtl_m0_a()
-                                m0_a_set = True
-                            loader.emit_dtl_load_a_single(payload)
-                        elif kind == 'dtl_b':
-                            if not m0_b_set:
-                                loader.emit_dtl_m0_b()
-                                m0_b_set = True
-                            loader.emit_dtl_load_b_single(payload)
-                        load_idx += 1
-
-            # Remaining loads
-            while load_idx < total_loads:
-                kind, payload = dtl_seq[load_idx]
-                if kind == 'scale_op':
-                    self._emit_op(payload)
-                elif kind == 'dtl_a':
-                    if not m0_a_set:
-                        loader.emit_dtl_m0_a()
-                        m0_a_set = True
-                    loader.emit_dtl_load_a_single(payload)
-                elif kind == 'dtl_b':
-                    if not m0_b_set:
-                        loader.emit_dtl_m0_b()
-                        m0_b_set = True
-                    loader.emit_dtl_load_b_single(payload)
-                load_idx += 1
+        if loader and len(remaining_mfma_ops) >= 4 and hasattr(loader, 'emit_dtl_load_a_single'):
+            dtl_seq = build_dtl_sequence(load_prods, loader)
+            emit_mfmas_with_dtl_interleaved(
+                ctx, remaining_mfma_ops, dtl_seq, loader, self._emit_op,
+                comment=f"remaining MFMAs + DTL ({copy_tag})")
         else:
-            # Fallback: emit remaining consumers then bulk loads
-            for i in range(split_pos, producer_start):
-                op = body[i]
-                if i in waitcnts:
-                    ctx.s_waitcnt(waitcnts[i],
-                                  comment=f"auto-wait at pos {i}")
-                self._emit_op(op)
+            for mfma_op in remaining_mfma_ops:
+                self._emit_op(mfma_op)
             for op in load_prods:
                 self._emit_op(op)
 
@@ -624,83 +570,47 @@ class PipelineEmitter:
         since there are no Phase B-2 reads yet (ramp-up loaded data).
         """
         ctx = self.ctx
-        pipeline = self.pipeline
 
-        # Classify consumer ops
-        consumers = [body[i] for i in range(producer_start)]
-        producers = [body[i] for i in range(producer_start, len(body))]
-
-        barrier_op = None
-        ki0_reads = []
-        ki1_reads = []
-        ki0_mfmas = []
-        ki1_mfmas = []
-        suffix_ops = []
-
-        for op in consumers:
-            if op.kind == OpKind.BARRIER:
-                barrier_op = op
-            elif op.kind == OpKind.DS_READ:
-                if '_k1' in op.name:
-                    ki1_reads.append(op)
-                else:
-                    ki0_reads.append(op)
-            elif op.kind == OpKind.MFMA:
-                if '_k1' in op.name:
-                    ki1_mfmas.append(op)
-                else:
-                    ki0_mfmas.append(op)
-            else:
-                suffix_ops.append(op)
-
-        # Separate producers
-        scalar_prods = [op for op in producers if op.kind == OpKind.SCALAR]
-        load_prods = [op for op in producers if op.kind == OpKind.GLOBAL_LOAD]
+        ops = classify_body_ops(body, producer_start)
+        barrier_op = ops["barrier"]
+        ki0_reads = ops["ki0_reads"]
+        ki1_reads = ops["ki1_reads"]
+        ki0_mfmas = ops["ki0_mfmas"]
+        ki1_mfmas = ops["ki1_mfmas"]
+        suffix_ops = ops["suffix"]
+        scalar_prods = ops["scalar_prods"]
+        load_prods = ops["load_prods"]
 
         # Split ki=1 MFMAs 50/50 for barrier straddling
         ki1_half = len(ki1_mfmas) // 2
-        ki1_pre = ki1_mfmas[:ki1_half]   # before end-barrier
-        ki1_post = ki1_mfmas[ki1_half:]  # after end-barrier
+        ki1_pre = ki1_mfmas[:ki1_half]
+        ki1_post = ki1_mfmas[ki1_half:]
 
-        # ── Step 1: drain prev Phase B-2 reads ───────────────────
+        # Step 1: drain prev Phase B-2 reads
         if is_first_copy:
-            # First copy: full sync from ramp-up
             ctx.s_waitcnt("vmcnt(0)", comment=f"wait DTL ({copy_tag})")
             ctx.s_waitcnt("lgkmcnt(0)", comment=f"wait LDS ({copy_tag})")
             if barrier_op:
                 self._emit_op(barrier_op)
-            # First copy must read ki=0 data here (no Phase B-2 yet)
             ctx.comment(f"ki=0 reads ({len(ki0_reads)} ops)")
             for r in ki0_reads:
                 self._emit_op(r)
             if ki0_reads:
                 ctx.s_waitcnt("lgkmcnt(0)", comment="drain ki=0 reads")
         else:
-            # Subsequent copies: ki=0 reads were issued in prev B-2
             ctx.s_waitcnt("lgkmcnt(0)",
                           comment=f"drain ki=0 reads from prev B-2 ({copy_tag})")
 
-        # ── Step 2: ki=0 MFMAs + ki=1 reads interleaved ─────────
-        n_ki0 = len(ki0_mfmas)
-        n_ki1_reads = len(ki1_reads)
-        interval = max(1, n_ki0 // (n_ki1_reads + 1)) if n_ki1_reads > 0 else n_ki0 + 1
-        read_idx = 0
+        # Step 2: ki=0 MFMAs + ki=1 reads interleaved
+        emit_mfmas_with_reads_interleaved(
+            ki0_mfmas, ki1_reads, self._emit_op,
+            comment=f"ki=0 MFMAs + ki=1 reads", ctx=ctx)
 
-        ctx.comment(f"ki=0 MFMAs ({n_ki0}) + ki=1 reads ({n_ki1_reads})")
-        for i, mfma_op in enumerate(ki0_mfmas):
-            self._emit_op(mfma_op)
-            if (i + 1) % interval == 0 and read_idx < n_ki1_reads:
-                self._emit_op(ki1_reads[read_idx])
-                read_idx += 1
-        while read_idx < n_ki1_reads:
-            self._emit_op(ki1_reads[read_idx])
-            read_idx += 1
-
-        # ── Step 3: mid-copy barrier ─────────────────────────────
+        # Step 3: mid-copy barrier
         ctx.s_waitcnt("lgkmcnt(0)", comment="drain ki=1 reads")
         ctx.s_barrier(comment=f"mid-copy barrier ({copy_tag})")
 
-        # ── Step 4: ki=1 pre-barrier half + skip-check + DTL ────
+        # Step 4: ki=1 pre-barrier half + skip-check + DTL
         ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
                   comment=f"k_tiles-- ({copy_tag})")
         ctx.inst("s_cmp_gt_u32", ctx.sreg("s_k_tiles"),
@@ -711,96 +621,32 @@ class PipelineEmitter:
 
         self.buffer_mgr.emit_negate_step(ctx)
 
-        # Scalar producers
         for op in scalar_prods:
             self._emit_op(op)
 
         # ki=1 pre-barrier MFMAs with DTL loads interleaved
         loader = ctx._metadata.get("_dtl_loader")
-        n_pre = len(ki1_pre)
 
-        if loader and n_pre >= 4 and hasattr(loader, 'emit_dtl_load_a_single'):
-            dtl_seq = []
-            for op in load_prods:
-                if 'scale' in op.name:
-                    dtl_seq.append(('scale_op', op))
-            n_a = loader.num_loads_a
-            n_b = loader.num_loads_b
-            for j in range(max(n_a, n_b)):
-                if j < n_a:
-                    dtl_seq.append(('dtl_a', j))
-                if j < n_b:
-                    dtl_seq.append(('dtl_b', j))
-
-            total_loads = len(dtl_seq)
-            dtl_interval = max(1, n_pre // (total_loads + 1))
-            load_idx = 0
-            m0_a_set = False
-            m0_b_set = False
-
-            ctx.comment(f"ki=1 pre-barrier ({n_pre}) + DTL ({total_loads})")
-            for i, mfma_op in enumerate(ki1_pre):
-                self._emit_op(mfma_op)
-                if (i + 1) % dtl_interval == 0 and load_idx < total_loads:
-                    kind, payload = dtl_seq[load_idx]
-                    if kind == 'scale_op':
-                        self._emit_op(payload)
-                    elif kind == 'dtl_a':
-                        if not m0_a_set:
-                            loader.emit_dtl_m0_a()
-                            m0_a_set = True
-                        loader.emit_dtl_load_a_single(payload)
-                    elif kind == 'dtl_b':
-                        if not m0_b_set:
-                            loader.emit_dtl_m0_b()
-                            m0_b_set = True
-                        loader.emit_dtl_load_b_single(payload)
-                    load_idx += 1
-            while load_idx < total_loads:
-                kind, payload = dtl_seq[load_idx]
-                if kind == 'scale_op':
-                    self._emit_op(payload)
-                elif kind == 'dtl_a':
-                    if not m0_a_set:
-                        loader.emit_dtl_m0_a()
-                        m0_a_set = True
-                    loader.emit_dtl_load_a_single(payload)
-                elif kind == 'dtl_b':
-                    if not m0_b_set:
-                        loader.emit_dtl_m0_b()
-                        m0_b_set = True
-                    loader.emit_dtl_load_b_single(payload)
-                load_idx += 1
+        if loader and len(ki1_pre) >= 4 and hasattr(loader, 'emit_dtl_load_a_single'):
+            dtl_seq = build_dtl_sequence(load_prods, loader)
+            emit_mfmas_with_dtl_interleaved(
+                ctx, ki1_pre, dtl_seq, loader, self._emit_op,
+                comment=f"ki=1 pre-barrier")
         else:
             for mfma_op in ki1_pre:
                 self._emit_op(mfma_op)
             for op in load_prods:
                 self._emit_op(op)
 
-        # ── Step 5: end-barrier (straddles ki=1) ─────────────────
+        # Step 5: end-barrier (straddles ki=1)
         ctx.s_waitcnt("vmcnt(14)", comment=f"wait DTL -14 inflight ({copy_tag})")
         ctx.s_barrier(comment=f"end-barrier ({copy_tag})")
 
-        # ── Step 6: ki=1 post-barrier + next-copy ki=0 reads ────
-        # These MFMAs use VGPR data from before the barrier.
-        # Interleave next-copy ki=0 reads from the new READ buffer
-        # (buffer was swapped by the barrier).
-        n_post = len(ki1_post)
-        n_next_reads = len(ki0_reads)
-        next_interval = max(1, n_post // (n_next_reads + 1)) if n_next_reads > 0 else n_post + 1
-        next_read_idx = 0
+        # Step 6: ki=1 post-barrier + next-copy ki=0 reads
+        emit_mfmas_with_reads_interleaved(
+            ki1_post, ki0_reads, self._emit_op,
+            comment=f"ki=1 post-barrier + next ki=0 reads", ctx=ctx)
 
-        ctx.comment(f"ki=1 post-barrier ({n_post}) + next ki=0 reads ({n_next_reads})")
-        for i, mfma_op in enumerate(ki1_post):
-            self._emit_op(mfma_op)
-            if (i + 1) % next_interval == 0 and next_read_idx < n_next_reads:
-                self._emit_op(ki0_reads[next_read_idx])
-                next_read_idx += 1
-        while next_read_idx < n_next_reads:
-            self._emit_op(ki0_reads[next_read_idx])
-            next_read_idx += 1
-
-        # Suffix ops (toggle_rd)
         for op in suffix_ops:
             self._emit_op(op)
 

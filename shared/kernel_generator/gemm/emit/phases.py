@@ -22,6 +22,7 @@ from .context import AsmContext
 from .layouts import emit_affine, GemmLayouts
 from ..problem import DataType, GemmProblem, MfmaConfig, TileConfig
 from ..tile.tree import TileLevel, TilePhase
+from ..schedule.tile_ops import emit_compute_tile_serial, emit_build_raw_srd
 __all__ = [
     "WORKGROUP_EPILOGUE_PHASES",
     "default_mfma_visitor",
@@ -545,7 +546,7 @@ def phase_store_streamk(level: TileLevel, ctx: AsmContext) -> None:
     ctx.comment("Partial: store to workspace + atomic inc")
 
     # Compute tile_serial for workspace and atomic addressing
-    _compute_tile_serial(ctx, tile)
+    emit_compute_tile_serial(ctx, tile)
     # s_tmp0 = tile_serial
 
     # Store accumulators to workspace
@@ -594,19 +595,6 @@ def phase_store_streamk(level: TileLevel, ctx: AsmContext) -> None:
 
 
 
-def _compute_tile_serial(ctx, tile):
-    """Compute tile_serial = wg_id_y * tiles_m + wg_id_x into s_tmp0."""
-    import math
-    log2_wgm = int(math.log2(tile.wg_m))
-    ctx.inst("s_lshr_b32", ctx.sreg("s_tmp0"), ctx.sreg("s_M"),
-             str(log2_wgm), comment=f"tiles_m = M / {tile.wg_m}")
-    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"),
-              ctx.sreg("s_tmp0"), comment="wg_id_y * tiles_m")
-    ctx.inst("s_add_u32", ctx.sreg("s_tmp0"),
-             ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"),
-             comment="+ wg_id_x -> tile_serial")
-
-
 def _store_workspace_sk(ctx, tile):
     """Store f32 accumulators to workspace using a loop (compact code).
 
@@ -625,18 +613,13 @@ def _store_workspace_sk(ctx, tile):
     # Build workspace SRD
     if not ctx.has("s_srd_ws"):
         ctx.alloc_sgpr_permanent(4, "s_srd_ws")
-    ctx.inst("s_mov_b32", ctx.sreg("s_srd_ws", 0, 1),
-             ctx.sreg("s_workspace_ptr", 0, 1), comment="WS SRD lo")
-    ctx.inst("s_mov_b32", ctx.sreg("s_srd_ws", 1, 1),
-             ctx.sreg("s_workspace_ptr", 1, 1), comment="WS SRD hi")
-    ctx.inst("s_mov_b32", ctx.sreg("s_srd_ws", 2, 1), "0xFFFFFFFF",
-             comment="WS SRD size")
-    ctx.inst("s_mov_b32", ctx.sreg("s_srd_ws", 3, 1), "0x20000",
-             comment="WS SRD flags")
+    emit_build_raw_srd(ctx, "s_srd_ws",
+                       ctx.sreg("s_workspace_ptr", 0, 1),
+                       ctx.sreg("s_workspace_ptr", 1, 1))
 
     # Compute ws slot and voffset (row-major within tile)
     tile_area = tile.wg_m * tile.wg_n
-    _compute_tile_serial(ctx, tile)
+    emit_compute_tile_serial(ctx, tile)
     ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
               ctx.sreg("s_iters_per_tile"), comment="tile_serial * ipt")
     ctx.inst("s_add_u32", ctx.sreg("s_tmp0"),
@@ -702,19 +685,14 @@ def _store_workspace_sk(ctx, tile):
 
 def _atomic_inc_tile(ctx, tile):
     """Atomic increment flags[tile_serial] and return old value in s_tmp1."""
-    # tile_serial already in s_tmp0 from _compute_tile_serial
-    _compute_tile_serial(ctx, tile)  # refresh s_tmp0
+    # tile_serial already in s_tmp0 from emit_compute_tile_serial
+    emit_compute_tile_serial(ctx, tile)  # refresh s_tmp0
 
     if not ctx.has("s_srd_flags"):
         ctx.alloc_sgpr_permanent(4, "s_srd_flags")
-    ctx.inst("s_mov_b32", ctx.sreg("s_srd_flags", 0, 1),
-             ctx.sreg("s_flags_ptr", 0, 1), comment="flags SRD lo")
-    ctx.inst("s_mov_b32", ctx.sreg("s_srd_flags", 1, 1),
-             ctx.sreg("s_flags_ptr", 1, 1), comment="flags SRD hi")
-    ctx.inst("s_mov_b32", ctx.sreg("s_srd_flags", 2, 1), "0xFFFFFFFF",
-             comment="flags SRD size")
-    ctx.inst("s_mov_b32", ctx.sreg("s_srd_flags", 3, 1), "0x20000",
-             comment="flags SRD flags")
+    emit_build_raw_srd(ctx, "s_srd_flags",
+                       ctx.sreg("s_flags_ptr", 0, 1),
+                       ctx.sreg("s_flags_ptr", 1, 1))
 
     # All waves in the WG barrier first, then wave 0 does the atomic
     ctx.s_barrier(comment="sync waves before atomic")
@@ -754,14 +732,9 @@ def _reduce_partials(ctx, tile):
     # Build workspace SRD
     if not ctx.has("s_srd_ws"):
         ctx.alloc_sgpr_permanent(4, "s_srd_ws")
-    ctx.inst("s_mov_b32", ctx.sreg("s_srd_ws", 0, 1),
-             ctx.sreg("s_workspace_ptr", 0, 1), comment="WS SRD lo")
-    ctx.inst("s_mov_b32", ctx.sreg("s_srd_ws", 1, 1),
-             ctx.sreg("s_workspace_ptr", 1, 1), comment="WS SRD hi")
-    ctx.inst("s_mov_b32", ctx.sreg("s_srd_ws", 2, 1), "0xFFFFFFFF",
-             comment="WS SRD size")
-    ctx.inst("s_mov_b32", ctx.sreg("s_srd_ws", 3, 1), "0x20000",
-             comment="WS SRD flags")
+    emit_build_raw_srd(ctx, "s_srd_ws",
+                       ctx.sreg("s_workspace_ptr", 0, 1),
+                       ctx.sreg("s_workspace_ptr", 1, 1))
 
     # Per-lane voffset (same as store)
     ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.n - 1,
@@ -799,7 +772,7 @@ def _reduce_partials(ctx, tile):
                  comment=f"zero acc[{i}]")
 
     # Tile base in workspace
-    _compute_tile_serial(ctx, tile)
+    emit_compute_tile_serial(ctx, tile)
     ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
               ctx.sreg("s_iters_per_tile"), comment="tile_serial * ipt")
     ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
