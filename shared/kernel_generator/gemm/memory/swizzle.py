@@ -525,29 +525,27 @@ def auto_swizzle(layout: DataLayout,
                  mem: BankedMemoryConfig = LDS_GFX950) -> Swizzle:
     """Return the best swizzle for the given layout + memory config.
 
-    Uses paired-row rotation as the primary strategy: packs multiple
-    M-rows into wider LDS rows so rotation has enough columns for
-    zero bank conflicts on 64-bank architectures.
+    Prefers XOR swizzle when it achieves zero bank conflicts, since
+    XOR requires ~1 v_xor per read vs ~4 v_add for rotation-based
+    swizzles.  Falls back to paired-row rotation when XOR cannot
+    achieve zero conflicts.
 
     Data-type-independent: operates on DataLayout geometry only.
     """
-    # Paired-row rotation: always achieves optimal for power-of-2 cols
+    # XOR first: cheapest in instruction count (~1 v_xor per read)
+    best_xor, xor_cycles = auto_derive_xor(layout, mem)
+    if xor_cycles <= 1:
+        return best_xor
+
+    # Fallback: paired-row rotation (more instructions but always works)
     paired = PairedRowRotationSwizzle.from_layout(layout, mem)
     paired_cycles = paired.verify_paired(layout, mem)
     if paired_cycles <= 1:
         return paired
 
-    # Fallback: try simple row rotation (no pairing)
-    row_rot = RowRotationSwizzle()
-    row_rot_cycles = row_rot.verify_all_ki(layout, mem)
-    if row_rot_cycles <= paired_cycles:
-        return row_rot
-
-    # Fallback: XOR
-    best_xor, xor_cycles = auto_derive_xor(layout, mem)
-    if xor_cycles < paired_cycles:
+    # Last resort: pick whichever has fewer conflicts
+    if xor_cycles <= paired_cycles:
         return best_xor
-
     return paired
 
 
