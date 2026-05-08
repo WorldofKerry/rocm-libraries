@@ -529,6 +529,10 @@ def phase_store_streamk(level: TileLevel, ctx: AsmContext) -> None:
     import math
     tile = _tile(ctx)
 
+    # Persistent loop already handled store -- skip epilogue
+    if ctx._metadata.get("_persistent_store_done"):
+        return
+
     ctx.comment("=== StreamK Epilogue (atomic tree reduction) ===")
 
     # Path 1: sole owner (full K range)

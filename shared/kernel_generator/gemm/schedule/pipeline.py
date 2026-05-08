@@ -504,12 +504,233 @@ class StreamKPartitioner(TilePartitioner):
         return (total_tiles, 1, 1)
 
 
+
+def _emit_persistent_loop(ctx, tile, mainloop, scheduled, buffer_mgr,
+                          scale_loader, loader, reader):
+    """Emit a persistent loop that wraps K-loop + store.
+
+    Each iteration: atomic grab tile -> decompose -> recompute SRDs ->
+    zero accumulators -> K-loop -> store to D -> loop back.
+
+    Runs tile-independent setup ONCE before the loop.
+    Only tile-dependent state (SRDs, acc init) is re-done per tile.
+    """
+    from .pipeline_emitter import PipelineEmitter
+    from ..emit.phases import phase_store_d
+
+    layout = ctx._metadata.get("layout")
+    log2_uk = int(math.log2(tile.unroll_k))
+    log2_wgm = int(math.log2(tile.wg_m))
+    log2_wgn = int(math.log2(tile.wg_n))
+    elem = ctx._metadata["problem"].element_bytes
+
+    # Load StreamK args from kernargs
+    karg = ctx.sreg("s_kernarg")
+    ctx.alloc_sgpr_permanent(2, "s_tile_counter_ptr")
+
+    # Compute total tiles
+    ctx.inst("s_lshr_b32", ctx.sreg("s_tmp0"), ctx.sreg("s_M"),
+             str(log2_wgm), comment=f"tiles_m = M / {tile.wg_m}")
+    ctx.inst("s_lshr_b32", ctx.sreg("s_tmp1"), ctx.sreg("s_N"),
+             str(log2_wgn), comment=f"tiles_n = N / {tile.wg_n}")
+    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"), ctx.sreg("s_tmp1"),
+              comment="total_tiles = tiles_m * tiles_n")
+    # Save total_tiles
+    ctx.alloc_sgpr_permanent(1, "s_total_tiles")
+    ctx.s_mov(ctx.sreg("s_total_tiles"), ctx.sreg("s_tmp0"),
+              comment="save total_tiles")
+
+    # Use flags_ptr as atomic tile counter
+    # Load flags_ptr from kernargs offset 72
+    ctx.inst("s_load_dwordx2", ctx.sreg("s_tile_counter_ptr"), karg,
+             "72", comment="tile counter ptr (flags slot)")
+    ctx.s_waitcnt("lgkmcnt(0)", comment="wait counter ptr")
+
+    # Build counter SRD
+    ctx.alloc_sgpr_permanent(4, "s_srd_counter")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_counter", 0, 1),
+             ctx.sreg("s_tile_counter_ptr", 0, 1), comment="counter SRD lo")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_counter", 1, 1),
+             ctx.sreg("s_tile_counter_ptr", 1, 1), comment="counter SRD hi")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_counter", 2, 1),
+             "0xFFFFFFFF", comment="counter SRD size")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_counter", 3, 1),
+             "0x20000", comment="counter SRD flags")
+    ctx.raw("")
+
+    # K-tiles for full K (same for all tiles)
+    ctx.s_lshr(ctx.sreg("s_k_tiles"), ctx.sreg("s_K"), log2_uk,
+               comment=f"k_tiles = K / {tile.unroll_k}")
+
+    if scheduled.pgr >= 2:
+        ctx.alloc_sgpr_permanent(1, "s_k_tiles_init")
+        ctx.s_mov(ctx.sreg("s_k_tiles_init"), ctx.sreg("s_k_tiles"),
+                  comment="save initial k_tiles for drain guard")
+
+    # Allocate is_partial/iter_start for epilogue compatibility
+    ctx.alloc_sgpr_permanent(1, "s_is_partial")
+    ctx.alloc_sgpr_permanent(1, "s_iter_start")
+    ctx.s_mov(ctx.sreg("s_is_partial"), "0", comment="DP mode")
+    ctx.s_mov(ctx.sreg("s_iter_start"), "0", comment="full K")
+    ctx.raw("")
+
+    # ── Persistent loop start ────────────────────────────────
+    ctx.label("persistent_loop")
+    ctx.comment("=== StreamK Persistent Loop: grab tile ===")
+
+    # Atomic increment tile counter, get old value = my tile_idx
+    ctx.v_mov(ctx.vreg("v_tmp0"), "1", comment="increment")
+    ctx.v_mov(ctx.vreg("v_tmp1"), "0", comment="offset 0")
+    ctx.inst("buffer_atomic_add",
+             ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),
+             ctx.sreg("s_srd_counter", 0, 4), "0",
+             "offen sc0",
+             comment="atomic_add counter, return old")
+    ctx.s_waitcnt("vmcnt(0)", comment="wait atomic")
+    ctx.inst("v_readfirstlane_b32", ctx.sreg("s_tmp0"),
+             ctx.vreg("v_tmp0"), comment="tile_idx -> sgpr")
+
+    # Check if tile_idx >= total_tiles -> exit
+    ctx.inst("s_cmp_ge_u32", ctx.sreg("s_tmp0"),
+             ctx.sreg("s_total_tiles"), comment="tile_idx >= total?")
+    ctx.inst("s_cbranch_scc1", "persistent_loop_end",
+             comment="no more tiles -> exit")
+    ctx.raw("")
+
+    # Decompose tile_idx -> tile_m, tile_n
+    ctx.comment("Decompose tile_idx into tile_m, tile_n")
+    ctx.inst("s_lshr_b32", ctx.sreg("s_tmp1"), ctx.sreg("s_M"),
+             str(log2_wgm), comment=f"tiles_m = M / {tile.wg_m}")
+    ctx.inst("s_ff1_i32_b32", ctx.sreg("s_is_partial"),
+             ctx.sreg("s_tmp1"), comment="log2(tiles_m)")
+    ctx.inst("s_sub_u32", ctx.sreg("s_tmp1"),
+             ctx.sreg("s_tmp1"), "1", comment="mask")
+    ctx.inst("s_and_b32", ctx.sreg("s_wg_id_x"),
+             ctx.sreg("s_tmp0"), ctx.sreg("s_tmp1"),
+             comment="tile_m = tile_idx & mask")
+    ctx.inst("s_lshr_b32", ctx.sreg("s_wg_id_y"),
+             ctx.sreg("s_tmp0"), ctx.sreg("s_is_partial"),
+             comment="tile_n = tile_idx >> log2(tiles_m)")
+    ctx.s_mov(ctx.sreg("s_is_partial"), "0", comment="restore")
+    ctx.raw("")
+
+    # Recompute SRD A
+    ctx.comment("Recompute SRDs for tile")
+    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"),
+              str(tile.wg_m), comment=f"tile_m * {tile.wg_m}")
+    ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+             ctx.sreg("s_k_stride"), comment="* K_stride")
+    ctx.inst("s_add_u32", ctx.sreg("s_srd_a", 0, 1),
+             ctx.sreg("s_ptr_A", 0, 1), ctx.sreg("s_tmp0"),
+             comment="SRD_A lo")
+    ctx.inst("s_addc_u32", ctx.sreg("s_srd_a", 1, 1),
+             ctx.sreg("s_ptr_A", 1, 1), "0", comment="hi")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_a", 2, 1),
+             "0xFFFFFFFF", comment="limit")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_a", 3, 1),
+             "0x20000", comment="flags")
+
+    # Recompute SRD B
+    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"),
+              str(tile.wg_n), comment=f"tile_n * {tile.wg_n}")
+    ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+             ctx.sreg("s_k_stride"), comment="* K_stride")
+    ctx.inst("s_add_u32", ctx.sreg("s_srd_b", 0, 1),
+             ctx.sreg("s_ptr_B", 0, 1), ctx.sreg("s_tmp0"),
+             comment="SRD_B lo")
+    ctx.inst("s_addc_u32", ctx.sreg("s_srd_b", 1, 1),
+             ctx.sreg("s_ptr_B", 1, 1), "0", comment="hi")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_b", 2, 1),
+             "0xFFFFFFFF", comment="limit")
+    ctx.inst("s_mov_b32", ctx.sreg("s_srd_b", 3, 1),
+             "0x20000", comment="flags")
+
+    # Recompute scale SRDs
+    if layout and layout.has_scales and ctx.has("s_srd_scale_a"):
+        from ..mainloop import VMEMScaleStrategy
+        use_swizzled = (isinstance(mainloop.scale_strategy, VMEMScaleStrategy)
+                       and mainloop.scale_strategy.swizzled)
+        mul_m = tile.wg_m // 32 if use_swizzled else tile.wg_m
+        ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"),
+                  str(mul_m), comment=f"tile_m * {mul_m}")
+        ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+                 ctx.sreg("s_stride_scale_a"), comment="* stride_scale_a")
+        ctx.inst("s_add_u32", ctx.sreg("s_srd_scale_a", 0, 1),
+                 ctx.sreg("s_ptr_scale_a", 0, 1), ctx.sreg("s_tmp0"),
+                 comment="scaleA lo")
+        ctx.inst("s_addc_u32", ctx.sreg("s_srd_scale_a", 1, 1),
+                 ctx.sreg("s_ptr_scale_a", 1, 1), "0", comment="hi")
+        ctx.inst("s_mov_b32", ctx.sreg("s_srd_scale_a", 2, 1),
+                 "0xFFFFFFFF", comment="limit")
+        ctx.inst("s_mov_b32", ctx.sreg("s_srd_scale_a", 3, 1),
+                 "0x20000", comment="flags")
+
+        mul_n = tile.wg_n // 32 if use_swizzled else tile.wg_n
+        ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"),
+                  str(mul_n), comment=f"tile_n * {mul_n}")
+        ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+                 ctx.sreg("s_stride_scale_b"), comment="* stride_scale_b")
+        ctx.inst("s_add_u32", ctx.sreg("s_srd_scale_b", 0, 1),
+                 ctx.sreg("s_ptr_scale_b", 0, 1), ctx.sreg("s_tmp0"),
+                 comment="scaleB lo")
+        ctx.inst("s_addc_u32", ctx.sreg("s_srd_scale_b", 1, 1),
+                 ctx.sreg("s_ptr_scale_b", 1, 1), "0", comment="hi")
+        ctx.inst("s_mov_b32", ctx.sreg("s_srd_scale_b", 2, 1),
+                 "0xFFFFFFFF", comment="limit")
+        ctx.inst("s_mov_b32", ctx.sreg("s_srd_scale_b", 3, 1),
+                 "0x20000", comment="flags")
+    ctx.raw("")
+
+    # Zero accumulators
+    acc_total = tile.mfma_m_repeat * tile.mfma_n_repeat * tile.mfma.acc_vgprs
+    ctx.comment(f"Zero {acc_total} accumulators")
+    for i in range(acc_total):
+        ctx.inst("v_accvgpr_write_b32", ctx.areg("acc_C", i, 1), "0")
+    ctx.raw("")
+
+    # Reset K-tile count and double-buffer state
+    ctx.s_mov(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles_init") if scheduled.pgr >= 2 else ctx.sreg("s_K"),
+              comment="reset k_tiles")
+    if scheduled.pgr < 2:
+        ctx.s_lshr(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), log2_uk,
+                   comment=f"k_tiles = K / {tile.unroll_k}")
+    ctx.s_mov(ctx.sreg("s_rd_db"), "0", comment="reset rd_db")
+    lds_half_total = mainloop.lds_half_total(tile)
+    ctx.s_mov(ctx.sreg("s_lds_db_step"), str(lds_half_total),
+              comment=f"reset DB step = {lds_half_total}")
+    ctx.raw("")
+
+    # Emit K-loop
+    PipelineEmitter(scheduled, buffer_mgr, ctx,
+                    double_copy=(scheduled.pgr >= 2)).emit()
+
+    # Store result to D (inline the store phase)
+    level = ctx._metadata.get("_tile_level")
+    if level is not None:
+        phase_store_d(level, ctx)
+    else:
+        # Fallback: create a minimal level
+        from ..tile.tree import TileLevel
+        level = TileLevel("workgroup", m=tile.wg_m, n=tile.wg_n, k=tile.unroll_k)
+        phase_store_d(level, ctx)
+
+    # Loop back
+    ctx.inst("s_branch", "persistent_loop", comment="next tile")
+    ctx.raw("")
+
+    ctx.label("persistent_loop_end")
+    # Mark that store was already done (suppress epilogue store_d)
+    ctx._metadata["_persistent_store_done"] = True
+    ctx.raw("")
+
+
 def pipeline_v2_kloop_phase(level: TileLevel, ctx: AsmContext) -> None:
     """Phase function using the new unified stream architecture.
 
     Default pipeline strategy. Uses LDSStream + LDSBufferManager +
     PipelineScheduler + PipelineEmitter.
     """
+    ctx._metadata["_tile_level"] = level
     tile = ctx._metadata["tile"]
     mainloop = ctx._metadata["mainloop"]
 
@@ -587,19 +808,22 @@ def pipeline_v2_kloop_phase(level: TileLevel, ctx: AsmContext) -> None:
 
     # K-tile count: determined by mainloop epilogue type
     from ..mainloop import StreamKStore
-    if isinstance(mainloop.epilogue, StreamKStore):
-        StreamKPartitioner().emit(ctx)
+    is_streamk = isinstance(mainloop.epilogue, StreamKStore)
+
+    if is_streamk:
+        # Persistent loop: grab tile -> recompute SRDs -> K-loop -> store -> repeat
+        _emit_persistent_loop(ctx, tile, mainloop, scheduled, buffer_mgr,
+                              scale_loader, loader, reader)
     else:
         GridPartitioner().emit(ctx)
 
-    # Save initial k_tiles for drain guard (PGR>=2 needs to
-    # know if enough tiles existed for each ramp-up stage)
-    if scheduled.pgr >= 2:
-        ctx.alloc_sgpr_permanent(1, "s_k_tiles_init")
-        ctx.s_mov(ctx.sreg("s_k_tiles_init"), ctx.sreg("s_k_tiles"),
-                  comment="save initial k_tiles for drain guard")
-        ctx.raw("")
+        # Save initial k_tiles for drain guard
+        if scheduled.pgr >= 2:
+            ctx.alloc_sgpr_permanent(1, "s_k_tiles_init")
+            ctx.s_mov(ctx.sreg("s_k_tiles_init"), ctx.sreg("s_k_tiles"),
+                      comment="save initial k_tiles for drain guard")
+            ctx.raw("")
 
-    # Emit K-loop
-    PipelineEmitter(scheduled, buffer_mgr, ctx,
-                    double_copy=(scheduled.pgr >= 2)).emit()
+        # Emit K-loop
+        PipelineEmitter(scheduled, buffer_mgr, ctx,
+                        double_copy=(scheduled.pgr >= 2)).emit()
