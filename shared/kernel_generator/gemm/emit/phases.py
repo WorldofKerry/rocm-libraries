@@ -511,24 +511,25 @@ WORKGROUP_EPILOGUE_PHASES = [
 # ===================================================================
 
 def phase_store_streamk(level: TileLevel, ctx: AsmContext) -> None:
-    """StreamK epilogue: 3-way branch based on WG's K-range ownership.
+    """StreamK epilogue with atomic-counter tree reduction.
 
     Path 1 (SOLE OWNER): is_partial == 0
-        Full K range computed by this WG. Direct store to D.
+        Full K range. Direct store to D.
 
-    Path 2 (PARTIAL NON-OWNER): is_partial == 1, iter_start != 0
-        Partial K range, not the owner. Store f32 accumulators to
-        workspace, set flag, done.
+    Path 2 (PARTIAL): is_partial == 1
+        a. Store f32 accumulators to workspace[partition_slot]
+        b. Atomic-increment flags[tile_serial]
+        c. If atomic_result == num_partitions_for_tile - 1:
+           → I'm the last WG for this tile
+           → Load all other partials from workspace, accumulate, store D
+        d. Else: exit (other WGs will handle reduction)
 
-    Path 3 (PARTIAL OWNER): is_partial == 1, iter_start == 0
-        Partial K range, owns the tile. Poll flags for other
-        partitions, load and accumulate their partials, then
-        convert and store to D.
+    No busy-polling. The last WG to finish naturally does the reduction.
     """
     import math
     tile = _tile(ctx)
 
-    ctx.comment("=== StreamK Epilogue ===")
+    ctx.comment("=== StreamK Epilogue (atomic tree reduction) ===")
 
     # Path 1: sole owner (full K range)
     ctx.inst("s_cmp_eq_u32", ctx.sreg("s_is_partial"), "0",
@@ -536,28 +537,51 @@ def phase_store_streamk(level: TileLevel, ctx: AsmContext) -> None:
     ctx.inst("s_cbranch_scc1", "sk_store_direct",
              comment="yes -> direct store to D")
 
-    # Path 2 vs 3: check if this WG is the owner (iter_start == 0)
-    ctx.inst("s_cmp_eq_u32", ctx.sreg("s_iter_start"), "0",
-             comment="tile owner (iter_start == 0)?")
-    ctx.inst("s_cbranch_scc1", "sk_owner_reduce",
-             comment="yes -> poll + accumulate + store")
+    # ---- Path 2: partial WG ----
+    ctx.comment("Partial: store to workspace + atomic inc")
 
-    # ---- Path 2: non-owner partial ----
-    ctx.comment("Non-owner: store partial to workspace + set flag")
-    _compute_global_partition_idx(ctx, tile)
-    _store_workspace(ctx, tile)
-    _set_flag(ctx)
-    ctx.inst("s_branch", "sk_store_done", comment="done (non-owner)")
+    # Compute tile_serial for workspace and atomic addressing
+    _compute_tile_serial(ctx, tile)
+    # s_tmp0 = tile_serial
+
+    # Store accumulators to workspace
+    _store_workspace_sk(ctx, tile)
+
+    # Atomic increment counter for this tile
+    _atomic_inc_tile(ctx, tile)
+    # s_tmp1 = old counter value (before increment)
+
+    # Check if we're the last partition for this tile
+    # num_partitions = ceil(iters_per_tile / sk_iters_per_wg)
+    # Approximate: use iters_per_tile / sk_iters_per_wg
+    # (for power-of-2, this is exact enough)
+    ctx.inst("s_ff1_i32_b32", ctx.sreg("s_tmp0"),
+             ctx.sreg("s_sk_iters_per_wg"),
+             comment="log2(sk_ipw)")
+    ctx.inst("s_lshr_b32", ctx.sreg("s_tmp0"),
+             ctx.sreg("s_iters_per_tile"), ctx.sreg("s_tmp0"),
+             comment="num_parts = ipt / sk_ipw")
+    ctx.inst("s_max_u32", ctx.sreg("s_tmp0"),
+             ctx.sreg("s_tmp0"), "2",
+             comment="at least 2 partitions")
+    ctx.inst("s_sub_u32", ctx.sreg("s_tmp0"),
+             ctx.sreg("s_tmp0"), "1",
+             comment="num_parts - 1 (threshold)")
+    ctx.inst("s_cmp_eq_u32", ctx.sreg("s_tmp1"),
+             ctx.sreg("s_tmp0"),
+             comment="am I the last WG for this tile?")
+    ctx.inst("s_cbranch_scc0", "sk_store_done",
+             comment="no -> exit (others will reduce)")
     ctx.raw("")
 
-    # ---- Path 3: owner with partials ----
-    ctx.label("sk_owner_reduce")
-    ctx.comment("Owner: poll flags, load partials, accumulate")
-    _compute_global_partition_idx(ctx, tile)
-    _owner_reduce(ctx, tile)
+    # ---- Last WG: load all other partials and accumulate ----
+    ctx.comment("Last WG: load + accumulate all partials")
+
+    _reduce_partials(ctx, tile)
+    # Accumulators now contain the sum of all partials
     # Fall through to sk_store_direct
 
-    # ---- Path 1 & 3 endpoint: direct store to D ----
+    # ---- Direct store to D ----
     ctx.label("sk_store_direct")
     phase_store_d(level, ctx)
 
@@ -565,38 +589,36 @@ def phase_store_streamk(level: TileLevel, ctx: AsmContext) -> None:
 
 
 
-def _compute_global_partition_idx(ctx: 'AsmContext', tile: 'TileConfig') -> None:
-    """Compute global workspace slot from WG IDs and partition index.
 
-    global_slot = (wg_id_y * tiles_m + wg_id_x) * num_partitions + partition_idx
-    Overwrites s_partition_idx with the global slot.
-    """
-    tiles_m = tile.wg_m  # Actually need M / wg_m, use s_M
-    # tile_serial = wg_id_y * (M / wg_m) + wg_id_x
+def _compute_tile_serial(ctx, tile):
+    """Compute tile_serial = wg_id_y * tiles_m + wg_id_x into s_tmp0."""
+    import math
+    log2_wgm = int(math.log2(tile.wg_m))
     ctx.inst("s_lshr_b32", ctx.sreg("s_tmp0"), ctx.sreg("s_M"),
-             str(int(tile.wg_m).bit_length() - 1),
-             comment=f"tiles_m = M / {tile.wg_m}")
+             str(log2_wgm), comment=f"tiles_m = M / {tile.wg_m}")
     ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"),
-              ctx.sreg("s_tmp0"),
-              comment="wg_id_y * tiles_m")
+              ctx.sreg("s_tmp0"), comment="wg_id_y * tiles_m")
     ctx.inst("s_add_u32", ctx.sreg("s_tmp0"),
              ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"),
              comment="+ wg_id_x -> tile_serial")
-    # global_slot = tile_serial * num_partitions + partition_idx
-    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
-              ctx.sreg("s_num_partitions"),
-              comment="tile_serial * num_partitions")
-    ctx.inst("s_add_u32", ctx.sreg("s_partition_idx"),
-             ctx.sreg("s_tmp0"), ctx.sreg("s_partition_idx"),
-             comment="+ partition_idx -> global_slot")
 
 
-def _build_ws_srd(ctx: 'AsmContext') -> None:
-    """Build workspace buffer SRD from s_workspace_ptr.
+def _store_workspace_sk(ctx, tile):
+    """Store f32 accumulators to workspace using a loop (compact code).
 
-    Always emits the MOV instructions so each branch that needs
-    the SRD gets its own initialization at runtime.
+    Uses s_loop_idx to iterate over all accumulator elements,
+    keeping the code footprint small to avoid I-cache thrashing.
     """
+    import math
+    mfma = tile.mfma
+    acc_per = mfma.acc_vgprs
+    mr = tile.mfma_m_repeat
+    nr = tile.mfma_n_repeat
+    total_accs = mr * nr * acc_per
+
+    ctx.comment("Store f32 accumulators to workspace (looped)")
+
+    # Build workspace SRD
     if not ctx.has("s_srd_ws"):
         ctx.alloc_sgpr_permanent(4, "s_srd_ws")
     ctx.inst("s_mov_b32", ctx.sreg("s_srd_ws", 0, 1),
@@ -608,27 +630,30 @@ def _build_ws_srd(ctx: 'AsmContext') -> None:
     ctx.inst("s_mov_b32", ctx.sreg("s_srd_ws", 3, 1), "0x20000",
              comment="WS SRD flags")
 
+    # Compute ws slot and voffset (row-major within tile)
+    tile_area = tile.wg_m * tile.wg_n
+    _compute_tile_serial(ctx, tile)
+    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+              ctx.sreg("s_iters_per_tile"), comment="tile_serial * ipt")
+    ctx.inst("s_add_u32", ctx.sreg("s_tmp0"),
+             ctx.sreg("s_tmp0"), ctx.sreg("s_iter_start"),
+             comment="+ iter_start -> ws_slot")
+    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+              str(tile_area * 4), comment="ws_base = slot * tile_bytes")
 
-def _ws_voffset(ctx: 'AsmContext', tile: 'TileConfig') -> None:
-    """Compute per-lane voffset within a tile's workspace region.
-
-    Result in v_tmp2. Layout: row-major within tile,
-    element_offset = (base_m * wg_n + base_n) * 4 bytes.
-    """
-    import math
-    mfma = tile.mfma
+    # Per-lane voffset
     ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.n - 1,
-              comment=f"lane_n = lane_id % {mfma.n}")
+              comment=f"lane_n")
     ctx.v_lshr(ctx.vreg("v_tmp1"), ctx.vreg("v_lane_id"),
-               int(math.log2(mfma.m)), comment=f"lane_id / {mfma.m}")
+               int(math.log2(mfma.m)), comment="lane_m_group")
     ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_tmp1"), 2,
                comment="* 4 -> lane_m_base")
     ctx.v_mul(ctx.vreg("v_tmp2"), str(tile.m_per_wave),
-              ctx.vreg("v_wave_m"), comment=f"wave_m * {tile.m_per_wave}")
+              ctx.vreg("v_wave_m"), comment="wave_m offset")
     ctx.v_add(ctx.vreg("v_tmp2"), ctx.vreg("v_tmp2"), ctx.vreg("v_tmp1"),
-              comment="+ lane_m_base -> base_m")
+              comment="+ lane_m -> base_m")
     ctx.v_mul(ctx.vreg("v_tmp3"), str(tile.n_per_wave),
-              ctx.vreg("v_wave_n"), comment=f"wave_n * {tile.n_per_wave}")
+              ctx.vreg("v_wave_n"), comment="wave_n offset")
     ctx.v_add(ctx.vreg("v_tmp3"), ctx.vreg("v_tmp3"), ctx.vreg("v_tmp0"),
               comment="+ lane_n -> base_n")
     ctx.v_mul(ctx.vreg("v_tmp2"), str(tile.wg_n), ctx.vreg("v_tmp2"),
@@ -636,62 +661,46 @@ def _ws_voffset(ctx: 'AsmContext', tile: 'TileConfig') -> None:
     ctx.v_add(ctx.vreg("v_tmp2"), ctx.vreg("v_tmp2"), ctx.vreg("v_tmp3"),
               comment="+ base_n")
     ctx.v_lshl(ctx.vreg("v_tmp2"), ctx.vreg("v_tmp2"), 2,
-               comment="* 4 -> byte offset within tile")
-
-
-def _set_flag(ctx: 'AsmContext') -> None:
-    """Set flags[partition_idx] = 1 to signal completion.
-
-    All waves execute this -- s_buffer_store is a scalar op
-    and all waves write the same value (idempotent).
-    """
-    ctx.comment("Set completion flag")
-    # Build flags SRD if not already done
-    if not ctx.has("s_srd_flags"):
-        ctx.alloc_sgpr_permanent(4, "s_srd_flags")
-        ctx.inst("s_mov_b32", ctx.sreg("s_srd_flags", 0, 1),
-                 ctx.sreg("s_flags_ptr", 0, 1), comment="flags SRD lo")
-        ctx.inst("s_mov_b32", ctx.sreg("s_srd_flags", 1, 1),
-                 ctx.sreg("s_flags_ptr", 1, 1), comment="flags SRD hi")
-        ctx.inst("s_mov_b32", ctx.sreg("s_srd_flags", 2, 1), "0xFFFFFFFF",
-                 comment="flags SRD size")
-        ctx.inst("s_mov_b32", ctx.sreg("s_srd_flags", 3, 1), "0x20000",
-                 comment="flags SRD flags")
-
-    # soffset = partition_idx * 4
-    ctx.s_lshl(ctx.sreg("s_tmp0"), ctx.sreg("s_partition_idx"), 2,
-               comment="flag offset = partition_idx * 4")
-    ctx.s_mov(ctx.sreg("s_tmp1"), "1", comment="flag value = 1")
-
-    # Barrier ensures all waves finished stores, then set flag
-    ctx.s_barrier(comment="sync waves before flag")
-    ctx.inst("s_buffer_store_dword", ctx.sreg("s_tmp1"),
-             ctx.sreg("s_srd_flags", 0, 4), ctx.sreg("s_tmp0"),
-             comment="flags[partition_idx] = 1")
-    ctx.s_waitcnt("lgkmcnt(0)", comment="wait flag store")
-    ctx.inst("s_dcache_wb", comment="flush scalar cache to L2 for visibility")
+               comment="* 4 -> byte offset")
+    ctx.v_add(ctx.vreg("v_tmp2"), ctx.sreg("s_tmp0"), ctx.vreg("v_tmp2"),
+              comment="+ ws_base -> voffset")
     ctx.raw("")
 
-def _owner_reduce(ctx: 'AsmContext', tile: 'TileConfig') -> None:
-    """Owner WG: poll flags, load partials from workspace, accumulate.
+    # Store all accumulators using unrolled loop
+    # (must be unrolled because accvgpr_read needs immediate operand)
+    mi_stride = mfma.m * tile.wg_n * 4
+    ni_stride = mfma.n * 4
+    ai_stride = tile.wg_n * 4
 
-    For each partition p > 0 of this tile:
-      1. Poll flags[first_partition + p] until non-zero
-      2. Load f32 workspace[partition_idx_of_p * tile_area + lane_offset]
-      3. v_add_f32 into accumulators
-    """
-    mfma = tile.mfma
-    acc_per = mfma.acc_vgprs
-    mr = tile.mfma_m_repeat
-    nr = tile.mfma_n_repeat
-    tile_area = tile.wg_m * tile.wg_n
-    total_accs = mr * nr * acc_per
+    for mi in range(mr):
+        soff = mi * mi_stride
+        if soff > 0:
+            ctx.s_mov(ctx.sreg("s_tmp1"), str(soff), comment=f"soff mi={mi}")
+        for ni in range(nr):
+            acc_base = (mi * nr + ni) * acc_per
+            for ai in range(acc_per):
+                imm = ni * ni_stride + ai * ai_stride
+                acc_reg = ctx.areg("acc_C", acc_base + ai, 1)
+                ctx.inst("v_accvgpr_read_b32",
+                         ctx.vreg("v_tmp0"), acc_reg,
+                         comment=f"acc[{acc_base+ai}]")
+                soff_reg = ctx.sreg("s_tmp1") if soff > 0 else "0"
+                ctx.inst("buffer_store_dword",
+                         ctx.vreg("v_tmp0"), ctx.vreg("v_tmp2"),
+                         ctx.sreg("s_srd_ws", 0, 4), soff_reg,
+                         f"offen offset:{imm}",
+                         comment=f"ws[m{mi}_n{ni}_a{ai}]")
 
-    # Build workspace + flags SRDs. Must emit initialization MOVs
-    # unconditionally because the non-owner path (which also emits
-    # SRD setup) is on a different branch and the owner never
-    # executes it at runtime.
-    _build_ws_srd(ctx)
+    ctx.s_waitcnt("vmcnt(0)", comment="wait workspace stores")
+    ctx.raw("")
+
+
+
+def _atomic_inc_tile(ctx, tile):
+    """Atomic increment flags[tile_serial] and return old value in s_tmp1."""
+    # tile_serial already in s_tmp0 from _compute_tile_serial
+    _compute_tile_serial(ctx, tile)  # refresh s_tmp0
+
     if not ctx.has("s_srd_flags"):
         ctx.alloc_sgpr_permanent(4, "s_srd_flags")
     ctx.inst("s_mov_b32", ctx.sreg("s_srd_flags", 0, 1),
@@ -703,193 +712,148 @@ def _owner_reduce(ctx: 'AsmContext', tile: 'TileConfig') -> None:
     ctx.inst("s_mov_b32", ctx.sreg("s_srd_flags", 3, 1), "0x20000",
              comment="flags SRD flags")
 
-    _ws_voffset(ctx, tile)
-    # v_tmp2 = per-lane byte offset within tile (no partition base yet)
+    # All waves in the WG barrier first, then wave 0 does the atomic
+    ctx.s_barrier(comment="sync waves before atomic")
 
-    # Loop over partitions: partition_idx+1 .. partition_idx+num_partitions-1
-    # The owner is partition_idx (iter_start==0). Other partitions are
-    # partition_idx+1, partition_idx+2, etc.
-    # num_partitions_per_tile is passed via kernarg.
-    ctx.s_mov(ctx.sreg("s_tmp0"), "1", comment="p = 1 (first non-owner)")
-
-    ctx.label("sk_reduce_loop")
-    # Check if p >= num_partitions_per_tile
-    ctx.inst("s_cmp_ge_u32", ctx.sreg("s_tmp0"),
-             ctx.sreg("s_num_partitions"),
-             comment="p >= num_partitions?")
-    ctx.inst("s_cbranch_scc1", "sk_reduce_done",
-             comment="all partitions accumulated")
-
-    # Flag index = partition_idx + p
-    # Use s_iter_start as scratch (it's 0 for the owner and no longer needed)
-    ctx.inst("s_add_u32", ctx.sreg("s_iter_start"),
-             ctx.sreg("s_partition_idx"), ctx.sreg("s_tmp0"),
-             comment="flag_idx = partition_idx + p")
-    ctx.s_lshl(ctx.sreg("s_iter_start"), ctx.sreg("s_iter_start"), 2,
-               comment="flag_offset = flag_idx * 4")
-
-    # Poll flag -- s_iter_start holds the offset (preserved across iterations),
-    # s_tmp1 receives the loaded value
-    ctx.label("sk_poll_flag")
-    ctx.inst("s_buffer_load_dword", ctx.sreg("s_tmp1"),
-             ctx.sreg("s_srd_flags", 0, 4), ctx.sreg("s_iter_start"),
-             "glc", comment="load flag (bypass scalar cache)")
-    ctx.s_waitcnt("lgkmcnt(0)", comment="wait flag load")
-    ctx.inst("s_cmp_eq_u32", ctx.sreg("s_tmp1"), "0",
-             comment="flag still 0?")
-    ctx.inst("s_cbranch_scc1", "sk_poll_flag",
-             comment="spin until flag set")
-
-    # Load partial from workspace and accumulate
-    # ws_base = (partition_idx + p) * tile_area * 4
-    ctx.inst("s_add_u32", ctx.sreg("s_tmp1"),
-             ctx.sreg("s_partition_idx"), ctx.sreg("s_tmp0"),
-             comment="ws_slot = partition_idx + p")
-    ctx.s_mul(ctx.sreg("s_tmp1"), ctx.sreg("s_tmp1"),
-              str(tile_area * 4), comment="ws_base = slot * tile_bytes")
-
-    # Add per-lane offset (v_tmp2) to ws_base
-    ctx.v_add(ctx.vreg("v_tmp3"), ctx.sreg("s_tmp1"), ctx.vreg("v_tmp2"),
-              comment="ws_addr = ws_base + lane_offset")
-
-    # Load each accumulator element, add to existing acc
-    mi_stride = mfma.m * tile.wg_n * 4
-    ni_stride = mfma.n * 4
-    ai_stride = tile.wg_n * 4
-
-    for mi in range(mr):
-        soff = mi * mi_stride
-        if soff > 0:
-            ctx.s_mov(ctx.sreg("s_tmp1"), str(soff),
-                      comment=f"soffset mi={mi}")
-        for ni in range(nr):
-            acc_base = (mi * nr + ni) * acc_per
-            for ai in range(acc_per):
-                imm = ni * ni_stride + ai * ai_stride
-                soff_reg = ctx.sreg("s_tmp1") if soff > 0 else "0"
-                ctx.inst("buffer_load_dword",
-                         ctx.vreg("v_tmp0"),
-                         ctx.vreg("v_tmp3"),
-                         ctx.sreg("s_srd_ws", 0, 4), soff_reg,
-                         f"offen offset:{imm}",
-                         comment=f"load ws[m{mi}_n{ni}_a{ai}]")
-                ctx.s_waitcnt("vmcnt(0)", comment="wait load")
-                acc_reg = ctx.areg("acc_C", acc_base + ai, 1)
-                # Read acc, add, write back
-                ctx.inst("v_accvgpr_read_b32",
-                         ctx.vreg("v_tmp4"), acc_reg,
-                         comment=f"read acc[{acc_base + ai}]")
-                ctx.inst("v_add_f32",
-                         ctx.vreg("v_tmp4"),
-                         ctx.vreg("v_tmp4"), ctx.vreg("v_tmp0"),
-                         comment="acc += partial")
-                ctx.inst("v_accvgpr_write_b32",
-                         acc_reg, ctx.vreg("v_tmp4"),
-                         comment=f"write acc[{acc_base + ai}]")
-
-    ctx.s_waitcnt("vmcnt(0)", comment="wait all loads")
-
-    # Next partition
-    ctx.inst("s_add_u32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"), "1",
-             comment="p++")
-    ctx.inst("s_branch", "sk_reduce_loop", comment="next partition")
-
-    ctx.label("sk_reduce_done")
+    # Atomic add 1 to flags[tile_serial], return old value
+    # Use buffer_atomic_add with GLC to return old value
+    ctx.s_lshl(ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"), 2,
+               comment="flag_offset = tile_serial * 4")
+    ctx.v_mov(ctx.vreg("v_tmp0"), "1", comment="increment value")
+    ctx.v_mov(ctx.vreg("v_tmp1"), ctx.sreg("s_tmp0"),
+              comment="flag offset as vgpr")
+    ctx.inst("buffer_atomic_add",
+             ctx.vreg("v_tmp0"),
+             ctx.vreg("v_tmp1"),
+             ctx.sreg("s_srd_flags", 0, 4), "0",
+             "offen sc0",
+             comment="atomic_add flags[tile], return old")
+    ctx.s_waitcnt("vmcnt(0)", comment="wait atomic")
+    ctx.inst("v_readfirstlane_b32", ctx.sreg("s_tmp1"),
+             ctx.vreg("v_tmp0"), comment="old_count -> sgpr")
     ctx.raw("")
 
 
+def _reduce_partials(ctx, tile):
+    """Load all partitions' f32 partials and sum into accumulators.
 
-def _store_workspace(ctx: AsmContext, tile: 'TileConfig') -> None:
-    """Store raw f32 accumulators to workspace buffer.
-
-    Layout: workspace[partition_idx * MT_M * MT_N + element_offset]
-    Uses soffset for mi stepping (to stay within 16-bit imm limit)
-    and immediate offset for ni/ai within each mi block.
+    Compact code: reuses voffset computation, unrolls only the
+    inner accumulator loop (unavoidable due to accvgpr addressing).
     """
     import math
     mfma = tile.mfma
     acc_per = mfma.acc_vgprs
     mr = tile.mfma_m_repeat
     nr = tile.mfma_n_repeat
+    tile_area = tile.wg_m * tile.wg_n
 
-    ctx.comment("Store f32 accumulators to workspace")
-
-    # Build workspace SRD from s_workspace_ptr
-    ctx.alloc_sgpr_permanent(4, "s_srd_ws")
+    # Build workspace SRD
+    if not ctx.has("s_srd_ws"):
+        ctx.alloc_sgpr_permanent(4, "s_srd_ws")
     ctx.inst("s_mov_b32", ctx.sreg("s_srd_ws", 0, 1),
-             ctx.sreg("s_workspace_ptr", 0, 1), comment="WS SRD base lo")
+             ctx.sreg("s_workspace_ptr", 0, 1), comment="WS SRD lo")
     ctx.inst("s_mov_b32", ctx.sreg("s_srd_ws", 1, 1),
-             ctx.sreg("s_workspace_ptr", 1, 1), comment="WS SRD base hi")
+             ctx.sreg("s_workspace_ptr", 1, 1), comment="WS SRD hi")
     ctx.inst("s_mov_b32", ctx.sreg("s_srd_ws", 2, 1), "0xFFFFFFFF",
              comment="WS SRD size")
     ctx.inst("s_mov_b32", ctx.sreg("s_srd_ws", 3, 1), "0x20000",
-             comment="WS SRD flags: raw buffer")
+             comment="WS SRD flags")
 
-    tile_area = tile.wg_m * tile.wg_n
-    # Compute base offset: partition_idx * tile_area * 4 (f32)
-    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_partition_idx"),
-              str(tile_area * 4),
-              comment=f"partition offset = idx * {tile_area} * 4")
-
-    # Per-lane voffset: (wave_m * m_per_wave + lane_m_base) * wg_n + (wave_n * n_per_wave + lane_n)
-    # Then scale by 4 (f32) and add partition base
+    # Per-lane voffset (same as store)
     ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.n - 1,
-              comment=f"lane_n = lane_id % {mfma.n}")
+              comment="lane_n")
     ctx.v_lshr(ctx.vreg("v_tmp1"), ctx.vreg("v_lane_id"),
-               int(math.log2(mfma.m)), comment=f"lane_id / {mfma.m}")
-    ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_tmp1"), 2,
-               comment="* 4 -> lane_m_base")
-
+               int(math.log2(mfma.m)), comment="lane_m_group")
+    ctx.v_lshl(ctx.vreg("v_tmp1"), ctx.vreg("v_tmp1"), 2, comment="*4")
     ctx.v_mul(ctx.vreg("v_tmp2"), str(tile.m_per_wave),
-              ctx.vreg("v_wave_m"), comment=f"wave_m * {tile.m_per_wave}")
+              ctx.vreg("v_wave_m"), comment="wave_m off")
     ctx.v_add(ctx.vreg("v_tmp2"), ctx.vreg("v_tmp2"), ctx.vreg("v_tmp1"),
-              comment="+ lane_m_base -> base_m")
-
+              comment="base_m")
     ctx.v_mul(ctx.vreg("v_tmp3"), str(tile.n_per_wave),
-              ctx.vreg("v_wave_n"), comment=f"wave_n * {tile.n_per_wave}")
+              ctx.vreg("v_wave_n"), comment="wave_n off")
     ctx.v_add(ctx.vreg("v_tmp3"), ctx.vreg("v_tmp3"), ctx.vreg("v_tmp0"),
-              comment="+ lane_n -> base_n")
-
-    # voffset = (base_m * wg_n + base_n) * 4 + partition_base
+              comment="base_n")
     ctx.v_mul(ctx.vreg("v_tmp2"), str(tile.wg_n), ctx.vreg("v_tmp2"),
               comment=f"base_m * {tile.wg_n}")
     ctx.v_add(ctx.vreg("v_tmp2"), ctx.vreg("v_tmp2"), ctx.vreg("v_tmp3"),
               comment="+ base_n")
-    ctx.v_lshl(ctx.vreg("v_tmp2"), ctx.vreg("v_tmp2"), 2,
-               comment="* 4 -> byte offset")
-    ctx.v_add(ctx.vreg("v_tmp2"), ctx.sreg("s_tmp0"), ctx.vreg("v_tmp2"),
-              comment="+ partition base -> voffset")
-    ctx.raw("")
+    ctx.v_lshl(ctx.vreg("v_tmp2"), ctx.vreg("v_tmp2"), 2, comment="*4")
 
-    # Store accumulators using soffset for mi stepping
-    # mi_stride = mfma.m * wg_n * 4 bytes (row block step)
+    # Num partitions
+    ctx.inst("s_ff1_i32_b32", ctx.sreg("s_tmp1"),
+             ctx.sreg("s_sk_iters_per_wg"), comment="log2(sk_ipw)")
+    ctx.inst("s_lshr_b32", ctx.sreg("s_tmp1"),
+             ctx.sreg("s_iters_per_tile"), ctx.sreg("s_tmp1"),
+             comment="num_parts")
+    ctx.inst("s_max_u32", ctx.sreg("s_tmp1"), ctx.sreg("s_tmp1"), "2",
+             comment="at least 2")
+
+    # Zero accumulators
+    total_accs = mr * nr * acc_per
+    for i in range(total_accs):
+        ctx.inst("v_accvgpr_write_b32", ctx.areg("acc_C", i, 1), "0",
+                 comment=f"zero acc[{i}]")
+
+    # Tile base in workspace
+    _compute_tile_serial(ctx, tile)
+    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+              ctx.sreg("s_iters_per_tile"), comment="tile_serial * ipt")
+    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+              str(tile_area * 4), comment="ws_tile_base")
+
+    # Loop over partitions
+    if not ctx.has("s_reduce_p"):
+        ctx.alloc_sgpr_permanent(1, "s_reduce_p")
+    ctx.s_mov(ctx.sreg("s_reduce_p"), "0", comment="p = 0")
+
+    ctx.label("sk_reduce_loop")
+    ctx.inst("s_cmp_ge_u32", ctx.sreg("s_reduce_p"), ctx.sreg("s_tmp1"),
+             comment="p >= num_parts?")
+    ctx.inst("s_cbranch_scc1", "sk_reduce_done", comment="done")
+
+    # ws_offset = ws_tile_base + p * tile_area * 4
+    ctx.s_mul(ctx.sreg("s_is_partial"), ctx.sreg("s_reduce_p"),
+              str(tile_area * 4), comment="p * tile_bytes")
+    ctx.inst("s_add_u32", ctx.sreg("s_is_partial"),
+             ctx.sreg("s_is_partial"), ctx.sreg("s_tmp0"),
+             comment="+ ws_tile_base")
+    ctx.v_add(ctx.vreg("v_tmp3"), ctx.sreg("s_is_partial"),
+              ctx.vreg("v_tmp2"), comment="+ lane_off -> ws_voff")
+
     mi_stride = mfma.m * tile.wg_n * 4
-    # ni_stride = mfma.n * 4 bytes (col block step)
     ni_stride = mfma.n * 4
-    # ai_stride = wg_n * 4 bytes (one row step within mi block)
     ai_stride = tile.wg_n * 4
 
     for mi in range(mr):
         soff = mi * mi_stride
         if soff > 0:
-            ctx.s_mov(ctx.sreg("s_tmp1"), str(soff),
-                      comment=f"soffset for mi={mi}")
-
+            ctx.s_mov(ctx.sreg("s_is_partial"), str(soff),
+                      comment=f"soff mi={mi}")
         for ni in range(nr):
             acc_base = (mi * nr + ni) * acc_per
             for ai in range(acc_per):
                 imm = ni * ni_stride + ai * ai_stride
-                acc_reg = ctx.areg("acc_C", acc_base + ai, 1)
-                ctx.inst("v_accvgpr_read_b32",
-                         ctx.vreg("v_tmp0"), acc_reg,
-                         comment=f"read acc[{acc_base + ai}]")
-                soff_reg = ctx.sreg("s_tmp1") if soff > 0 else "0"
-                ctx.inst("buffer_store_dword",
-                         ctx.vreg("v_tmp0"),
-                         ctx.vreg("v_tmp2"),
+                soff_reg = ctx.sreg("s_is_partial") if soff > 0 else "0"
+                ctx.inst("buffer_load_dword",
+                         ctx.vreg("v_tmp0"), ctx.vreg("v_tmp3"),
                          ctx.sreg("s_srd_ws", 0, 4), soff_reg,
                          f"offen offset:{imm}",
                          comment=f"ws[m{mi}_n{ni}_a{ai}]")
+                ctx.s_waitcnt("vmcnt(0)", comment="wait")
+                acc_reg = ctx.areg("acc_C", acc_base + ai, 1)
+                ctx.inst("v_accvgpr_read_b32",
+                         ctx.vreg("v_tmp4"), acc_reg, comment="read acc")
+                ctx.inst("v_add_f32", ctx.vreg("v_tmp4"),
+                         ctx.vreg("v_tmp4"), ctx.vreg("v_tmp0"),
+                         comment="acc += partial")
+                ctx.inst("v_accvgpr_write_b32",
+                         acc_reg, ctx.vreg("v_tmp4"), comment="write acc")
 
-    ctx.s_waitcnt("vmcnt(0)", comment="wait workspace stores")
+    ctx.inst("s_add_u32", ctx.sreg("s_reduce_p"),
+             ctx.sreg("s_reduce_p"), "1", comment="p++")
+    ctx.inst("s_branch", "sk_reduce_loop", comment="next partition")
+
+    ctx.label("sk_reduce_done")
+    ctx.s_mov(ctx.sreg("s_is_partial"), "0",
+              comment="clear partial for store_d")
     ctx.raw("")

@@ -354,8 +354,30 @@ class StreamKPartitioner(TilePartitioner):
                   comment="not partial")
         ctx.s_mov(ctx.sreg("s_partition_idx"), "0",
                   comment="partition_idx = 0")
-        # tile coords already set by setup phase for DP WGs
-        ctx.inst("s_branch", "sk_done", comment="skip SRD recompute")
+
+        # Decompose flat wg_id_x into tile_m, tile_n for 1D grid
+        # s_tmp1 = wg_id_x (tile index)
+        ctx.s_mov(ctx.sreg("s_tmp1"), ctx.sreg("s_wg_id_x"),
+                  comment="tile_idx = wg_id_x")
+        ctx.inst("s_lshr_b32", ctx.sreg("s_tmp0"),
+                 ctx.sreg("s_M"), str(log2_wgm),
+                 comment=f"tiles_m = M / {tile.wg_m}")
+        ctx.inst("s_ff1_i32_b32", ctx.sreg("s_is_partial"),
+                 ctx.sreg("s_tmp0"), comment="log2(tiles_m)")
+        ctx.inst("s_sub_u32", ctx.sreg("s_tmp0"),
+                 ctx.sreg("s_tmp0"), "1", comment="mask")
+        ctx.inst("s_and_b32", ctx.sreg("s_wg_id_x"),
+                 ctx.sreg("s_tmp1"), ctx.sreg("s_tmp0"),
+                 comment="tile_m = tile_idx & mask")
+        ctx.inst("s_lshr_b32", ctx.sreg("s_wg_id_y"),
+                 ctx.sreg("s_tmp1"), ctx.sreg("s_is_partial"),
+                 comment="tile_n = tile_idx >> log2(tiles_m)")
+        ctx.s_mov(ctx.sreg("s_is_partial"), "0",
+                  comment="not partial (restore)")
+
+        # DP WGs need SRD recompute since setup used raw 1D wg_id
+        ctx.inst("s_branch", "sk_recompute_srds",
+                 comment="recompute SRDs for correct tile coords")
         ctx.raw("")
 
         # ── Recompute SRDs for SK tile coords ────────────────
