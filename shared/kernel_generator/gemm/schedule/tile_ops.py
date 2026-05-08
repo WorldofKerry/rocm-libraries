@@ -2,7 +2,7 @@
 
 Extracts duplicated SRD recompute, tile decomposition, accumulator
 zeroing, and K-tile reset into standalone functions.  Used by both
-``_emit_persistent_loop`` and ``StreamKPartitioner``.
+the persistent tile loop and store epilogue.
 """
 from __future__ import annotations
 
