@@ -611,6 +611,7 @@ def _format_fp16_custom_kernel(
     streamk: bool = False,
 ) -> str:
     """Format the complete .s file for an FP16 custom kernel."""
+    sk_val = 3 if streamk else 0
     k_iters = unroll_k // mfma.k
     mi_input = mfma.k // 2
 

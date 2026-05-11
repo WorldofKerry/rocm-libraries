@@ -596,10 +596,11 @@ class PipelineEmitter:
             for r in ki0_reads:
                 self._emit_op(r)
             if ki0_reads:
-                ctx.s_waitcnt("lgkmcnt(0)", comment="drain ki=0 reads")
+                ctx.s_waitcnt("vmcnt(0) lgkmcnt(0)",
+                              comment="drain ki=0 reads + scale VMEM loads")
         else:
-            ctx.s_waitcnt("lgkmcnt(0)",
-                          comment=f"drain ki=0 reads from prev B-2 ({copy_tag})")
+            ctx.s_waitcnt("vmcnt(0) lgkmcnt(0)",
+                          comment=f"drain ki=0 reads + scale loads ({copy_tag})")
 
         # Step 2: ki=0 MFMAs + ki=1 reads interleaved
         emit_mfmas_with_reads_interleaved(
