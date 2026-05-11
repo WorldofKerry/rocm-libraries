@@ -375,22 +375,25 @@ def _emit_lds_read_addresses(ctx: AsmContext, tile: TileConfig,
                                elem_bytes=elem, wave_size=tile.wave_size)
         ctx.v_lshr(ctx.vreg("v_tmp1"), ctx.vreg("v_lane_id"),
                    int(math.log2(mfma.m)), comment=f"k_group = lane_id / {mfma.m}")
-        ctx.v_mul(ctx.vreg("v_lds_rd_a"), str(row_stride_bytes),
-                  ctx.vreg("v_tmp0"), comment=f"lane_row * {row_stride_bytes}")
+        # Compute row_base into v_tmp3 to avoid aliasing with
+        # out_vregs[0] and XorSwizzle's internal v_tmp2 temp.
+        ctx.v_mul(ctx.vreg("v_tmp3"), str(row_stride_bytes),
+                  ctx.vreg("v_tmp0"), comment=f"row_base_a = lane_row * {row_stride_bytes}")
         ki_count = swz_layout.ki_count
         a_out = [ctx.vreg("v_lds_rd_a")] + [ctx.vreg(f"v_lds_rd_a_k{ki}") for ki in range(1, ki_count)]
         swz.emit_read_setup(ctx, swz_layout, LDS_GFX950,
                             ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),
-                            ctx.vreg("v_lds_rd_a"), a_out)
+                            ctx.vreg("v_tmp3"), a_out)
         ctx.raw("")
         ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.m - 1,
                   comment=f"lane_row (re-derive)")
-        ctx.v_mul(ctx.vreg("v_lds_rd_b"), str(row_stride_bytes),
-                  ctx.vreg("v_tmp0"), comment=f"lane_row * {row_stride_bytes}")
+        # Same fix for B: use v_tmp3 to avoid aliasing.
+        ctx.v_mul(ctx.vreg("v_tmp3"), str(row_stride_bytes),
+                  ctx.vreg("v_tmp0"), comment=f"row_base_b = lane_row * {row_stride_bytes}")
         b_out = [ctx.vreg("v_lds_rd_b")] + [ctx.vreg(f"v_lds_rd_b_k{ki}") for ki in range(1, ki_count)]
         swz.emit_read_setup(ctx, swz_layout, LDS_GFX950,
                             ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),
-                            ctx.vreg("v_lds_rd_b"), b_out)
+                            ctx.vreg("v_tmp3"), b_out)
     else:
         ctx.v_lshr(ctx.vreg("v_tmp1"), ctx.vreg("v_lane_id"),
                    int(math.log2(mfma.m)), comment=f"lane_id / {mfma.m}")

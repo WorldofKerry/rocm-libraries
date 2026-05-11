@@ -335,6 +335,7 @@ def _format_mxfp4_streamk_custom_kernel(
     mr: int,
     nr: int,
     pgr: int,
+    streamk: bool = False,
 ) -> str:
     """Format the complete .s file for an MXFP4 StreamK custom kernel."""
     return f""".amdgcn_target "amdgcn-amd-amdhsa--gfx950"
@@ -607,6 +608,7 @@ def _format_fp16_custom_kernel(
     nr: int,
     mfma: MfmaConfig,
     pgr: int,
+    streamk: bool = False,
 ) -> str:
     """Format the complete .s file for an FP16 custom kernel."""
     k_iters = unroll_k // mfma.k
