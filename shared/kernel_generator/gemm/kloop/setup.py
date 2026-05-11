@@ -754,12 +754,24 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
                       comment=f"wave_m * {n_groups_a}")
             ctx.inst("v_readfirstlane_b32", ctx.sreg("s_tmp0"),
                      ctx.vreg("v_tmp0"), comment=f"wave_m * {n_groups_a} -> SGPR")
-            ctx.s_lshl(ctx.sreg("s_scale_soff_a0"), ctx.sreg("s_tmp0"), 8,
-                       comment="group0 soffset A = base * 256")
+            # block_stride = stride * 32 (bytes per 32-M-row block)
+            ctx.s_lshl(ctx.sreg("s_tmp1"), ctx.sreg("s_stride_scale_a"), 5,
+                       comment="block_stride_a = stride * 32")
+            ctx.inst("s_mul_i32", ctx.sreg("s_scale_soff_a0"),
+                     ctx.sreg("s_tmp0"), ctx.sreg("s_tmp1"),
+                     comment="group0 soffset A = base * block_stride")
             for g in range(1, n_groups_a):
-                ctx.inst("s_add_u32", ctx.sreg(f"s_scale_soff_a{g}"),
-                         ctx.sreg("s_scale_soff_a0"), str(g * 256),
-                         comment=f"group{g} soffset A = base + {g*256}")
+                if g == 1:
+                    ctx.inst("s_add_u32", ctx.sreg(f"s_scale_soff_a{g}"),
+                             ctx.sreg("s_scale_soff_a0"), ctx.sreg("s_tmp1"),
+                             comment=f"group{g} soffset A += block_stride")
+                else:
+                    ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"),
+                             ctx.sreg("s_tmp1"), str(g),
+                             comment=f"{g} * block_stride_a")
+                    ctx.inst("s_add_u32", ctx.sreg(f"s_scale_soff_a{g}"),
+                             ctx.sreg("s_scale_soff_a0"), ctx.sreg("s_tmp0"),
+                             comment=f"group{g} soffset A")
 
             ctx.comment("Scale B group soffsets")
             ctx.v_mul(ctx.vreg("v_tmp0"),
@@ -767,12 +779,24 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
                       comment=f"wave_n * {n_groups_b}")
             ctx.inst("v_readfirstlane_b32", ctx.sreg("s_tmp0"),
                      ctx.vreg("v_tmp0"), comment=f"wave_n * {n_groups_b} -> SGPR")
-            ctx.s_lshl(ctx.sreg("s_scale_soff_b0"), ctx.sreg("s_tmp0"), 8,
-                       comment="group0 soffset B = base * 256")
+            # block_stride = stride * 32 (bytes per 32-M-row block)
+            ctx.s_lshl(ctx.sreg("s_tmp1"), ctx.sreg("s_stride_scale_b"), 5,
+                       comment="block_stride_b = stride * 32")
+            ctx.inst("s_mul_i32", ctx.sreg("s_scale_soff_b0"),
+                     ctx.sreg("s_tmp0"), ctx.sreg("s_tmp1"),
+                     comment="group0 soffset B = base * block_stride")
             for g in range(1, n_groups_b):
-                ctx.inst("s_add_u32", ctx.sreg(f"s_scale_soff_b{g}"),
-                         ctx.sreg("s_scale_soff_b0"), str(g * 256),
-                         comment=f"group{g} soffset B = base + {g*256}")
+                if g == 1:
+                    ctx.inst("s_add_u32", ctx.sreg(f"s_scale_soff_b{g}"),
+                             ctx.sreg("s_scale_soff_b0"), ctx.sreg("s_tmp1"),
+                             comment=f"group{g} soffset B += block_stride")
+                else:
+                    ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"),
+                             ctx.sreg("s_tmp1"), str(g),
+                             comment=f"{g} * block_stride_b")
+                    ctx.inst("s_add_u32", ctx.sreg(f"s_scale_soff_b{g}"),
+                             ctx.sreg("s_scale_soff_b0"), ctx.sreg("s_tmp0"),
+                             comment=f"group{g} soffset B")
             ctx.raw("")
         else:
             # Linear scale addressing (standalone path)
