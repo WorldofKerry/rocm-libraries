@@ -188,8 +188,8 @@ class E8M0ShuffleLayout(ScaleLayout):
         ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
                  ctx.sreg(stride_reg),
                  comment=f"* stride_scale_{matrix}")
-        # No additional multiply: strideMXSA0 from TensileLite already
-        # accounts for the pre-swizzled block layout.
+        ctx.s_lshl(ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"), 5,
+                   comment="* 32 (pre-swizzled block stride)")
 
     def emit_vmem_voffset(self, ctx: AsmContext, tile: TileConfig,
                           matrix: str) -> None:

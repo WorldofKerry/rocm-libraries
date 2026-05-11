@@ -673,6 +673,10 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
                   comment=f"wg_id_x * {tile.wg_m // 32} (MT/32)")
         ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
                  ctx.sreg("s_stride_scale_a"), comment="* stride_scale_a")
+        # E8M0 shuffle: each 32-row block = stride * 32 bytes
+        if use_swizzled_scales:
+            ctx.s_lshl(ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"), 5,
+                       comment="* 32 (pre-swizzled block stride)")
     ctx.inst("s_add_u32", ctx.sreg("s_srd_scale_a", 0, 1),
              ctx.sreg("s_ptr_scale_a", 0, 1), ctx.sreg("s_tmp0"),
              comment="SRD_scaleA lo")
@@ -695,6 +699,10 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
                   comment=f"wg_id_y * {tile.wg_n // 32} (MT/32)")
         ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
                  ctx.sreg("s_stride_scale_b"), comment="* stride_scale_b")
+        # E8M0 shuffle: each 32-row block = stride * 32 bytes
+        if use_swizzled_scales:
+            ctx.s_lshl(ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"), 5,
+                       comment="* 32 (pre-swizzled block stride)")
     ctx.inst("s_add_u32", ctx.sreg("s_srd_scale_b", 0, 1),
              ctx.sreg("s_ptr_scale_b", 0, 1), ctx.sreg("s_tmp0"),
              comment="SRD_scaleB lo")
