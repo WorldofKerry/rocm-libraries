@@ -129,7 +129,7 @@ class PipelineScheduler:
             pre_body: List[KLoopOp] = []
             rest_consumers: List[KLoopOp] = []
             for op in sorted_consumers:
-                if (op.kind == OpKind.DS_READ
+                if (op.kind in (OpKind.DS_READ, OpKind.SCALE_LOAD)
                         and "data_b" in op.name
                         and "_k0" in op.name
                         and op.name not in war_reads):
@@ -239,7 +239,7 @@ class PipelineScheduler:
         suffix: List[KLoopOp] = []
 
         for op in consumers:
-            if op.kind == OpKind.DS_READ:
+            if op.kind in (OpKind.DS_READ, OpKind.SCALE_LOAD):
                 reads.append(op)
             elif op.kind == OpKind.MFMA:
                 mfmas.append(op)
@@ -336,7 +336,7 @@ class PipelineScheduler:
         suffix: List[KLoopOp] = []
 
         for op in consumers:
-            if op.kind == OpKind.DS_READ:
+            if op.kind in (OpKind.DS_READ, OpKind.SCALE_LOAD):
                 reads.append(op)
             elif op.kind == OpKind.MFMA:
                 mfmas.append(op)

@@ -187,7 +187,7 @@ class PipelineEmitter:
         ctx.comment("Pre-loop ki=0 reads for first C0")
         for i in range(producer_start):
             op = body[i]
-            if op.kind == OpKind.DS_READ and '_k1' not in op.name:
+            if op.kind in (OpKind.DS_READ, OpKind.SCALE_LOAD) and '_k1' not in op.name:
                 self._emit_op(op)
         ctx.raw("")
 
@@ -599,8 +599,15 @@ class PipelineEmitter:
                 ctx.s_waitcnt("vmcnt(0) lgkmcnt(0)",
                               comment="drain ki=0 reads + scale VMEM loads")
         else:
-            ctx.s_waitcnt("vmcnt(0) lgkmcnt(0)",
-                          comment=f"drain ki=0 reads + scale loads ({copy_tag})")
+            # Include vmcnt(0) if pipeline has VMEM scale loads
+            has_vmem_scale = any(
+                op.kind == OpKind.SCALE_LOAD for op in self.pipeline.body)
+            if has_vmem_scale:
+                ctx.s_waitcnt("vmcnt(0) lgkmcnt(0)",
+                              comment=f"drain reads + scale VMEM ({copy_tag})")
+            else:
+                ctx.s_waitcnt("lgkmcnt(0)",
+                              comment=f"drain ki=0 reads from prev B-2 ({copy_tag})")
 
         # Step 2: ki=0 MFMAs + ki=1 reads interleaved
         emit_mfmas_with_reads_interleaved(

@@ -157,11 +157,15 @@ def build_kloop_graph(
         repeat = mr if matrix == "a" else nr
         num_groups = (repeat + mx_block - 1) // mx_block
 
+        # VMEM scale streams have region_size=0 (no LDS).
+        # Use SCALE_LOAD (vmcnt) for VMEM, DS_READ (lgkmcnt) for LDS.
+        scale_op_kind = OpKind.SCALE_LOAD if s.region_size == 0 else OpKind.DS_READ
+
         for g in range(num_groups):
             rname = f"read_{s.name}_g{g}"
             graph.add_op(KLoopOp(
-                rname, OpKind.DS_READ, emit=None,
-                comment=f"ds_read {s.name} group {g}"))
+                rname, scale_op_kind, emit=None,
+                comment=f"scale_read {s.name} group {g}"))
 
             # SYNC: barrier -> read
             graph.add_dep("barrier", rname, DepKind.SYNC)
