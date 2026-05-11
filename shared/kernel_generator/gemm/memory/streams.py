@@ -250,6 +250,17 @@ class ScaleStream(LDSStream):
 
     def toggle_read(self, ctx: 'AsmContext') -> None:
         if self._region == 0:
+            # VMEM path: advance scale SRD post-consumer.
+            # toggle_read is a consumer suffix (iteration=0), runs
+            # AFTER barrier + scale reads + MFMAs, so scale reads
+            # see the current K. Advance prepares for next iteration.
+            srd = f"s_srd_scale_{self._matrix}"
+            stride = self._scale_k_stride
+            ctx.inst("s_add_u32", ctx.sreg(srd, 0, 1),
+                     ctx.sreg(srd, 0, 1), str(stride),
+                     comment=f"{srd} += {stride}")
+            ctx.inst("s_addc_u32", ctx.sreg(srd, 1, 1),
+                     ctx.sreg(srd, 1, 1), "0", comment="carry")
             return
         rd = f"v_scale_rd_{self._matrix}"
         ctx.v_add(ctx.vreg(rd), ctx.vreg(rd),
