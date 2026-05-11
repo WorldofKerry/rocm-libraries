@@ -13,11 +13,26 @@ optimized GCN assembly with dependency-driven instruction scheduling.
 - TensileLite custom kernel export
 - StreamK work decomposition (K-splitting with GPU-side reduction)
 
+## Setup
+
+Create a virtual environment and install dependencies (requires [uv](https://docs.astral.sh/uv/)):
+
+```bash
+cd kernel-generator
+uv venv .venv --python 3.12
+source .venv/bin/activate
+uv pip install -e shared/kernel_generator[dev]
+```
+
+This installs `numpy` and `pytest` into an isolated venv. After
+activation, `PYTHONPATH` is no longer needed -- the editable install
+puts `kernel_generator` on the path automatically.
+
 ## Quick Start
 
 ```bash
 cd kernel-generator
-PYTHONPATH=shared python3 -c "
+python3 -c "
 from kernel_generator.gemm.problem import GemmProblem
 from kernel_generator.gemm.kernel import GemmKernel
 
@@ -93,8 +108,86 @@ Multi-partition launches use separate HIP streams for concurrent execution.
 ## Tests
 
 ```bash
-PYTHONPATH=shared pytest shared/kernel_generator/tests/gemm/ -q
+pytest shared/kernel_generator/tests/gemm/ -q
 ```
+
+## Benchmarking via TensileLite (Recommended)
+
+For fair performance comparison against TensileLite/hipBLASLt kernels,
+use the TensileLite client as a shared harness. This ensures identical
+data initialization, GPU event timing, and memory layout -- our own
+`GemmLauncher` uses different timing (host-side `perf_counter`) and
+data init, so numbers are not directly comparable.
+
+### 1. Export a custom kernel
+
+```python
+from kernel_generator.gemm.export_tensilelite import generate_custom_kernel
+
+# MXFP4
+s = generate_custom_kernel(256, 256, 256, dtype='mxfp4')
+open('my_kernel.s', 'w').write(s)
+
+# FP16
+s = generate_custom_kernel(256, 256, 64, dtype='fp16')
+open('my_kernel_fp16.s', 'w').write(s)
+```
+
+The `.s` file includes embedded `custom.config` metadata (ProblemType,
+MatrixInstruction, kernarg layout) so TensileLite can load it directly.
+
+### 2. Place the kernel
+
+Copy the `.s` file into the GemmFromAnywhere branch's CustomKernels
+directory:
+
+```bash
+cp my_kernel.s <rocm-libraries>/projects/hipblaslt/tensilelite/Tensile/CustomKernels/rocroller/
+```
+
+### 3. Build TensileLite client (one-time)
+
+```bash
+cd <rocm-libraries>/projects/hipblaslt
+cmake -B build-tensilelite -S . \
+  -DCMAKE_CXX_COMPILER=/opt/rocm/bin/amdclang++ \
+  -DCMAKE_C_COMPILER=/opt/rocm/bin/amdclang \
+  -DCMAKE_PREFIX_PATH=/opt/rocm \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DGPU_TARGETS=gfx950 \
+  -DHIPBLASLT_ENABLE_FETCH=ON \
+  -DHIPBLASLT_BUILD_TESTING=OFF \
+  -DHIPBLASLT_ENABLE_CLIENT=OFF \
+  -DHIPBLASLT_ENABLE_DEVICE=OFF \
+  -DHIPBLASLT_ENABLE_HOST=OFF \
+  -DHIPBLASLT_ENABLE_ROCROLLER=OFF \
+  -DTENSILELITE_ENABLE_CLIENT=ON \
+  -DTENSILELITE_BUILD_TESTING=OFF \
+  -DTENSILELITE_ENABLE_AUTOBUILD=ON
+cmake --build build-tensilelite --parallel
+```
+
+### 4. Write a benchmark YAML
+
+Create a test YAML under `Tensile/Tests/custom/` that references the
+kernel by name and declares its kernarg layout. The `args` list must
+match the `.args` section in the kernel's `.amdgpu_metadata`. See
+existing examples in `Tensile/Tests/custom/custom_aiter_f4.yaml`.
+
+### 5. Run
+
+```bash
+HIP_VISIBLE_DEVICES=0 ./build-tensilelite/Tensile.sh \
+  tensilelite/Tensile/Tests/custom/my_test.yaml \
+  /tmp/bench_output \
+  --cxx-compiler /opt/rocm/bin/amdclang++ \
+  --prebuilt-client ./build-tensilelite/tensilelite/client/tensilelite-client \
+  --library-format msgpack \
+  --mx-scale-format 1
+```
+
+Output is a CSV line with time (us) and GFLOPS -- directly comparable
+to any other TensileLite kernel run through the same harness.
 
 ## Architecture
 

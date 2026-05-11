@@ -1,0 +1,31 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+
+[project]
+name = "kernel-generator"
+version = "0.1.0"
+description = "Python-based GPU assembly kernel generator for AMD MI355X (gfx950)"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.package-dir]
+"kernel_generator" = "."
+
+[tool.setuptools.packages.find]
+where = [".."]
+include = ["kernel_generator*"]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"

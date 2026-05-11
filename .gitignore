@@ -13,3 +13,5 @@ CMakeUserPresets.json
 # claude tmp files
 .nfs*
 a.out
+shared/kernel_generator.egg-info/
+shared/kernel_generator/kernel_generator.egg-info/

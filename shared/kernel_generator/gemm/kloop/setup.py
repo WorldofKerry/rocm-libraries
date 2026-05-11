@@ -664,11 +664,15 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
 
     # Scale SRD A
     ctx.comment("Scale SRD A")
-    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"),
-              str(tile.wg_m // 32),
-              comment=f"wg_id_x * {tile.wg_m // 32} (MT/32)")
-    ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
-             ctx.sreg("s_stride_scale_a"), comment="* stride_scale_a")
+    scale_layout = getattr(mainloop.scale_strategy, 'layout', None) if mainloop else None
+    if scale_layout is not None:
+        scale_layout.srd_base_offset_expr(ctx, tile, "s_wg_id_x", "a")
+    else:
+        ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_x"),
+                  str(tile.wg_m // 32),
+                  comment=f"wg_id_x * {tile.wg_m // 32} (MT/32)")
+        ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+                 ctx.sreg("s_stride_scale_a"), comment="* stride_scale_a")
     ctx.inst("s_add_u32", ctx.sreg("s_srd_scale_a", 0, 1),
              ctx.sreg("s_ptr_scale_a", 0, 1), ctx.sreg("s_tmp0"),
              comment="SRD_scaleA lo")
@@ -683,11 +687,14 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
 
     # Scale SRD B
     ctx.comment("Scale SRD B")
-    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"),
-              str(tile.wg_n // 32),
-              comment=f"wg_id_y * {tile.wg_n // 32} (MT/32)")
-    ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
-             ctx.sreg("s_stride_scale_b"), comment="* stride_scale_b")
+    if scale_layout is not None:
+        scale_layout.srd_base_offset_expr(ctx, tile, "s_wg_id_y", "b")
+    else:
+        ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_id_y"),
+                  str(tile.wg_n // 32),
+                  comment=f"wg_id_y * {tile.wg_n // 32} (MT/32)")
+        ctx.inst("s_mul_i32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+                 ctx.sreg("s_stride_scale_b"), comment="* stride_scale_b")
     ctx.inst("s_add_u32", ctx.sreg("s_srd_scale_b", 0, 1),
              ctx.sreg("s_ptr_scale_b", 0, 1), ctx.sreg("s_tmp0"),
              comment="SRD_scaleB lo")
@@ -700,79 +707,84 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
              "0x20000", comment="flags")
     ctx.raw("")
 
-    # Allocate scale soffset SGPRs for swizzled mode
-    # Need mr/2 groups for A, nr/2 for B (each group = 2 MFMA tiles = 32 M/N rows)
-    mr = tile.mfma_m_repeat
-    nr = tile.mfma_n_repeat
-    n_groups_a = mr // 2
-    n_groups_b = nr // 2
-    if use_swizzled_scales or (mainloop_ref and mainloop_ref.wave_abi):
-        for g in range(n_groups_a):
-            ctx.alloc_sgpr_permanent(1, f"s_scale_soff_a{g}")
-        for g in range(n_groups_b):
-            ctx.alloc_sgpr_permanent(1, f"s_scale_soff_b{g}")
+    # When a ScaleLayout is provided, it handles voffset/soffset setup via
+    # VMEMScaleLoader.emit_setup() or LDSScaleLoader.emit_setup().
+    # Skip only the inline VMEM voffset/soffset code; the LDS write-base
+    # allocation at the bottom must still run when needs_lds is True.
+    if scale_layout is None:
+        # Allocate scale soffset SGPRs for swizzled mode
+        # Need mr/2 groups for A, nr/2 for B (each group = 2 MFMA tiles = 32 M/N rows)
+        mr = tile.mfma_m_repeat
+        nr = tile.mfma_n_repeat
+        n_groups_a = mr // 2
+        n_groups_b = nr // 2
+        if use_swizzled_scales or (mainloop_ref and mainloop_ref.wave_abi):
+            for g in range(n_groups_a):
+                ctx.alloc_sgpr_permanent(1, f"s_scale_soff_a{g}")
+            for g in range(n_groups_b):
+                ctx.alloc_sgpr_permanent(1, f"s_scale_soff_b{g}")
 
-    if use_swizzled_scales:
-        # Pre-swizzled scale layout (e8m0_shuffle):
-        # Per-lane voffset = lane_id * 4
-        # Per-group soffset = (wave_m * n_groups_a + group) * 256
-        # Each 256-byte tile covers 32 M-rows (2 MFMA tiles of 16 rows)
-        ctx.comment("Scale swizzled voffset: lane_id * 4")
-        ctx.v_lshl(ctx.vreg("v_dtl_off_scale_a"),
-                   ctx.vreg("v_lane_id"), 2,
-                   comment="lane_id * 4 -> swizzled scale voffset")
-        ctx.inst("v_mov_b32", ctx.vreg("v_dtl_off_scale_b"),
-                 ctx.vreg("v_dtl_off_scale_a"),
-                 comment="scaleB voffset = same")
-        ctx.raw("")
+        if use_swizzled_scales:
+            # Pre-swizzled scale layout (e8m0_shuffle):
+            # Per-lane voffset = lane_id * 4
+            # Per-group soffset = (wave_m * n_groups_a + group) * 256
+            # Each 256-byte tile covers 32 M-rows (2 MFMA tiles of 16 rows)
+            ctx.comment("Scale swizzled voffset: lane_id * 4")
+            ctx.v_lshl(ctx.vreg("v_dtl_off_scale_a"),
+                       ctx.vreg("v_lane_id"), 2,
+                       comment="lane_id * 4 -> swizzled scale voffset")
+            ctx.inst("v_mov_b32", ctx.vreg("v_dtl_off_scale_b"),
+                     ctx.vreg("v_dtl_off_scale_a"),
+                     comment="scaleB voffset = same")
+            ctx.raw("")
 
-        # Compute SGPR soffsets for each group
-        # group_g: (wave_m * n_groups_a + g) * 256
-        ctx.comment("Scale A group soffsets")
-        ctx.v_mul(ctx.vreg("v_tmp0"),
-                  str(n_groups_a), ctx.vreg("v_wave_m"),
-                  comment=f"wave_m * {n_groups_a}")
-        ctx.inst("v_readfirstlane_b32", ctx.sreg("s_tmp0"),
-                 ctx.vreg("v_tmp0"), comment=f"wave_m * {n_groups_a} -> SGPR")
-        ctx.s_lshl(ctx.sreg("s_scale_soff_a0"), ctx.sreg("s_tmp0"), 8,
-                   comment="group0 soffset A = base * 256")
-        for g in range(1, n_groups_a):
-            ctx.inst("s_add_u32", ctx.sreg(f"s_scale_soff_a{g}"),
-                     ctx.sreg("s_scale_soff_a0"), str(g * 256),
-                     comment=f"group{g} soffset A = base + {g*256}")
+            # Compute SGPR soffsets for each group
+            # group_g: (wave_m * n_groups_a + g) * 256
+            ctx.comment("Scale A group soffsets")
+            ctx.v_mul(ctx.vreg("v_tmp0"),
+                      str(n_groups_a), ctx.vreg("v_wave_m"),
+                      comment=f"wave_m * {n_groups_a}")
+            ctx.inst("v_readfirstlane_b32", ctx.sreg("s_tmp0"),
+                     ctx.vreg("v_tmp0"), comment=f"wave_m * {n_groups_a} -> SGPR")
+            ctx.s_lshl(ctx.sreg("s_scale_soff_a0"), ctx.sreg("s_tmp0"), 8,
+                       comment="group0 soffset A = base * 256")
+            for g in range(1, n_groups_a):
+                ctx.inst("s_add_u32", ctx.sreg(f"s_scale_soff_a{g}"),
+                         ctx.sreg("s_scale_soff_a0"), str(g * 256),
+                         comment=f"group{g} soffset A = base + {g*256}")
 
-        ctx.comment("Scale B group soffsets")
-        ctx.v_mul(ctx.vreg("v_tmp0"),
-                  str(n_groups_b), ctx.vreg("v_wave_n"),
-                  comment=f"wave_n * {n_groups_b}")
-        ctx.inst("v_readfirstlane_b32", ctx.sreg("s_tmp0"),
-                 ctx.vreg("v_tmp0"), comment=f"wave_n * {n_groups_b} -> SGPR")
-        ctx.s_lshl(ctx.sreg("s_scale_soff_b0"), ctx.sreg("s_tmp0"), 8,
-                   comment="group0 soffset B = base * 256")
-        for g in range(1, n_groups_b):
-            ctx.inst("s_add_u32", ctx.sreg(f"s_scale_soff_b{g}"),
-                     ctx.sreg("s_scale_soff_b0"), str(g * 256),
-                     comment=f"group{g} soffset B = base + {g*256}")
-        ctx.raw("")
-    else:
-        # Linear scale addressing (standalone path)
-        ctx.comment("Scale A wave-level voffset")
-        ctx.v_mul(ctx.vreg("v_tmp0"),
-                  str(tile.m_per_wave), ctx.vreg("v_wave_m"),
-                  comment=f"wave_m * {tile.m_per_wave}")
-        ctx.inst("v_mul_lo_u32", ctx.vreg("v_dtl_off_scale_a"),
-                 ctx.sreg("s_stride_scale_a"), ctx.vreg("v_tmp0"),
-                 comment="wave_m_base * stride_scale_a -> voffset_scale_a")
-        ctx.raw("")
+            ctx.comment("Scale B group soffsets")
+            ctx.v_mul(ctx.vreg("v_tmp0"),
+                      str(n_groups_b), ctx.vreg("v_wave_n"),
+                      comment=f"wave_n * {n_groups_b}")
+            ctx.inst("v_readfirstlane_b32", ctx.sreg("s_tmp0"),
+                     ctx.vreg("v_tmp0"), comment=f"wave_n * {n_groups_b} -> SGPR")
+            ctx.s_lshl(ctx.sreg("s_scale_soff_b0"), ctx.sreg("s_tmp0"), 8,
+                       comment="group0 soffset B = base * 256")
+            for g in range(1, n_groups_b):
+                ctx.inst("s_add_u32", ctx.sreg(f"s_scale_soff_b{g}"),
+                         ctx.sreg("s_scale_soff_b0"), str(g * 256),
+                         comment=f"group{g} soffset B = base + {g*256}")
+            ctx.raw("")
+        else:
+            # Linear scale addressing (standalone path)
+            ctx.comment("Scale A wave-level voffset")
+            ctx.v_mul(ctx.vreg("v_tmp0"),
+                      str(tile.m_per_wave), ctx.vreg("v_wave_m"),
+                      comment=f"wave_m * {tile.m_per_wave}")
+            ctx.inst("v_mul_lo_u32", ctx.vreg("v_dtl_off_scale_a"),
+                     ctx.sreg("s_stride_scale_a"), ctx.vreg("v_tmp0"),
+                     comment="wave_m_base * stride_scale_a -> voffset_scale_a")
+            ctx.raw("")
 
-        ctx.comment("Scale B wave-level voffset")
-        ctx.v_mul(ctx.vreg("v_tmp0"),
-                  str(tile.n_per_wave), ctx.vreg("v_wave_n"),
-                  comment=f"wave_n * {tile.n_per_wave}")
-        ctx.inst("v_mul_lo_u32", ctx.vreg("v_dtl_off_scale_b"),
-                 ctx.sreg("s_stride_scale_b"), ctx.vreg("v_tmp0"),
-                 comment="wave_n_base * stride_scale_b -> voffset_scale_b")
-        ctx.raw("")
+            ctx.comment("Scale B wave-level voffset")
+            ctx.v_mul(ctx.vreg("v_tmp0"),
+                      str(tile.n_per_wave), ctx.vreg("v_wave_n"),
+                      comment=f"wave_n * {tile.n_per_wave}")
+            ctx.inst("v_mul_lo_u32", ctx.vreg("v_dtl_off_scale_b"),
+                     ctx.sreg("s_stride_scale_b"), ctx.vreg("v_tmp0"),
+                     comment="wave_n_base * stride_scale_b -> voffset_scale_b")
+            ctx.raw("")
 
     # LDS scale write bases (for LDSScaleLoader / DTL scale path)
     if mainloop and mainloop.scale_strategy.needs_lds:

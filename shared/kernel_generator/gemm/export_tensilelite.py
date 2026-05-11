@@ -844,7 +844,7 @@ def generate_custom_kernel(
         p = GemmProblem(4096, 4096, 4096, dtype=DataType.MXFP4)
         effective_pgr = 2  # MXFP4 always PGR=2
         ml = mainloop_mxfp4_tensilelite(
-            pgr=effective_pgr, wg_mapping_xcc=2, colmajor_output=True,
+            pgr=effective_pgr, wg_mapping_xcc=1, colmajor_output=True,
             swizzled_scales=swizzled_scales,
             streamk=streamk,
         )

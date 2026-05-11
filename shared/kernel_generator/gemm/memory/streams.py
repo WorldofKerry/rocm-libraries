@@ -177,12 +177,12 @@ class ScaleStream(LDSStream):
     def num_global_loads(self) -> int:
         if self._region == 0:
             return 0
-        return 1  # single buffer_load_dwordx4 ... lds per matrix
+        return 4  # 4 buffer_load_dword per matrix (VGPR intermediate)
 
     @property
     def needs_lds_write(self) -> bool:
-        # True DTL: data goes directly from global to LDS, no ds_write
-        return False
+        # VGPR-intermediate: buffer_load into VGPRs, then ds_write to LDS
+        return True
 
     def setup(self, ctx: 'AsmContext', lds_offset: int) -> None:
         if self._region == 0:
@@ -192,22 +192,36 @@ class ScaleStream(LDSStream):
     def emit_global_loads(self, ctx: 'AsmContext') -> None:
         if self._region == 0:
             return
-        # Set m0 to LDS write base for this matrix's scale region
-        wr_base = f"s_lds_wr_scale_{self._matrix}"
-        ctx.inst("s_mov_b32", "m0", ctx.sreg(wr_base),
-                 comment=f"m0 = scale {self._matrix.upper()} LDS write base")
-        # True DTL: buffer_load_dwordx4 vaddr, srd, soffset, offen lds
-        # vaddr = per-lane offset, data goes to LDS at m0+vaddr
+        # VGPR-intermediate: load 4 dwords into tmp VGPRs per thread
         srd = f"s_srd_scale_{self._matrix}"
         voff = f"v_dtl_off_scale_{self._matrix}_lds"
-        ctx.inst("buffer_load_dwordx4",
-                 ctx.vreg(voff), ctx.sreg(srd, 0, 4),
-                 "0", "offen offset:0, lds",
-                 comment=f"scale {self._matrix.upper()} DTL to LDS")
+        # Each thread loads 16 bytes (4 dwords) from global at SRD + voff
+        base_tmp = 0 if self._matrix == "a" else 4
+        for dw in range(4):
+            ctx.inst("buffer_load_dword",
+                     ctx.vreg(f"v_tmp{base_tmp + dw}"),
+                     ctx.vreg(voff),
+                     ctx.sreg(srd, 0, 4),
+                     "0", f"offen offset:{dw * 4}",
+                     comment=f"scale {self._matrix.upper()} dw{dw}")
 
     def emit_lds_writes(self, ctx: 'AsmContext') -> None:
-        # No-op: true DTL writes directly to LDS
-        pass
+        if self._region == 0:
+            return
+        # Write 4 dwords per thread from tmp VGPRs to LDS
+        wr_base = f"s_lds_wr_scale_{self._matrix}"
+        voff = f"v_dtl_off_scale_{self._matrix}_lds"
+        base_tmp = 0 if self._matrix == "a" else 4
+        ctx.v_add(ctx.vreg("v_tmp9"),
+                  ctx.vreg(voff),
+                  ctx.sreg(wr_base),
+                  comment=f"LDS addr {self._matrix.upper()} = wr_base + voff")
+        for dw in range(4):
+            ctx.inst("ds_write_b32",
+                     ctx.vreg("v_tmp9"),
+                     ctx.vreg(f"v_tmp{base_tmp + dw}"),
+                     f"offset:{dw * 4}",
+                     comment=f"scale {self._matrix.upper()} dw{dw} -> LDS")
 
     def read_op_count(self) -> int:
         # One read per 2-mi group (LDS scales group 2 mi values)

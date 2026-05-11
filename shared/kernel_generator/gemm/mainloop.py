@@ -77,8 +77,25 @@ class ScaleStrategy:
         return 0
 
 
+class VMEMScaleStrategy(ScaleStrategy):
+    """Load scales directly from VMEM into VGPRs."""
+
+    def __init__(self, swizzled: bool = False, layout: object = None) -> None:
+        self.swizzled: bool = swizzled
+        self.layout = layout
+
+    def build_loader(self, ctx: object, tile: TileConfig,
+                     lds_data_half: int = 0) -> object:
+        from .memory.scale_loader import VMEMScaleLoader
+        return VMEMScaleLoader(ctx, tile, swizzled=self.swizzled,
+                               layout=self.layout)
+
+
 class LDSScaleStrategy(ScaleStrategy):
     """Load scales via DTL into LDS, read via ds_read."""
+
+    def __init__(self, layout: object = None) -> None:
+        self.layout = layout
 
     def build_loader(self, ctx: object, tile: TileConfig,
                      lds_data_half: int = 0) -> object:
@@ -93,18 +110,6 @@ class LDSScaleStrategy(ScaleStrategy):
         scale_a = max(tile.wg_m * (tile.unroll_k // layout.scale_block), 4096)
         scale_b = max(tile.wg_n * (tile.unroll_k // layout.scale_block), 4096)
         return scale_a + scale_b
-
-
-class VMEMScaleStrategy(ScaleStrategy):
-    """Load scales directly from VMEM into VGPRs."""
-
-    def __init__(self, swizzled: bool = False) -> None:
-        self.swizzled: bool = swizzled
-
-    def build_loader(self, ctx: object, tile: TileConfig,
-                     lds_data_half: int = 0) -> object:
-        from .memory.scale_loader import VMEMScaleLoader
-        return VMEMScaleLoader(ctx, tile, swizzled=self.swizzled)
 
 
 # ── Mainloop ──────────────────────────────────────────────────────
@@ -287,25 +292,24 @@ def mainloop_mxfp4_tensilelite(
     swizzled_scales: bool = False,
     streamk: bool = False,
 ) -> Mainloop:
-    """MXFP4 mainloop for TensileLite custom kernels with LDS scale loading.
+    """MXFP4 mainloop for TensileLite custom kernels.
 
-    Uses LDS-based scale loading via true DTL (buffer_load_dwordx4 ... lds)
-    for zero VMEM scale loads. Scale data goes directly from global
-    memory to LDS, then ds_read_b32 with op_sel byte selection.
+    Uses VMEM scale loading with pre-swizzled E8M0 layout
+    (``--mx-scale-format 1``) for TensileLite compatibility.
 
     Args:
-        swizzled_scales: Accepted for API compatibility. LDS scales
-            always use pre-swizzled format (MXScaleFormat=1).
+        swizzled_scales: Accepted for API compatibility (currently unused).
         streamk: Enable StreamK work distribution for better CU utilization.
     """
     from .memory.global_loader import DTLLoader
+    from .memory.scale_layout import E8M0ShuffleLayout
 
     layout = MXFP4_STREAMK_LAYOUT if streamk else MXFP4_LAYOUT
     return Mainloop(
         layout=layout,
         grid=_make_grid(wg_mapping_xcc),
         loader_cls=DTLLoader,
-        scale_strategy=LDSScaleStrategy(),
+        scale_strategy=VMEMScaleStrategy(swizzled=True),
         swizzle=IdentitySwizzle(),
         pgr=pgr,
         epilogue=StreamKStore() if streamk else DirectStore(),
