@@ -139,7 +139,7 @@ class TestScaleStream:
         tiling = GemmTiling.mxfp4_standard(wg_m=128, wg_n=128, unroll_k=256)
         tile = tiling.to_tile_config()
         s = ScaleStream("a", tile)
-        assert s.needs_lds_write is True  # VGPR intermediate: needs ds_write
+        assert s.needs_lds_write is True  # VGPR intermediate: needs ds_write (region > 0)
 
     def test_read_op_count(self):
         """read_op_count = ceil(mfma_{m,n}_repeat / 2) for scale streams."""

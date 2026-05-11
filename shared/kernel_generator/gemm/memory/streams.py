@@ -181,8 +181,9 @@ class ScaleStream(LDSStream):
 
     @property
     def needs_lds_write(self) -> bool:
-        # VGPR-intermediate: buffer_load into VGPRs, then ds_write to LDS
-        return True
+        # VGPR-intermediate needs ds_write only when region > 0.
+        # For VMEM path (region=0), no LDS writes needed.
+        return self._region > 0
 
     def setup(self, ctx: 'AsmContext', lds_offset: int) -> None:
         if self._region == 0:
