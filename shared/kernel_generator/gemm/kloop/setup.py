@@ -192,11 +192,40 @@ def _emit_lds_write_offset(ctx: AsmContext, tile: TileConfig,
 
 
 def _emit_dtl_voffset(ctx: AsmContext) -> None:
-    """Emit DTL voffset = thread_row * K * elem + col_bytes."""
-    ctx.inst("v_mul_lo_u32", ctx.vreg("v_dtl_off_a"),
-             ctx.sreg("s_k_stride"), ctx.vreg("v_tmp0"), comment="row * K*elem")
-    ctx.v_add(ctx.vreg("v_dtl_off_a"), ctx.vreg("v_dtl_off_a"),
-              ctx.vreg("v_tmp1"), comment="+ col_bytes")
+    """Emit DTL voffset = thread_row * K * elem + col_bytes.
+
+    When DTLRotationSwizzle is active, rotates the column component
+    so different M-rows fetch from rotated K positions for bank-conflict-free reads.
+    """
+    tile = _tile(ctx)
+    problem = _problem(ctx)
+    elem = problem.element_bytes
+    swz = tile.resolved_swizzle(elem)
+
+    from ..memory.swizzle import DTLRotationSwizzle
+    if isinstance(swz, DTLRotationSwizzle):
+        # v_tmp0 = thread_row, v_tmp1 = col_bytes (from _emit_dtl_lane_offset)
+        # Extract thread_col = col_bytes / 16
+        ctx.v_lshr(ctx.vreg("v_tmp4"), ctx.vreg("v_tmp1"), 4,
+                   comment="thread_col = col_bytes / 16")
+        # Apply inverse rotation to column
+        swz.emit_dtl_voffset_rotation(ctx, tile,
+                                       ctx.vreg("v_tmp0"),  # thread_row
+                                       ctx.vreg("v_tmp4"),  # thread_col
+                                       ctx.vreg("v_tmp4"))  # output: rotated_col
+        # DTL voffset = thread_row * K_stride + rotated_col * 16
+        ctx.inst("v_mul_lo_u32", ctx.vreg("v_dtl_off_a"),
+                 ctx.sreg("s_k_stride"), ctx.vreg("v_tmp0"), comment="row * K*elem")
+        ctx.v_lshl(ctx.vreg("v_tmp4"), ctx.vreg("v_tmp4"), 4,
+                   comment="rotated_col * 16")
+        ctx.v_add(ctx.vreg("v_dtl_off_a"), ctx.vreg("v_dtl_off_a"),
+                  ctx.vreg("v_tmp4"), comment="+ rotated_col_bytes")
+    else:
+        ctx.inst("v_mul_lo_u32", ctx.vreg("v_dtl_off_a"),
+                 ctx.sreg("s_k_stride"), ctx.vreg("v_tmp0"), comment="row * K*elem")
+        ctx.v_add(ctx.vreg("v_dtl_off_a"), ctx.vreg("v_dtl_off_a"),
+                  ctx.vreg("v_tmp1"), comment="+ col_bytes")
+
     ctx.v_mov(ctx.vreg("v_dtl_off_b"), ctx.vreg("v_dtl_off_a"),
               comment="B offset = same")
     ctx.raw("")

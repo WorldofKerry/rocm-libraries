@@ -21,6 +21,7 @@ __all__ = [
     "Swizzle",
     "IdentitySwizzle", "XorSwizzle", "RotationSwizzle", "RowRotationSwizzle",
     "ComposedSwizzle", "PairedRowRotationSwizzle", "PairedRowLayout",
+    "DTLRotationSwizzle",
 ]
 
 
@@ -843,3 +844,227 @@ class PairedRowRotationSwizzle(Swizzle):
                     addrs.append(addr)
                 worst = max(worst, mem.cycles(addrs))
         return worst
+
+
+class DTLRotationSwizzle(Swizzle):
+    """Rotation swizzle compatible with DTL (Direct-To-LDS) writes.
+
+    DTL writes are sequential (LDS addr = m0 + tid*16), so we cannot
+    swizzle the LDS write address. Instead, we rotate the global read
+    column (DTL voffset) so different M-rows fetch from rotated K positions.
+    The read side applies the matching de-rotation.
+
+    Uses pair_factor=2: two consecutive M-rows share one wider LDS row.
+    The rotation key is lds_row = m_row // pair_factor.
+
+    Write (DTL voffset): global_k_col = (thread_col - lds_row) % orig_cols
+    Read (ds_read):      read_col = half * orig_cols + (k_col + lds_row) % orig_cols
+
+    This achieves 1-cycle (zero bank conflict) reads on GFX950 LDS.
+    """
+
+    def __init__(self, pair_factor: int = 2, orig_cols: int = 8) -> None:
+        self.pair_factor = pair_factor
+        self.orig_cols = orig_cols
+        self.effective_cols = pair_factor * orig_cols
+
+    @staticmethod
+    def from_layout(layout: 'DataLayout',
+                    mem: 'BankedMemoryConfig' = None) -> 'DTLRotationSwizzle':
+        """Auto-derive from tile geometry."""
+        if mem is None:
+            mem = LDS_GFX950
+        bank_row = mem.bank_row_bytes
+        pair_factor = max(1, -(-bank_row // layout.row_stride_bytes))
+        return DTLRotationSwizzle(
+            pair_factor=pair_factor,
+            orig_cols=layout.num_cols,
+        )
+
+    def forward(self, row: int, col: int, num_cols: int) -> int:
+        """Column mapping for verification. Returns read-side swizzled column.
+
+        Here row = M-row index, col = k_column within original row.
+        The rotation maps: read_col = half * orig_cols + (col + lds_row) % orig_cols.
+        """
+        lds_row = row // self.pair_factor
+        half = row % self.pair_factor
+        return half * self.orig_cols + (col + lds_row) % self.orig_cols
+
+    def lds_row_of(self, m_row: int) -> int:
+        """Which LDS row an M-row maps to."""
+        return m_row // self.pair_factor
+
+    def emit_write_swizzle(self, ctx: 'AsmContext', layout: 'DataLayout',
+                           mem: 'BankedMemoryConfig',
+                           v_thread_row: str, v_thread_col: str,
+                           v_out: str) -> None:
+        """DTL writes are hardware-determined; this is a no-op placeholder.
+
+        The actual rotation is applied in emit_dtl_voffset_rotation() which
+        modifies the global read column instead of the LDS write column.
+        """
+        # DTL write addresses are fixed by hardware; nothing to swizzle.
+        ctx.v_mov(v_out, v_thread_col,
+                  comment="DTL write: identity (rotation applied to global read)")
+
+    def emit_dtl_voffset_rotation(self, ctx: 'AsmContext',
+                                  tile_config: 'TileConfig',
+                                  v_thread_row: str,
+                                  v_thread_col: str,
+                                  v_out: str) -> None:
+        """Apply inverse rotation to DTL column for the global read voffset.
+
+        v_thread_row: thread_row = tid / threads_per_row (VGPR)
+        v_thread_col: thread_col = tid % threads_per_row (VGPR, 0..orig_cols-1)
+        v_out: receives rotated column index (VGPR)
+
+        Formula: rotated_col = (thread_col - lds_row) % orig_cols
+        where lds_row = thread_row / pair_factor
+        """
+        pf = self.pair_factor
+        oc = self.orig_cols
+
+        # lds_row = thread_row / pair_factor
+        ctx.v_lshr(ctx.vreg("v_tmp2"), v_thread_row, int(math.log2(pf)),
+                   comment=f"lds_row = thread_row / {pf}")
+        # rotated_col = (thread_col + orig_cols - lds_row) % orig_cols
+        ctx.v_add(v_out, v_thread_col, str(oc),
+                  comment=f"thread_col + {oc}")
+        ctx.inst("v_sub_u32", v_out, v_out, ctx.vreg("v_tmp2"),
+                 comment="- lds_row")
+        ctx.v_and(v_out, v_out, oc - 1,
+                  comment=f"% {oc}")
+
+    def emit_read_setup(self, ctx: 'AsmContext', layout: 'DataLayout',
+                        mem: 'BankedMemoryConfig',
+                        v_lane_row: str, v_k_group: str,
+                        v_row_base: str, out_vregs: List[str]) -> None:
+        """Compute per-ki read addresses with per-half rotation.
+
+        Formula: read_col = half * orig_cols + (k_col + lds_row) % orig_cols
+        addr = lds_row * eff_stride + read_col * 16 + byte_within_col
+
+        Internal scratch registers: v_tmp6 (col), v_tmp7 (byte_within),
+        v_tmp8 (half_offset), v_tmp9 (lds_row / ki scratch),
+        v_tmp5 (saved rotated_k_col_0 for ki>0).
+        """
+        pf = self.pair_factor
+        oc = self.orig_cols
+        ec = self.effective_cols
+
+        col_vreg = ctx.vreg("v_tmp6")
+        bw_vreg = ctx.vreg("v_tmp7")
+        half_vreg = ctx.vreg("v_tmp8")
+        lds_row_vreg = ctx.vreg("v_tmp9")
+
+        k_per_group = layout.mfma_k // (layout.wave_size // layout.mfma_m)
+        bytes_per_kgroup = int(k_per_group * layout.elem_bytes)
+        kgroups_per_col = 16 // bytes_per_kgroup
+
+        # Phase 1: extract all values from parameters before writes
+
+        # 1a. k_col = k_group / kgroups_per_col
+        if kgroups_per_col > 1:
+            log2_kpc = int(math.log2(kgroups_per_col))
+            ctx.v_lshr(col_vreg, v_k_group, log2_kpc,
+                       comment=f"k_col = k_group / {kgroups_per_col}")
+        else:
+            ctx.v_mov(col_vreg, v_k_group, comment="k_col = k_group")
+
+        # 1b. byte_within = (k_group % kgroups_per_col) * bytes_per_kgroup
+        if kgroups_per_col > 1:
+            ctx.v_and(bw_vreg, v_k_group, kgroups_per_col - 1,
+                      comment=f"k_group % {kgroups_per_col}")
+            ctx.v_lshl(bw_vreg, bw_vreg, int(math.log2(bytes_per_kgroup)),
+                       comment=f"* {bytes_per_kgroup} -> byte_within")
+
+        # 1c. half_offset = (m_row % pair_factor) * orig_cols
+        if pf == 2:
+            ctx.v_and(half_vreg, v_lane_row, 1, comment="m_row % 2")
+            ctx.v_lshl(half_vreg, half_vreg, int(math.log2(oc)),
+                       comment=f"* {oc} -> half_offset")
+        else:
+            ctx.v_and(half_vreg, v_lane_row, pf - 1,
+                      comment=f"m_row % {pf}")
+            ctx.v_lshl(half_vreg, half_vreg, int(math.log2(oc)),
+                       comment=f"* {oc}")
+
+        # 1d. lds_row = m_row / pair_factor
+        ctx.v_lshr(lds_row_vreg, v_lane_row, int(math.log2(pf)),
+                   comment=f"lds_row = m_row / {pf}")
+
+        # Phase 2: per-half rotation
+        # rotated_k_col = (k_col + lds_row) % orig_cols
+        # read_col = half_offset + rotated_k_col
+        ctx.v_add(col_vreg, col_vreg, lds_row_vreg,
+                  comment="k_col + lds_row")
+        ctx.v_and(col_vreg, col_vreg, oc - 1,
+                  comment=f"% {oc} (per-half wrap)")
+        # Save rotated_k_col_0 before adding half_offset (needed for ki>0).
+        # v_tmp5 is safe: callers pass v_lds_rd_a/v_tmp1/v_tmp2 as parameters,
+        # and we've finished reading from v_k_group (v_tmp1) by this point.
+        rot_base_vreg = ctx.vreg("v_tmp5")
+        ctx.v_mov(rot_base_vreg, col_vreg,
+                  comment="save rotated_k_col_0 for ki>0")
+        ctx.v_add(col_vreg, col_vreg, half_vreg,
+                  comment="+ half_offset -> read_col")
+
+        # Phase 3: per-ki base addresses
+        k_col_step = int(layout.mfma_k * layout.elem_bytes) // 16
+
+        for ki in range(len(out_vregs)):
+            if ki == 0:
+                ctx.v_lshl(out_vregs[0], col_vreg, 4,
+                           comment="read_col * 16")
+                ctx.v_add(out_vregs[0], out_vregs[0], v_row_base,
+                          comment="+ row_base")
+                if kgroups_per_col > 1:
+                    ctx.v_add(out_vregs[0], out_vregs[0], bw_vreg,
+                              comment="+ byte_within_col")
+            else:
+                step = ki * k_col_step
+                # rotated_k_col_ki = (rotated_k_col_0 + step) % oc
+                # read_col_ki = half_offset + rotated_k_col_ki
+                ctx.v_add(lds_row_vreg, rot_base_vreg, str(step),
+                          comment=f"rotated_k_col_0 + {step} (ki={ki})")
+                ctx.v_and(lds_row_vreg, lds_row_vreg, oc - 1,
+                          comment=f"% {oc}")
+                ctx.v_add(lds_row_vreg, lds_row_vreg, half_vreg,
+                          comment="+ half_offset")
+                ctx.v_lshl(out_vregs[ki], lds_row_vreg, 4,
+                           comment="read_col * 16")
+                ctx.v_add(out_vregs[ki], out_vregs[ki], v_row_base,
+                          comment="+ row_base")
+                if kgroups_per_col > 1:
+                    ctx.v_add(out_vregs[ki], out_vregs[ki], bw_vreg,
+                              comment="+ byte_within_col")
+
+    def verify_paired(self, layout: DataLayout,
+                      mem: BankedMemoryConfig) -> int:
+        """Verify conflict cycles using the actual paired access pattern."""
+        worst = 1
+        for ki in range(layout.ki_count):
+            for kg in range(layout.k_groups):
+                addrs = []
+                for lane in range(mem.lanes_per_group):
+                    m_row = lane
+                    lds_row = self.lds_row_of(m_row)
+                    eff_stride = self.effective_cols * 16
+                    col = self.forward(m_row, kg, self.orig_cols)
+                    col_ki = (col + ki * layout.k_step) % self.effective_cols
+                    addr = lds_row * eff_stride + col_ki * 16
+                    addrs.append(addr)
+                worst = max(worst, mem.cycles(addrs))
+        return worst
+
+
+def auto_swizzle_dtl(layout: DataLayout,
+                     mem: BankedMemoryConfig = LDS_GFX950) -> Swizzle:
+    """Select best swizzle for DTL (Direct-To-LDS) writes.
+
+    DTL writes are sequential (hardware-determined LDS addresses), so XOR
+    swizzle doesn't work. Uses DTLRotationSwizzle which rotates the global
+    read column instead of the LDS write address.
+    """
+    return DTLRotationSwizzle.from_layout(layout, mem)

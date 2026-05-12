@@ -817,9 +817,16 @@ def generate_custom_kernel(
     if dtype == "fp16":
         mfma = MfmaConfig.f16_16x16x16()
         unroll_k = min(unroll_k, 64)
+        # Build DTL rotation swizzle for bank-conflict-free reads
+        from .memory.swizzle import DTLRotationSwizzle, DataLayout as SwzLayout
+        swz_layout = SwzLayout(
+            row_stride_bytes=int(unroll_k * 2),
+            mfma_k=mfma.k, mfma_m=mfma.m, elem_bytes=2,
+        )
+        dtl_swz = DTLRotationSwizzle.from_layout(swz_layout)
         t = GemmTiling.high_perf(
             wg_m=wg_m, wg_n=wg_n, unroll_k=unroll_k,
-            mfma=mfma, lds_swizzle=False,
+            mfma=mfma, lds_swizzle=True, swizzle=dtl_swz,
         )
         p = GemmProblem(4096, 4096, 4096, dtype=DataType.F16)
         effective_pgr = 2 if pgr2 else 1
