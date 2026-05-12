@@ -71,7 +71,16 @@ def phase_store_d(level: TileLevel, ctx: AsmContext) -> None:
     ctx.comment("=== Store D via buffer SRD ===")
 
     # ---- 1. Build raw buffer SRD for D (4 SGPRs) ----
-    ctx.alloc_sgpr_permanent(4, "s_srd_d")
+    # Reuse s_srd_flags if available (StreamK: flags SRD is dead by store time)
+    if ctx.has("s_srd_flags"):
+        # Alias s_srd_d to the same registers as s_srd_flags
+        flags_binding = ctx.get("s_srd_flags")
+        from ..tile.context import Binding, Lifetime
+        ctx._bindings["s_srd_d"] = Binding(
+            "s_srd_d", "s", flags_binding.start, 4,
+            Lifetime.PERMANENT, "__global__")
+    else:
+        ctx.alloc_sgpr_permanent(4, "s_srd_d")
 
     ctx.comment("SRD for D matrix (raw buffer mode)")
     ctx.inst("s_mov_b32", ctx.sreg("s_srd_d", 0, 1),

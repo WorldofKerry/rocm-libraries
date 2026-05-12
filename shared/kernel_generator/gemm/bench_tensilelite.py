@@ -54,6 +54,13 @@ _NAME_TO_SEMANTIC = {
     "strideMXSB1": "StrideScaleB1",
     "alpha": "Alpha",
     "beta": "Beta",
+    "AddressWorkspace": "AddressWorkspace",
+    "AddressFlags": "AddressFlags",
+    "NumWorkGroups": "NumWorkGroups",
+    "ItersPerTile": "ItersPerTile",
+    "SKItersPerWG": "SKItersPerWG",
+    "SKGrid": "SKGrid",
+    "SKTilesAndSplit": "SKTilesAndSplit",
 }
 
 
@@ -103,6 +110,7 @@ def _build_yaml(
     threads: List[int],
     validate: bool = True,
     use_1d_grid: bool = False,
+    streamk: bool = False,
 ) -> str:
     """Build a complete TensileLite benchmark YAML."""
     # ProblemType
@@ -190,7 +198,8 @@ BenchmarkProblems:
 {','.join(chr(10) + l for l in args_lines)} ]
             macrotile: {macrotile}
             threads: {threads}
-            grid: [{"TilesXYBatchGSU" if use_1d_grid else "TilesX"}, {"One" if use_1d_grid else "TilesY"}, One]
+            grid: [{"StreamKWithBatch" if streamk else "TilesXYBatchGSU" if use_1d_grid else "TilesX"}, {"One" if streamk or use_1d_grid else "TilesY"}, One]
+{"            workspaceType: StreamK" + chr(10) + "            workspaceSizePerElemC: 4" if streamk else ""}
         - MatrixInstruction:
           - {mi}
         - AssertFree0ElementMultiple: [{macrotile[0]}]
@@ -339,7 +348,7 @@ def main() -> None:
     macrotile = [args.wg_m, args.wg_n, args.unroll_k]
     threads = [256, 1, 1]
     # FP16 uses WGMXCC=8 (1D grid); MXFP4 uses WGMXCC=1 (2D grid)
-    use_1d = (args.dtype != "mxfp4")
+    use_1d = (args.dtype != "mxfp4") and not args.streamk
     yaml_text = _build_yaml(
         kernel_name=kernel_name,
         yaml_args=yaml_args,
@@ -349,6 +358,7 @@ def main() -> None:
         threads=threads,
         validate=not args.no_validate,
         use_1d_grid=use_1d,
+        streamk=args.streamk,
     )
     yaml_path = test_dir / f"custom_kgen_{args.dtype}.yaml"
     yaml_path.write_text(yaml_text)
