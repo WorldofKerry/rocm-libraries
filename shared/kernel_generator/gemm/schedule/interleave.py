@@ -18,6 +18,7 @@ __all__ = [
     "classify_body_ops",
     "build_dtl_sequence",
     "emit_mfmas_with_dtl_interleaved",
+    "emit_mfmas_with_reads_and_dtl",
     "emit_mfmas_with_reads_interleaved",
 ]
 
@@ -49,7 +50,7 @@ def classify_body_ops(
     for op in consumers:
         if op.kind == OpKind.BARRIER:
             result["barrier"] = op
-        elif op.kind == OpKind.DS_READ:
+        elif op.kind in (OpKind.DS_READ, OpKind.SCALE_LOAD):
             if "_k1" in op.name:
                 result["ki1_reads"].append(op)
             else:
@@ -174,6 +175,85 @@ def emit_mfmas_with_dtl_interleaved(
         kind, payload = dtl_seq[load_idx]
         emit_dtl_load(kind, payload, loader, emit_op_fn, m0_state)
         load_idx += 1
+
+
+def emit_mfmas_with_reads_and_dtl(
+    ctx: 'AsmContext',
+    mfma_ops: List[KLoopOp],
+    read_ops: List[KLoopOp],
+    dtl_seq: List[Tuple[str, object]],
+    loader: 'GlobalLoader',
+    emit_op_fn: object,
+    comment: str = "",
+) -> None:
+    """Emit MFMAs with both ds_reads and DTL loads spread evenly.
+
+    Reads and DTL loads are independently spaced among the MFMAs
+    using separate intervals (they use different HW counters:
+    lgkmcnt for reads, vmcnt for DTL loads).
+
+    Args:
+        ctx: Assembly context (for comments).
+        mfma_ops: MFMA ops to emit.
+        read_ops: ds_read ops to interleave (lgkmcnt).
+        dtl_seq: DTL load sequence from ``build_dtl_sequence`` (vmcnt).
+        loader: GlobalLoader for per-line DTL emission.
+        emit_op_fn: callable(KLoopOp) to emit one op.
+        comment: Optional section comment.
+    """
+    n_mfma = len(mfma_ops)
+    n_reads = len(read_ops)
+    n_dtl = len(dtl_seq)
+
+    if comment:
+        ctx.comment(f"{comment} ({n_mfma} MFMAs + {n_reads} reads + {n_dtl} DTL)")
+
+    if n_mfma == 0:
+        for r in read_ops:
+            emit_op_fn(r)
+        return
+
+    # Build merged schedule: each event has a fractional position
+    # indicating when it should fire relative to the MFMA sequence.
+    # Reads and DTL loads are independently spaced.
+    events: List[Tuple[float, str, int]] = []  # (position, kind, index)
+
+    if n_reads > 0:
+        step = n_mfma / (n_reads + 1)
+        for j in range(n_reads):
+            events.append((step * (j + 1), 'read', j))
+
+    if n_dtl > 0:
+        step = n_mfma / (n_dtl + 1)
+        for j in range(n_dtl):
+            events.append((step * (j + 1), 'dtl', j))
+
+    events.sort(key=lambda e: e[0])
+
+    m0_state: dict = {}
+    event_idx = 0
+
+    for i, mfma_op in enumerate(mfma_ops):
+        emit_op_fn(mfma_op)
+        # Emit all events whose target position is <= current MFMA index+1
+        while event_idx < len(events) and events[event_idx][0] <= i + 1:
+            _, kind, idx = events[event_idx]
+            if kind == 'read':
+                emit_op_fn(read_ops[idx])
+            else:
+                k, payload = dtl_seq[idx]
+                emit_dtl_load(k, payload, loader, emit_op_fn, m0_state)
+            event_idx += 1
+
+    # Remaining events after all MFMAs
+    while event_idx < len(events):
+        _, kind, idx = events[event_idx]
+        if kind == 'read':
+            emit_op_fn(read_ops[idx])
+        else:
+            k, payload = dtl_seq[idx]
+            emit_dtl_load(k, payload, loader, emit_op_fn, m0_state)
+        event_idx += 1
 
 
 def emit_mfmas_with_reads_interleaved(

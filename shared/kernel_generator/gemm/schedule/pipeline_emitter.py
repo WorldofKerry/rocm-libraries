@@ -21,6 +21,7 @@ from .pipeline_scheduler import ScheduledPipeline
 from .interleave import (
     classify_body_ops, build_dtl_sequence,
     emit_mfmas_with_dtl_interleaved, emit_mfmas_with_reads_interleaved,
+    emit_mfmas_with_reads_and_dtl,
 )
 
 if TYPE_CHECKING:
@@ -551,23 +552,28 @@ class PipelineEmitter:
         waitcnts: dict, skip_label: str, pgr: int,
         copy_tag: str, is_first_copy: bool,
     ) -> None:
-        """Emit one copy with barrier-straddling ki-phased structure.
+        """Emit one copy with ki-phased structure and full ki=1 DTL spreading.
 
-        The end-barrier straddles the ki=1 MFMAs: first half before,
-        second half after.  Post-barrier ki=1 MFMAs use VGPR data
-        from before the barrier, hiding the latency of next-copy
-        ki=0 reads that are interleaved among them.
+        DTL loads are spread across ALL ki=1 MFMAs (64 instead of
+        32) by removing the barrier-straddling split.  The end-barrier
+        comes after all ki=1 MFMAs + DTL loads, followed by ki=0
+        reads issued separately (no MFMA overlap, but minimal cost
+        since they are fast LDS reads).
 
         Structure per copy:
-          1. lgkmcnt(0)  (drain ki=0 reads from prev Phase B-2)
-          2. ki=0 MFMAs with ki=1 reads interleaved
+          1. drain prev reads  (lgkmcnt/vmcnt)
+          2. ki=0 MFMAs + ki=1 reads interleaved
           3. lgkmcnt(0) + s_barrier  (mid-copy: drain ki=1 reads)
-          4. ki=1 first half MFMAs + skip-check + DTL loads
-          5. vmcnt(14) + s_barrier  (end-barrier: straddles ki=1)
-          6. ki=1 second half MFMAs + next-copy ki=0 reads + LR swaps
+          4. k_tiles-- + skip-check → skip_label
+          5. negate + scalar_prods
+          6. ALL ki=1 MFMAs + DTL loads interleaved
+          7. vmcnt(14) + s_barrier  (end-barrier)
+          8. next-copy ki=0 reads
+          9. suffix
 
-        For the FIRST copy in the loop, step 1 uses vmcnt(0)+lgkmcnt(0)
-        since there are no Phase B-2 reads yet (ramp-up loaded data).
+        DTL loads MUST be after mid-barrier to avoid LDS contention
+        between DTL writes (to write buffer) and ds_reads (from
+        read buffer) sharing the LDS port.
         """
         ctx = self.ctx
 
@@ -581,12 +587,7 @@ class PipelineEmitter:
         scalar_prods = ops["scalar_prods"]
         load_prods = ops["load_prods"]
 
-        # Split ki=1 MFMAs 50/50 for barrier straddling
-        ki1_half = len(ki1_mfmas) // 2
-        ki1_pre = ki1_mfmas[:ki1_half]
-        ki1_post = ki1_mfmas[ki1_half:]
-
-        # Step 1: drain prev Phase B-2 reads
+        # ─── Step 1: drain prev reads ───
         if is_first_copy:
             ctx.s_waitcnt("vmcnt(0)", comment=f"wait DTL ({copy_tag})")
             ctx.s_waitcnt("lgkmcnt(0)", comment=f"wait LDS ({copy_tag})")
@@ -599,7 +600,6 @@ class PipelineEmitter:
                 ctx.s_waitcnt("vmcnt(0) lgkmcnt(0)",
                               comment="drain ki=0 reads + scale VMEM loads")
         else:
-            # Include vmcnt(0) if pipeline has VMEM scale loads
             has_vmem_scale = any(
                 op.kind == OpKind.SCALE_LOAD for op in self.pipeline.body)
             if has_vmem_scale:
@@ -609,16 +609,16 @@ class PipelineEmitter:
                 ctx.s_waitcnt("lgkmcnt(0)",
                               comment=f"drain ki=0 reads from prev B-2 ({copy_tag})")
 
-        # Step 2: ki=0 MFMAs + ki=1 reads interleaved
+        # ─── Step 2: ki=0 MFMAs + ki=1 reads interleaved ───
         emit_mfmas_with_reads_interleaved(
             ki0_mfmas, ki1_reads, self._emit_op,
             comment=f"ki=0 MFMAs + ki=1 reads", ctx=ctx)
 
-        # Step 3: mid-copy barrier
+        # ─── Step 3: mid-copy barrier ───
         ctx.s_waitcnt("lgkmcnt(0)", comment="drain ki=1 reads")
         ctx.s_barrier(comment=f"mid-copy barrier ({copy_tag})")
 
-        # Step 4: ki=1 pre-barrier half + skip-check + DTL
+        # ─── Step 4: skip-check ───
         ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
                   comment=f"k_tiles-- ({copy_tag})")
         ctx.inst("s_cmp_gt_u32", ctx.sreg("s_k_tiles"),
@@ -627,34 +627,34 @@ class PipelineEmitter:
         ctx.inst("s_cbranch_scc0", skip_label,
                  comment=f"skip {copy_tag} producers (drain)")
 
+        # ─── Step 5: negate + scalar_prods ───
         self.buffer_mgr.emit_negate_step(ctx)
-
         for op in scalar_prods:
             self._emit_op(op)
 
-        # ki=1 pre-barrier MFMAs with DTL loads interleaved
+        # ─── Step 6: ALL ki=1 MFMAs + DTL loads interleaved ───
         loader = ctx._metadata.get("_dtl_loader")
 
-        if loader and len(ki1_pre) >= 4 and hasattr(loader, 'emit_dtl_load_a_single'):
+        if loader and len(ki1_mfmas) >= 4 and hasattr(loader, 'emit_dtl_load_a_single'):
             dtl_seq = build_dtl_sequence(load_prods, loader)
             emit_mfmas_with_dtl_interleaved(
-                ctx, ki1_pre, dtl_seq, loader, self._emit_op,
-                comment=f"ki=1 pre-barrier")
+                ctx, ki1_mfmas, dtl_seq, loader, self._emit_op,
+                comment=f"ki=1 MFMAs + DTL ({copy_tag})")
         else:
-            for mfma_op in ki1_pre:
+            for mfma_op in ki1_mfmas:
                 self._emit_op(mfma_op)
             for op in load_prods:
                 self._emit_op(op)
 
-        # Step 5: end-barrier (straddles ki=1)
+        # ─── Step 7: end-barrier ───
         ctx.s_waitcnt("vmcnt(14)", comment=f"wait DTL -14 inflight ({copy_tag})")
         ctx.s_barrier(comment=f"end-barrier ({copy_tag})")
 
-        # Step 6: ki=1 post-barrier + next-copy ki=0 reads
-        emit_mfmas_with_reads_interleaved(
-            ki1_post, ki0_reads, self._emit_op,
-            comment=f"ki=1 post-barrier + next ki=0 reads", ctx=ctx)
+        # ─── Step 8: next-copy ki=0 reads ───
+        for r in ki0_reads:
+            self._emit_op(r)
 
+        # ─── Step 9: suffix ───
         for op in suffix_ops:
             self._emit_op(op)
 
