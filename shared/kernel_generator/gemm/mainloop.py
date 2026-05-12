@@ -203,6 +203,7 @@ def mainloop_fp16(
     streamk: bool = False,
     wg_mapping_xcc: int = 1,
     colmajor_output: bool = False,
+    tensilelite_abi: bool = False,
 ) -> Mainloop:
     """Standard FP16 mainloop. DTL loads, no scales."""
     from .memory.global_loader import DTLLoader
@@ -216,6 +217,7 @@ def mainloop_fp16(
         pgr=pgr,
         epilogue=StreamKStore() if streamk else DirectStore(),
         colmajor_output=colmajor_output,
+        tensilelite_abi=tensilelite_abi,
     )
 
 

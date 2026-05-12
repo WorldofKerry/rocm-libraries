@@ -645,14 +645,18 @@ def _format_fp16_custom_kernel(
 custom.config:
   InternalSupportParams:
     KernArgsVersion: 2
+    UseUniversalArgs: false
+    SupportUserGSU: false
+    SupportCustomWGM: false
+    SupportCustomStaggerU: false
   ProblemType:
     OperationType: GEMM
     DataType: H
     DestDataType: H
     ComputeDataType: S
     HighPrecisionAccumulate: true
-    TransposeA: 0
-    TransposeB: 1
+    TransposeA: 1
+    TransposeB: 0
     UseBeta: true
     Batched: true
   MatrixInstruction: [{mfma.m}, {mfma.n}, {mfma.k}, 1]
@@ -699,98 +703,82 @@ amdhsa.kernels:
     .wavefront_size:  64
     .max_flat_workgroup_size: 256
     .args:
-      - .name: Gemm info
-        .offset: 0
-        .size: 4
-        .value_kind: by_value
-      - .name: kernel info0
-        .offset: 4
-        .size: 4
-        .value_kind: by_value
-      - .name: kernel info1
-        .offset: 8
-        .size: 4
-        .value_kind: by_value
-      - .name: numWG
-        .offset: 12
-        .size: 4
-        .value_kind: by_value
-      - .name: SizesFree0
-        .offset: 16
-        .size: 4
-        .value_kind: by_value
-      - .name: SizesFree1
-        .offset: 20
-        .size: 4
-        .value_kind: by_value
-      - .name: SizesFree2
-        .offset: 24
-        .size: 4
-        .value_kind: by_value
-      - .name: SizesSum0
-        .offset: 28
-        .size: 4
-        .value_kind: by_value
-      - .name: D
-        .offset: 32
-        .size: 8
-        .value_kind: global_buffer
-        .address_space: global
-      - .name: C
-        .offset: 40
-        .size: 8
-        .value_kind: global_buffer
-        .address_space: global
-      - .name: A
-        .offset: 48
-        .size: 8
-        .value_kind: global_buffer
-        .address_space: global
-      - .name: B
-        .offset: 56
-        .size: 8
-        .value_kind: global_buffer
-        .address_space: global
-      - .name: strideD0
-        .offset: 64
-        .size: 4
-        .value_kind: by_value
-      - .name: strideD1
-        .offset: 68
-        .size: 4
-        .value_kind: by_value
-      - .name: strideC0
-        .offset: 72
-        .size: 4
-        .value_kind: by_value
-      - .name: strideC1
-        .offset: 76
-        .size: 4
-        .value_kind: by_value
-      - .name: strideA0
-        .offset: 80
-        .size: 4
-        .value_kind: by_value
-      - .name: strideA1
-        .offset: 84
-        .size: 4
-        .value_kind: by_value
-      - .name: strideB0
-        .offset: 88
-        .size: 4
-        .value_kind: by_value
-      - .name: strideB1
-        .offset: 92
-        .size: 4
-        .value_kind: by_value
-      - .name: alpha
-        .offset: 96
-        .size: 4
-        .value_kind: by_value
-      - .name: beta
-        .offset: 100
-        .size: 4
-        .value_kind: by_value
+      - .name:           SizesFree0
+        .offset:         0
+        .size:           4
+        .value_kind:     by_value
+      - .name:           SizesFree1
+        .offset:         4
+        .size:           4
+        .value_kind:     by_value
+      - .name:           SizesFree2
+        .offset:         8
+        .size:           4
+        .value_kind:     by_value
+      - .name:           SizesSum0
+        .offset:         12
+        .size:           4
+        .value_kind:     by_value
+      - .name:           D
+        .offset:         16
+        .size:           8
+        .value_kind:     global_buffer
+        .address_space:  generic
+      - .name:           C
+        .offset:         24
+        .size:           8
+        .value_kind:     global_buffer
+        .address_space:  generic
+      - .name:           A
+        .offset:         32
+        .size:           8
+        .value_kind:     global_buffer
+        .address_space:  generic
+      - .name:           B
+        .offset:         40
+        .size:           8
+        .value_kind:     global_buffer
+        .address_space:  generic
+      - .name:           strideD0
+        .offset:         48
+        .size:           4
+        .value_kind:     by_value
+      - .name:           strideD1
+        .offset:         52
+        .size:           4
+        .value_kind:     by_value
+      - .name:           strideC0
+        .offset:         56
+        .size:           4
+        .value_kind:     by_value
+      - .name:           strideC1
+        .offset:         60
+        .size:           4
+        .value_kind:     by_value
+      - .name:           strideA0
+        .offset:         64
+        .size:           4
+        .value_kind:     by_value
+      - .name:           strideA1
+        .offset:         68
+        .size:           4
+        .value_kind:     by_value
+      - .name:           strideB0
+        .offset:         72
+        .size:           4
+        .value_kind:     by_value
+      - .name:           strideB1
+        .offset:         76
+        .size:           4
+        .value_kind:     by_value
+      - .name:           alpha
+        .offset:         80
+        .size:           4
+        .value_kind:     by_value
+      - .name:           beta
+        .offset:         84
+        .size:           4
+        .value_kind:     by_value
 ...
 .end_amdgpu_metadata
 """
@@ -831,12 +819,12 @@ def generate_custom_kernel(
         unroll_k = min(unroll_k, 64)
         t = GemmTiling.high_perf(
             wg_m=wg_m, wg_n=wg_n, unroll_k=unroll_k,
-            mfma=mfma, lds_swizzle=True,
+            mfma=mfma, lds_swizzle=False,
         )
         p = GemmProblem(4096, 4096, 4096, dtype=DataType.F16)
         effective_pgr = 2 if pgr2 else 1
         ml = mainloop_fp16(
-            pgr=effective_pgr, wg_mapping_xcc=8, colmajor_output=True,
+            pgr=effective_pgr, wg_mapping_xcc=8, colmajor_output=True, tensilelite_abi=True,
         )
     else:
         mfma = MfmaConfig.mxfp4_16x16x128()
@@ -857,7 +845,7 @@ def generate_custom_kernel(
     if kernel_name is None:
         if dtype == "fp16":
             kernel_name = (
-                f"Custom_Cijk_Ailk_Bjlk_HHS_BH"
+                f"Custom_Cijk_Alik_Bljk_HHS_BH"
                 f"_MT{wg_m}x{wg_n}x{unroll_k}_MI16x16x1"
                 f"_kgen_gfx950"
             )

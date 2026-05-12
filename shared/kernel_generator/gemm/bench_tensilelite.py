@@ -102,6 +102,7 @@ def _build_yaml(
     macrotile: List[int],
     threads: List[int],
     validate: bool = True,
+    use_1d_grid: bool = False,
 ) -> str:
     """Build a complete TensileLite benchmark YAML."""
     # ProblemType
@@ -189,7 +190,7 @@ BenchmarkProblems:
 {','.join(chr(10) + l for l in args_lines)} ]
             macrotile: {macrotile}
             threads: {threads}
-            grid: [TilesX, TilesY, One]
+            grid: [{"TilesXYBatchGSU" if use_1d_grid else "TilesX"}, {"One" if use_1d_grid else "TilesY"}, One]
         - MatrixInstruction:
           - {mi}
         - AssertFree0ElementMultiple: [{macrotile[0]}]
@@ -337,6 +338,8 @@ def main() -> None:
     yaml_args = _args_to_yaml_list(metadata_args)
     macrotile = [args.wg_m, args.wg_n, args.unroll_k]
     threads = [256, 1, 1]
+    # FP16 uses WGMXCC=8 (1D grid); MXFP4 uses WGMXCC=1 (2D grid)
+    use_1d = (args.dtype != "mxfp4")
     yaml_text = _build_yaml(
         kernel_name=kernel_name,
         yaml_args=yaml_args,
@@ -345,6 +348,7 @@ def main() -> None:
         macrotile=macrotile,
         threads=threads,
         validate=not args.no_validate,
+        use_1d_grid=use_1d,
     )
     yaml_path = test_dir / f"custom_kgen_{args.dtype}.yaml"
     yaml_path.write_text(yaml_text)
