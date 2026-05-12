@@ -404,6 +404,10 @@ def _emit_persistent_loop(ctx, tile, mainloop, scheduled, buffer_mgr,
 
     # Derive tile and K-range from current iteration
     _emit_sk_tile_from_iter(ctx, tile, mainloop)
+    # Save k_tiles for PGR drain guard before reset clobbers it
+    if scheduled.pgr >= 2 and ctx.has("s_k_tiles_init"):
+        ctx.s_mov(ctx.sreg("s_k_tiles_init"), ctx.sreg("s_k_tiles"),
+                  comment="save k_tiles for drain guard")
     emit_zero_accumulators(ctx, tile)
     emit_reset_kloop_state(ctx, tile, mainloop, scheduled.pgr)
 
@@ -419,9 +423,11 @@ def _emit_persistent_loop(ctx, tile, mainloop, scheduled, buffer_mgr,
         level = TileLevel("workgroup", m=tile.wg_m, n=tile.wg_n, k=tile.unroll_k)
     phase_store_streamk(level, ctx)
 
-    # Advance iter_current past this tile
+    # Advance iter_current past this tile (use saved init value since
+    # s_k_tiles is decremented to 0 by the K-loop)
+    advance_reg = "s_k_tiles_init" if ctx.has("s_k_tiles_init") else "s_k_tiles"
     ctx.inst("s_add_u32", ctx.sreg("s_iter_current"),
-             ctx.sreg("s_iter_current"), ctx.sreg("s_k_tiles"),
+             ctx.sreg("s_iter_current"), ctx.sreg(advance_reg),
              comment="iter_current += k_tiles (advance)")
 
     ctx.inst("s_branch", "persistent_loop", comment="next tile")
