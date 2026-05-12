@@ -626,16 +626,10 @@ def _store_workspace_sk(ctx, tile):
                        ctx.sreg("s_workspace_ptr", 0, 1),
                        ctx.sreg("s_workspace_ptr", 1, 1))
 
-    # Compute ws slot and voffset (row-major within tile)
+    # Workspace slot = wg_idx (each WG gets one tile-sized slot)
     tile_area = tile.wg_m * tile.wg_n
-    emit_compute_tile_serial(ctx, tile)
-    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
-              ctx.sreg("s_iters_per_tile"), comment="tile_serial * ipt")
-    ctx.inst("s_add_u32", ctx.sreg("s_tmp0"),
-             ctx.sreg("s_tmp0"), ctx.sreg("s_iter_start"),
-             comment="+ iter_start -> ws_slot")
-    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
-              str(tile_area * 4), comment="ws_base = slot * tile_bytes")
+    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_wg_idx_save"),
+              str(tile_area * 4), comment="ws_base = wg_idx * tile_bytes")
 
     # Per-lane voffset
     ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.n - 1,

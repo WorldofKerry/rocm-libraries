@@ -260,6 +260,11 @@ def _emit_sk_iter_range_setup(
 
     ctx.label("sk_init_done")
 
+    # Save wg_idx for workspace slot addressing in the epilogue
+    ctx.alloc_sgpr_permanent(1, "s_wg_idx_save")
+    ctx.s_mov(ctx.sreg("s_wg_idx_save"), ctx.sreg("s_wg_id_x"),
+              comment="save wg_idx for workspace slot")
+
     # Save initial K-tiles for drain guard (PGR >= 2)
     if pgr >= 2:
         ctx.alloc_sgpr_permanent(1, "s_k_tiles_init")

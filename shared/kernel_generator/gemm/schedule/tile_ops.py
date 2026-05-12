@@ -53,13 +53,13 @@ def emit_decompose_tile_idx(
     """
     ctx.comment("Decompose tile_idx -> tile_m, tile_n")
 
-    # If tile_idx is in s_tmp0, save it before clobbering s_tmp0 with ff1.
-    # s_wg_id_x is safe to use as temp since it's overwritten below.
+    # Save tile_idx before clobbering s_tmp0/s_tmp1 with tiles_m/ff1.
+    # Use s_wg_id_y as temp (overwritten last, after all reads of saved_reg).
     saved_reg = tile_idx_reg
-    if tile_idx_reg == "s_tmp0":
-        ctx.s_mov(ctx.sreg("s_wg_id_x"), ctx.sreg("s_tmp0"),
+    if tile_idx_reg in ("s_tmp0", "s_tmp1"):
+        ctx.s_mov(ctx.sreg("s_wg_id_y"), ctx.sreg(tile_idx_reg),
                   comment="save tile_idx")
-        saved_reg = "s_wg_id_x"
+        saved_reg = "s_wg_id_y"
 
     log2_wgm = int(math.log2(tile.wg_m))
     ctx.inst("s_lshr_b32", ctx.sreg("s_tmp1"), ctx.sreg("s_M"),
