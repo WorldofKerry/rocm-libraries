@@ -835,9 +835,14 @@ def generate_custom_kernel(
         )
     else:
         mfma = MfmaConfig.mxfp4_16x16x128()
+        from .memory.swizzle import DTLRotationSwizzle, DataLayout as SwzLayout
+        swz_layout_mx = SwzLayout(row_stride_bytes=int(unroll_k * 0.5),
+                                  mfma_k=mfma.k, mfma_m=mfma.m,
+                                  elem_bytes=0.5, wave_size=64)
+        dtl_swz_mx = DTLRotationSwizzle.from_layout(swz_layout_mx)
         t = GemmTiling.high_perf(
             wg_m=wg_m, wg_n=wg_n, unroll_k=unroll_k,
-            mfma=mfma, lds_swizzle=True,
+            mfma=mfma, lds_swizzle=True, swizzle=dtl_swz_mx,
         )
         p = GemmProblem(4096, 4096, 4096, dtype=DataType.MXFP4)
         effective_pgr = 2  # MXFP4 always PGR=2
