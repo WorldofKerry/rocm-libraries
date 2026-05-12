@@ -289,7 +289,7 @@ class XorSwizzle(Swizzle):
             # Simplified: XOR with shifted value, then add ki offset
             xor_bytes = ki * layout.k_step * mem.access_width
             ctx.inst("v_xor_b32", out_vregs[ki],
-                     out_vregs[0], str(xor_bytes),
+                     str(xor_bytes), out_vregs[0],
                      comment=f"ki={ki}: XOR {xor_bytes}")
 
 

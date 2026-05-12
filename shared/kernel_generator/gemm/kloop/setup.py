@@ -460,6 +460,14 @@ def _emit_lds_read_addresses(ctx: AsmContext, tile: TileConfig,
     if swz_check is None or not hasattr(swz_check, 'pair_factor'):
         ctx.v_add(ctx.vreg("v_lds_rd_b"), str(dtl_b_off),
                   ctx.vreg("v_lds_rd_b"), comment=f"+ lds_b_offset({dtl_b_off})")
+        # Also add B offset to per-ki VGPRs (XOR swizzle computes them
+        # before the B offset is added, so they need it too).
+        for ki in range(1, tile.k_iterations):
+            vname = f"v_lds_rd_b_k{ki}"
+            if ctx.has(vname):
+                ctx.v_add(ctx.vreg(vname), str(dtl_b_off),
+                          ctx.vreg(vname),
+                          comment=f"+ lds_b_offset({dtl_b_off}) ki={ki}")
     ctx.raw("")
 
 
