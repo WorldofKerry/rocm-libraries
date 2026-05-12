@@ -774,16 +774,31 @@ def _reduce_partials(ctx, tile):
         ctx.inst("v_accvgpr_write_b32", ctx.areg("acc_C", i, 1), "0",
                  comment=f"zero acc[{i}]")
 
-    # Tile base in workspace
+    # Compute coopGroupStart (first WG index contributing to this tile)
     emit_compute_tile_serial(ctx, tile)
+    # s_tmp0 = tile_serial
+    # dp_tiles = total_tiles - sk_tiles
+    ctx.inst("s_sub_u32", ctx.sreg("s_is_partial"), ctx.sreg("s_num_partitions"),
+             ctx.sreg("s_sk_tiles"), comment="dp_tiles = total - sk_tiles")
+    # sk_tile_idx = tile_serial - dp_tiles
+    ctx.inst("s_sub_u32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+             ctx.sreg("s_is_partial"), comment="sk_tile_idx")
+    # tile_first_sk_iter = sk_tile_idx * ipt
     ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
-              ctx.sreg("s_iters_per_tile"), comment="tile_serial * ipt")
-    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
-              str(tile_area * 4), comment="ws_tile_base")
-
-    # Loop over partitions
+              ctx.sreg("s_iters_per_tile"), comment="first SK iter for tile")
+    # coopGroupStart = dp_tiles + first_sk_iter / ipw
     if not ctx.has("s_reduce_p"):
         ctx.alloc_sgpr_permanent(1, "s_reduce_p")
+    ctx.inst("s_ff1_i32_b32", ctx.sreg("s_reduce_p"),
+             ctx.sreg("s_sk_iters_per_wg"), comment="log2(ipw)")
+    ctx.inst("s_lshr_b32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+             ctx.sreg("s_reduce_p"), comment="/ ipw")
+    ctx.inst("s_add_u32", ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+             ctx.sreg("s_is_partial"), comment="+ dp_tiles -> coopGroupStart")
+    ctx.s_mul(ctx.sreg("s_tmp0"), ctx.sreg("s_tmp0"),
+              str(tile_area * 4), comment="coopGroupStart * tile_bytes")
+
+    # Loop over partitions
     ctx.s_mov(ctx.sreg("s_reduce_p"), "0", comment="p = 0")
 
     ctx.label("sk_reduce_loop")
