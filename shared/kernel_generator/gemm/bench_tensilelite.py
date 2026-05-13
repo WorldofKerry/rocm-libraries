@@ -15,6 +15,8 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import os
 import re
 import shutil
@@ -173,6 +175,10 @@ GlobalParameters:
   MinimumRequiredVersion: 5.0.0
   SleepPercent: 50
   NumElementsToValidate: {num_validate}
+  NumBenchmarks: 1
+  SyncsPerBenchmark: 4
+  EnqueuesPerSync: 1
+  NumWarmups: 4
   DataInitTypeBeta: 0
   DataInitTypeAlpha: 1
   DataInitTypeA: 3
@@ -252,18 +258,32 @@ LibraryLogic:
 def _parse_csv_results(output: str) -> list:
     """Parse Tensile.sh CSV output for timing results."""
     results = []
+    header = None
     for line in output.splitlines():
         # Data lines start with a digit (run index)
-        if not line or not line[0].isdigit():
+        if not line:
             continue
-        fields = line.split(",")
-        if len(fields) < 12:
+        # Capture header line for column mapping
+        if line.startswith("run,"):
+            header = next(csv.reader(io.StringIO(line)))
+            continue
+        if not line[0].isdigit():
+            continue
+        # Use csv.reader to handle quoted fields with commas
+        try:
+            fields = next(csv.reader(io.StringIO(line)))
+        except (csv.Error, StopIteration):
+            continue
+        if len(fields) < 12 or not header:
             continue
         try:
-            sizes_str = fields[4].strip('"()')
-            validation = fields[9]
-            time_us = float(fields[10]) if fields[10] != "-nan" else None
-            gflops = float(fields[11]) if fields[11] != "-nan" else None
+            col = {name: i for i, name in enumerate(header)}
+            sizes_str = fields[col["problem-sizes"]].strip("()")
+            validation = fields[col["validation"]]
+            time_str = fields[col["time-us"]]
+            gflops_str = fields[col["gflops"]]
+            time_us = float(time_str) if time_str not in ("", "-nan") else None
+            gflops = float(gflops_str) if gflops_str not in ("", "-nan") else None
             results.append({
                 "sizes": sizes_str,
                 "validation": validation,
