@@ -231,7 +231,20 @@ class ScaleStream(LDSStream):
 
     def advance(self, ctx: 'AsmContext') -> None:
         if self._region == 0:
-            return  # VMEM path: advance handled by VMEMScaleLoader
+            # VMEM path: advance scale SRD alongside data SRD.
+            # This is a producer op (iteration > 0), runs after the
+            # skip-check. Scale reads (ki0_reads) fire in the suffix
+            # BEFORE this advance in single-copy, but in double-copy
+            # the advance must happen between C0 and C1 so C1's scale
+            # reads see the correct K-step.
+            srd = f"s_srd_scale_{self._matrix}"
+            stride = self._scale_k_stride
+            ctx.inst("s_add_u32", ctx.sreg(srd, 0, 1),
+                     ctx.sreg(srd, 0, 1), str(stride),
+                     comment=f"{srd} += {stride}")
+            ctx.inst("s_addc_u32", ctx.sreg(srd, 1, 1),
+                     ctx.sreg(srd, 1, 1), "0", comment="carry")
+            return
         srd = f"s_srd_scale_{self._matrix}"
         stride = self._scale_k_stride
         ctx.inst("s_add_u32", ctx.sreg(srd, 0, 1),
@@ -250,17 +263,8 @@ class ScaleStream(LDSStream):
 
     def toggle_read(self, ctx: 'AsmContext') -> None:
         if self._region == 0:
-            # VMEM path: advance scale SRD post-consumer.
-            # toggle_read is a consumer suffix (iteration=0), runs
-            # AFTER barrier + scale reads + MFMAs, so scale reads
-            # see the current K. Advance prepares for next iteration.
-            srd = f"s_srd_scale_{self._matrix}"
-            stride = self._scale_k_stride
-            ctx.inst("s_add_u32", ctx.sreg(srd, 0, 1),
-                     ctx.sreg(srd, 0, 1), str(stride),
-                     comment=f"{srd} += {stride}")
-            ctx.inst("s_addc_u32", ctx.sreg(srd, 1, 1),
-                     ctx.sreg(srd, 1, 1), "0", comment="carry")
+            # VMEM path: advance is done in the producer phase.
+            # toggle_read is a no-op for VMEM scales.
             return
         rd = f"v_scale_rd_{self._matrix}"
         ctx.v_add(ctx.vreg(rd), ctx.vreg(rd),
