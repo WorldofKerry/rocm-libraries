@@ -183,6 +183,12 @@ GlobalParameters:
   DataInitTypeAlpha: 1
   DataInitTypeA: 3
   DataInitTypeB: 3
+  DataInitTypeMXSA: 3
+  DataInitTypeMXSB: 3
+  KernelTime: True
+  DeviceLDS: 163840
+  MaxLDS: 163840
+  MXScaleFormat: 1
   CSVExportWinner: 1
   CSVMergeSameProblemID: 1
   Device: 0
