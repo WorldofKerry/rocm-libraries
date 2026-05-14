@@ -392,14 +392,18 @@ class VMEMScaleLoader(ScaleLoader):
         srd = ctx.sreg("s_srd_scale_b", 0, 4)
 
         if self._swizzled:
-            voff = ctx.vreg("v_dtl_off_scale_b")
             group = ni // 2
             soff = ctx.sreg(f"s_scale_soff_b{group}")
             name = self._scale_b_names.get((ni, 0))
             if name:
+                # B scale must be uniform across all lanes.  Use
+                # buffer_load_dword with zeroed voffset so all lanes
+                # read the same 4-byte dword (first dword of group).
                 ctx.inst("buffer_load_dword",
-                         ctx.vreg(name), voff, srd, soff, "offen",
-                         comment=f"scale B group{group} (n{ni}-n{ni+1})")
+                         ctx.vreg(name),
+                         ctx.vreg("v_dtl_off_scale_b"),
+                         srd, soff, "offen",
+                         comment=f"scale B group{group} (n{ni}-n{ni+1}) [uniform]")
             return
 
         voff = ctx.vreg("v_scale_voff_b")

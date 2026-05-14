@@ -774,16 +774,20 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
 
         if use_swizzled_scales:
             # Pre-swizzled scale layout (e8m0_shuffle):
-            # Per-lane voffset = lane_id * 4
+            # Per-lane voffset A = lane_id * 8 (skip interleaved K-blocks)
+            # B scale loaded via s_buffer_load_dword (uniform across lanes)
             # Per-group soffset = (wave_m * n_groups_a + group) * 256
             # Each 256-byte tile covers 32 M-rows (2 MFMA tiles of 16 rows)
-            ctx.comment("Scale swizzled voffset: lane_id * 4")
+            ctx.comment("Scale A voffset: (lane_id % 16) * 8")
+            ctx.inst("v_and_b32", ctx.vreg("v_dtl_off_scale_a"),
+                     ctx.vreg("v_lane_id"), "15",
+                     comment="lane_id % 16 (M-row within MFMA tile)")
             ctx.v_lshl(ctx.vreg("v_dtl_off_scale_a"),
-                       ctx.vreg("v_lane_id"), 2,
-                       comment="lane_id * 4 -> swizzled scale voffset")
+                       ctx.vreg("v_dtl_off_scale_a"), 3,
+                       comment="* 8 -> scale A voffset")
+            # B scale voffset = 0 (uniform load, all lanes read same dword)
             ctx.inst("v_mov_b32", ctx.vreg("v_dtl_off_scale_b"),
-                     ctx.vreg("v_dtl_off_scale_a"),
-                     comment="scaleB voffset = same")
+                     "0", comment="scale B voffset = 0 (uniform)")
             ctx.raw("")
 
             # Compute SGPR soffsets for each group

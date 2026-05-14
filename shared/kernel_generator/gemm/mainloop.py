@@ -296,22 +296,21 @@ def mainloop_mxfp4_tensilelite(
 ) -> Mainloop:
     """MXFP4 mainloop for TensileLite custom kernels.
 
-    Uses VMEM scale loading with pre-swizzled E8M0 layout
-    (``--mx-scale-format 1``) for TensileLite compatibility.
+    Uses LDS-based scale loading (DTL->LDS->ds_read) to match the
+    pre-swizzled E8M0 layout (``--mx-scale-format 1``).  Each lane
+    reads 4 consecutive K-block scales from LDS via ds_read_b32.
 
     Args:
-        swizzled_scales: Accepted for API compatibility (currently unused).
         streamk: Enable StreamK work distribution for better CU utilization.
     """
     from .memory.global_loader import DTLLoader
-    from .memory.scale_layout import E8M0ShuffleLayout
 
     layout = MXFP4_STREAMK_LAYOUT if streamk else MXFP4_LAYOUT
     return Mainloop(
         layout=layout,
         grid=_make_grid(wg_mapping_xcc),
         loader_cls=DTLLoader,
-        scale_strategy=VMEMScaleStrategy(swizzled=True),
+        scale_strategy=LDSScaleStrategy(),
         swizzle=IdentitySwizzle(),
         pgr=pgr,
         epilogue=StreamKStore() if streamk else DirectStore(),
