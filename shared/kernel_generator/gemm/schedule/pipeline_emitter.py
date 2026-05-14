@@ -586,7 +586,7 @@ class PipelineEmitter:
           5. k_tiles-- + negate (always)
           5b. skip-check → skip_label
           6. scalar_prods (toggle_write) + DTL loads
-          7. [skip_label] vmcnt(14) + s_barrier
+          7. [skip_label] vmcnt(0) + lgkmcnt(0) + s_barrier
           8. negate (flip step for toggle_read)
           9. suffix (toggle_read, uses flipped step)
           10. negate (restore step)
@@ -677,7 +677,11 @@ class PipelineEmitter:
 
         # ─── Step 7: end-barrier ───
         ctx.label(skip_label)
-        ctx.s_waitcnt("vmcnt(14)", comment=f"wait DTL -14 inflight ({copy_tag})")
+        # Must drain ALL DTL loads before reading the buffer they
+        # wrote to.  In double-copy, the other copy's ki=0 reads
+        # access this buffer after toggle, so loads must be done.
+        ctx.s_waitcnt("vmcnt(0)", comment=f"wait all DTL loads ({copy_tag})")
+        ctx.s_waitcnt("lgkmcnt(0)", comment=f"wait scale LDS writes ({copy_tag})")
         ctx.s_barrier(comment=f"end-barrier ({copy_tag})")
 
         # ─── Step 8: negate (flip step for toggle_read) ───

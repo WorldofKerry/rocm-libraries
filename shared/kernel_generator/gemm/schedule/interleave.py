@@ -98,14 +98,15 @@ def build_dtl_sequence(
         if "scale" in op.name:
             seq.append(("scale_op", op))
 
-    # Alternate A and B DTL loads
     n_a = loader.num_loads_a
     n_b = loader.num_loads_b
-    for j in range(max(n_a, n_b)):
-        if j < n_a:
-            seq.append(("dtl_a", j))
-        if j < n_b:
-            seq.append(("dtl_b", j))
+    # All A DTL loads, then all B (no interleaving).
+    # m0 must be set once per matrix and advanced sequentially;
+    # interleaving A/B would corrupt m0 state.
+    for j in range(n_a):
+        seq.append(("dtl_a", j))
+    for j in range(n_b):
+        seq.append(("dtl_b", j))
 
     return seq
 
@@ -124,19 +125,21 @@ def emit_dtl_load(
         payload: KLoopOp (for scale) or int index (for dtl_a/b)
         loader: GlobalLoader with emit_dtl_* methods
         emit_op_fn: callable to emit a KLoopOp
-        m0_state: dict tracking {'a': bool, 'b': bool} for m0 setup
+        m0_state: dict tracking which matrix m0 is set for.
+            Keys: 'current' -> 'a' or 'b', 'a_idx' / 'b_idx' -> last index.
+            m0 is re-set whenever the matrix switches.
     """
     if kind == "scale_op":
         emit_op_fn(payload)
     elif kind == "dtl_a":
-        if not m0_state.get("a"):
+        if m0_state.get("current") != "a":
             loader.emit_dtl_m0_a()
-            m0_state["a"] = True
+            m0_state["current"] = "a"
         loader.emit_dtl_load_a_single(payload)
     elif kind == "dtl_b":
-        if not m0_state.get("b"):
+        if m0_state.get("current") != "b":
             loader.emit_dtl_m0_b()
-            m0_state["b"] = True
+            m0_state["current"] = "b"
         loader.emit_dtl_load_b_single(payload)
 
 
