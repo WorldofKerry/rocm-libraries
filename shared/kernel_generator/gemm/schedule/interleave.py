@@ -68,6 +68,11 @@ def classify_body_ops(
             result["scalar_prods"].append(op)
         elif op.kind == OpKind.GLOBAL_LOAD:
             result["load_prods"].append(op)
+        elif op.kind == OpKind.DS_WRITE:
+            # Scale LDS writes: must happen after the corresponding
+            # global load completes.  Grouped with load_prods so
+            # they are emitted together in the producer phase.
+            result["load_prods"].append(op)
 
     return result
 

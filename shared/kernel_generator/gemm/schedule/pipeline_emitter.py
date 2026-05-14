@@ -287,9 +287,12 @@ class PipelineEmitter:
         in a skip-check.
 
         When ``double_copy`` is enabled, the consumers and producers
-        are emitted twice (C0 then C1).  Each copy decrements
-        k_tiles by 1 and has its own skip-check.  If C0 skips,
-        C1 is bypassed entirely (jump to ``load_skip_all``).
+        are emitted twice (C0 then C1).  Each copy has its own
+        skip-check that skips producers only (not the end-barrier,
+        suffix toggle, or ki=0 reads).  The negate is emitted
+        before the skip-check so it always runs; extra negates
+        around the suffix ensure toggle_read uses the opposite
+        step direction from toggle_write.
         """
         ctx = self.ctx
         waitcnts = self.pipeline.waitcnts
@@ -304,21 +307,28 @@ class PipelineEmitter:
         if self.double_copy:
             if self.pipeline.ki_phased:
                 # -- Ki-phased double-copy --------------------------
-                # Both copies use Phase B-2 reads from the previous
-                # copy (or pre-loop reads for the first C0).
                 ctx.comment("=== Copy C0 (ki-phased) ===")
                 self._emit_copy_ki_phased(
                     body, producer_start, waitcnts,
-                    skip_label="load_skip_all", pgr=pgr, copy_tag="C0",
+                    skip_label="c0_prod_skip", pgr=pgr, copy_tag="C0",
                     is_first_copy=False)
                 ctx.raw("")
+
+                # Guard: skip C1 when C0 consumed the last tile.
+                # k_tiles underflows (unsigned) if C1 decrements
+                # past 0, so we must prevent C1 from running.
+                ctx.inst("s_cmp_eq_u32", ctx.sreg("s_k_tiles"), "0",
+                         comment="k_tiles == 0? (no data for C1)")
+                ctx.inst("s_cbranch_scc1", "load_skip_all",
+                         comment="skip C1 (all tiles consumed)")
 
                 ctx.comment("=== Copy C1 (ki-phased) ===")
                 self._emit_copy_ki_phased(
                     body, producer_start, waitcnts,
-                    skip_label="load_skip_c1", pgr=pgr, copy_tag="C1",
+                    skip_label="c1_prod_skip", pgr=pgr, copy_tag="C1",
                     is_first_copy=False)
                 ctx.raw("")
+
             else:
                 # -- Standard interleaved double-copy ---------------
                 ctx.comment("=== Copy C0 ===")
@@ -333,11 +343,11 @@ class PipelineEmitter:
                     skip_label="load_skip_c1", pgr=pgr, copy_tag="C1")
                 ctx.raw("")
 
-            # C1 skip target + loop tail
-            ctx.label("load_skip_c1")
-            self._emit_loop_tail()
-            # C0 skip target (after loop exit, drain follows)
-            ctx.label("load_skip_all")
+            if not self.pipeline.ki_phased:
+                # C1 skip target + loop tail (non-ki-phased path)
+                ctx.label("load_skip_c1")
+                self._emit_loop_tail()
+                ctx.label("load_skip_all")
         else:
             # -- Single-copy (original) ----------------------------
             self._emit_copy_consumers(body, producer_start, waitcnts)
@@ -358,6 +368,11 @@ class PipelineEmitter:
 
             # Loop tail.
             self._emit_loop_tail()
+
+        if self.double_copy and self.pipeline.ki_phased:
+            # Loop tail for ki-phased double-copy (after C1).
+            self._emit_loop_tail()
+            ctx.label("load_skip_all")
 
     # -- drain -----------------------------------------------------
 
@@ -399,7 +414,15 @@ class PipelineEmitter:
             # s_k_tiles_init is saved by the pipeline phase before
             # the loop starts. If it doesn't exist (unit tests),
             # drain runs unconditionally (assumes enough tiles).
-            if ctx.has("s_k_tiles_init"):
+            if self.double_copy:
+                # Double-copy: body consumes 2 tiles/iter.  Drain
+                # is needed only when k_tiles > 0 at loop exit
+                # (odd total tile count).
+                ctx.inst("s_cmp_eq_u32", ctx.sreg("s_k_tiles"), "0",
+                         comment="k_tiles == 0? (all consumed)")
+                ctx.inst("s_cbranch_scc1", skip_label,
+                         comment=f"drain stage {d_idx} not needed")
+            elif ctx.has("s_k_tiles_init"):
                 ctx.inst("s_cmp_le_u32", ctx.sreg("s_k_tiles_init"),
                          str(ramp_stage),
                          comment=f"skip drain if k_tiles_init <= {ramp_stage}")
@@ -555,27 +578,29 @@ class PipelineEmitter:
     ) -> None:
         """Emit one copy with ki-phased structure and full ki=1 DTL spreading.
 
-        DTL loads are spread across ALL ki=1 MFMAs (64 instead of
-        32) by removing the barrier-straddling split.  The end-barrier
-        comes after all ki=1 MFMAs + DTL loads, followed by ki=0
-        reads issued separately (no MFMA overlap, but minimal cost
-        since they are fast LDS reads).
-
-        Structure per copy:
+        Structure per copy (double-copy toggle fix):
           1. drain prev reads  (lgkmcnt/vmcnt)
           2. ki=0 MFMAs + ki=1 reads interleaved
           3. lgkmcnt(0) + s_barrier  (mid-copy: drain ki=1 reads)
           4. ALL ki=1 MFMAs  (consumers, always execute)
-          5. k_tiles-- + skip-check → skip_label
-          6. negate + scalar_prods + DTL loads
-          7. vmcnt(14) + s_barrier  (end-barrier)
-          8. next-copy ki=0 reads
-          9. suffix
+          5. k_tiles-- + negate (always)
+          5b. skip-check → skip_label
+          6. scalar_prods (toggle_write) + DTL loads
+          7. [skip_label] vmcnt(14) + s_barrier
+          8. negate (flip step for toggle_read)
+          9. suffix (toggle_read, uses flipped step)
+          10. negate (restore step)
+          11. ki=0 reads (from toggled buffer)
 
         ki=1 MFMAs are consumers (they use data from the CURRENT
         iteration loaded before the mid-barrier).  They must NOT
         be skipped during drain.  Only the producer ops (DTL loads,
         SRD advances) are skipped when there are no more tiles.
+
+        Toggle invariant: toggle_write and toggle_read need opposite
+        step directions.  The negate at step 5 sets the step for
+        toggle_write; the extra negates at 8/10 flip it for
+        toggle_read and restore it afterward.
         """
         ctx = self.ctx
 
@@ -624,17 +649,19 @@ class PipelineEmitter:
         for mfma_op in ki1_mfmas:
             self._emit_op(mfma_op)
 
-        # ─── Step 5: skip-check ───
+        # ─── Step 5: k_tiles-- + negate (always runs) ───
         ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
                   comment=f"k_tiles-- ({copy_tag})")
+        self.buffer_mgr.emit_negate_step(ctx)
+
+        # ─── Step 5b: skip-check ───
         ctx.inst("s_cmp_gt_u32", ctx.sreg("s_k_tiles"),
                  str(pgr - 1),
                  comment=f"k_tiles > {pgr - 1}? ({copy_tag})")
         ctx.inst("s_cbranch_scc0", skip_label,
                  comment=f"skip {copy_tag} producers (drain)")
 
-        # ─── Step 6: negate + scalar_prods + DTL loads ───
-        self.buffer_mgr.emit_negate_step(ctx)
+        # ─── Step 6: scalar_prods (toggle_write) + DTL loads ───
         for op in scalar_prods:
             self._emit_op(op)
 
@@ -649,16 +676,23 @@ class PipelineEmitter:
                 self._emit_op(op)
 
         # ─── Step 7: end-barrier ───
+        ctx.label(skip_label)
         ctx.s_waitcnt("vmcnt(14)", comment=f"wait DTL -14 inflight ({copy_tag})")
         ctx.s_barrier(comment=f"end-barrier ({copy_tag})")
 
-        # ─── Step 8: next-copy ki=0 reads ───
-        for r in ki0_reads:
-            self._emit_op(r)
+        # ─── Step 8: negate (flip step for toggle_read) ───
+        self.buffer_mgr.emit_negate_step(ctx)
 
-        # ─── Step 9: suffix ───
+        # ─── Step 9: suffix (toggle_read, uses flipped step) ───
         for op in suffix_ops:
             self._emit_op(op)
+
+        # ─── Step 10: negate (restore step) ───
+        self.buffer_mgr.emit_negate_step(ctx)
+
+        # ─── Step 11: ki=0 reads (from toggled buffer) ───
+        for r in ki0_reads:
+            self._emit_op(r)
 
 
     def _emit_op(self, op: KLoopOp) -> None:

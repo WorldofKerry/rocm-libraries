@@ -209,6 +209,10 @@ class ScaleStream(LDSStream):
     def emit_lds_writes(self, ctx: 'AsmContext') -> None:
         if self._region == 0:
             return
+        # Wait for the preceding buffer_load_dword ops to complete
+        # before reading the VGPRs they wrote.
+        ctx.s_waitcnt("vmcnt(0)",
+                      comment=f"wait scale {self._matrix.upper()} loads")
         # Write 4 dwords per thread from tmp VGPRs to LDS
         wr_base = f"s_lds_wr_scale_{self._matrix}"
         voff = f"v_dtl_off_scale_{self._matrix}_lds"
