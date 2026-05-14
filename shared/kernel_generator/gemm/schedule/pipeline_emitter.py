@@ -680,8 +680,7 @@ class PipelineEmitter:
         # Must drain ALL DTL loads before reading the buffer they
         # wrote to.  In double-copy, the other copy's ki=0 reads
         # access this buffer after toggle, so loads must be done.
-        ctx.s_waitcnt("vmcnt(0)", comment=f"wait all DTL loads ({copy_tag})")
-        ctx.s_waitcnt("lgkmcnt(0)", comment=f"wait scale LDS writes ({copy_tag})")
+        ctx.s_waitcnt("vmcnt(0) lgkmcnt(0)", comment=f"wait DTL+scale writes ({copy_tag})")
         ctx.s_barrier(comment=f"end-barrier ({copy_tag})")
 
         # ─── Step 8: negate (flip step for toggle_read) ───

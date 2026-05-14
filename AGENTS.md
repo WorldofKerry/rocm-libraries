@@ -232,6 +232,13 @@ See `schedule/DESIGN_PGR.md` for full pipeline phase diagrams.
 
 ## Current Performance (4096x4096x4096)
 
+**Validation Status:**
+- FP16: PASSES at all sizes with random data
+- MXFP4: PASSES at all sizes with uniform data (DataInitType=1)
+- MXFP4: K=256 PASSES with random data; K>256 FAILS with random data
+  (pre-existing scale layout mismatch with TensileLite reference)
+
+
 - **FP16**: 545 TFLOPS (72% of TensileLite 256x256)
 - **MXFP4**: 1231 TFLOPS with StreamK (72% of TensileLite 256x256)
 - **Main gap**: Instruction scheduling -- MGRIPM-style DTL/scale load
