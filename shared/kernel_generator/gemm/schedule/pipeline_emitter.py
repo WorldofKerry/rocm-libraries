@@ -20,7 +20,8 @@ from .kloop_graph import KLoopOp, OpKind
 from .pipeline_scheduler import ScheduledPipeline
 from .interleave import (
     classify_body_ops, build_dtl_sequence,
-    emit_mfmas_with_dtl_interleaved, emit_mfmas_with_reads_interleaved,
+    emit_mfmas_with_dtl_interleaved, emit_dtl_load,
+    emit_mfmas_with_reads_interleaved,
     emit_mfmas_with_reads_and_dtl,
 )
 
@@ -564,16 +565,17 @@ class PipelineEmitter:
           1. drain prev reads  (lgkmcnt/vmcnt)
           2. ki=0 MFMAs + ki=1 reads interleaved
           3. lgkmcnt(0) + s_barrier  (mid-copy: drain ki=1 reads)
-          4. k_tiles-- + skip-check → skip_label
-          5. negate + scalar_prods
-          6. ALL ki=1 MFMAs + DTL loads interleaved
+          4. ALL ki=1 MFMAs  (consumers, always execute)
+          5. k_tiles-- + skip-check → skip_label
+          6. negate + scalar_prods + DTL loads
           7. vmcnt(14) + s_barrier  (end-barrier)
           8. next-copy ki=0 reads
           9. suffix
 
-        DTL loads MUST be after mid-barrier to avoid LDS contention
-        between DTL writes (to write buffer) and ds_reads (from
-        read buffer) sharing the LDS port.
+        ki=1 MFMAs are consumers (they use data from the CURRENT
+        iteration loaded before the mid-barrier).  They must NOT
+        be skipped during drain.  Only the producer ops (DTL loads,
+        SRD advances) are skipped when there are no more tiles.
         """
         ctx = self.ctx
 
@@ -618,7 +620,11 @@ class PipelineEmitter:
         ctx.s_waitcnt("lgkmcnt(0)", comment="drain ki=1 reads")
         ctx.s_barrier(comment=f"mid-copy barrier ({copy_tag})")
 
-        # ─── Step 4: skip-check ───
+        # ─── Step 4: ki=1 MFMAs (consumers, always execute) ───
+        for mfma_op in ki1_mfmas:
+            self._emit_op(mfma_op)
+
+        # ─── Step 5: skip-check ───
         ctx.s_sub(ctx.sreg("s_k_tiles"), ctx.sreg("s_k_tiles"), "1",
                   comment=f"k_tiles-- ({copy_tag})")
         ctx.inst("s_cmp_gt_u32", ctx.sreg("s_k_tiles"),
@@ -627,22 +633,18 @@ class PipelineEmitter:
         ctx.inst("s_cbranch_scc0", skip_label,
                  comment=f"skip {copy_tag} producers (drain)")
 
-        # ─── Step 5: negate + scalar_prods ───
+        # ─── Step 6: negate + scalar_prods + DTL loads ───
         self.buffer_mgr.emit_negate_step(ctx)
         for op in scalar_prods:
             self._emit_op(op)
 
-        # ─── Step 6: ALL ki=1 MFMAs + DTL loads interleaved ───
         loader = ctx._metadata.get("_dtl_loader")
-
-        if loader and len(ki1_mfmas) >= 4 and hasattr(loader, 'emit_dtl_load_a_single'):
+        if loader and hasattr(loader, 'emit_dtl_load_a_single'):
             dtl_seq = build_dtl_sequence(load_prods, loader)
-            emit_mfmas_with_dtl_interleaved(
-                ctx, ki1_mfmas, dtl_seq, loader, self._emit_op,
-                comment=f"ki=1 MFMAs + DTL ({copy_tag})")
+            m0_state: dict = {}
+            for kind, payload in dtl_seq:
+                emit_dtl_load(kind, payload, loader, self._emit_op, m0_state)
         else:
-            for mfma_op in ki1_mfmas:
-                self._emit_op(mfma_op)
             for op in load_prods:
                 self._emit_op(op)
 
