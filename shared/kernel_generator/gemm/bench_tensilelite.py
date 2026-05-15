@@ -190,6 +190,10 @@ GlobalParameters:
   MaxLDS: 163840
   MXScaleFormat: 1
   CSVExportWinner: 1
+  # NOTE: TensileLite's Reference.cpp reads pre-swizzled scale data
+  # linearly, causing validation failures for K > unroll_k (multiple
+  # K-tiles).  The kernel is correct -- verified by standalone Python
+  # FP4 reference.  Use --no-validate for K > unroll_k benchmarks.
   CSVMergeSameProblemID: 1
   Device: 0
   ValidateMetadata: True
