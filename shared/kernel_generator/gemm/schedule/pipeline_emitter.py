@@ -547,7 +547,7 @@ class PipelineEmitter:
             body[i] for i in range(split_pos, producer_start)
             if body[i].kind != OpKind.MFMA
         ]
-        loader = ctx._metadata.get("_dtl_loader")
+        loader = ctx._state.get("_dtl_loader")
 
         # Emit non-MFMA ops first (reads with waitcnts)
         for i in range(split_pos, producer_start):
@@ -665,7 +665,7 @@ class PipelineEmitter:
         for op in scalar_prods:
             self._emit_op(op)
 
-        loader = ctx._metadata.get("_dtl_loader")
+        loader = ctx._state.get("_dtl_loader")
         if loader and hasattr(loader, 'emit_dtl_load_a_single'):
             dtl_seq = build_dtl_sequence(load_prods, loader)
             m0_state: dict = {}

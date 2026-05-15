@@ -155,7 +155,7 @@ def emit_descriptor(ctx: AsmContext, kernel_name: str,
     acc_count = ctx._next["acc"]
     vgpr_count = accum_offset + acc_count
     # Kernarg size depends on ABI mode
-    mainloop = ctx._metadata.get('mainloop')
+    mainloop = ctx.config.mainloop
     if mainloop and mainloop.wave_abi:
         kernarg_size = 104  # WaveGemmKernelArgs: 13 u64 fields = 104 bytes
     else:

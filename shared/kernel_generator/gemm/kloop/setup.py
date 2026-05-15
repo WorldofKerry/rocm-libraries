@@ -31,9 +31,9 @@ __all__ = ["phase_mx_scale_setup", "phase_dtl_interleaved_setup",
            "phase_wave_abi_setup"]
 
 
-def _tile(ctx: AsmContext) -> TileConfig: return ctx._metadata["tile"]
-def _problem(ctx: AsmContext) -> GemmProblem: return ctx._metadata["problem"]
-def _layouts(ctx: AsmContext) -> GemmLayouts: return ctx._metadata["layouts"]
+def _tile(ctx: AsmContext) -> TileConfig: return ctx.config.tile
+def _problem(ctx: AsmContext) -> GemmProblem: return ctx.config.problem
+def _layouts(ctx: AsmContext) -> GemmLayouts: return ctx.config.layouts
 
 
 def _a_off(mi: int, ki: int, tile: TileConfig, mfma: MfmaConfig, elem: float) -> int:
@@ -397,28 +397,39 @@ def _emit_lds_read_addresses(ctx: AsmContext, tile: TileConfig,
                       ctx.vreg("v_tmp0"), comment="+ lane_row (persistent)")
             ctx.raw("")
     elif swz is not None:
-        # Non-paired swizzle (legacy path)
+        # Non-paired swizzle (XorSwizzle / DTLRotationSwizzle)
         from ..memory.swizzle import DataLayout as SwzLayout, LDS_GFX950
         swz_layout = SwzLayout(row_stride_bytes=row_stride_bytes,
                                mfma_k=mfma.k, mfma_m=mfma.m,
                                elem_bytes=elem, wave_size=tile.wave_size)
         ctx.v_lshr(ctx.vreg("v_tmp1"), ctx.vreg("v_lane_id"),
                    int(math.log2(mfma.m)), comment=f"k_group = lane_id / {mfma.m}")
+
+        # A: m_row = wave_m * m_per_wave + lane_row
+        ctx.v_mul(ctx.vreg("v_tmp4"), str(tile.m_per_wave),
+                  ctx.vreg("v_wave_m"), comment=f"wave_m * {tile.m_per_wave}")
+        ctx.v_add(ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"), ctx.vreg("v_tmp4"),
+                  comment="+ lane_row -> m_row_a")
         # Compute row_base into v_tmp3 to avoid aliasing with
         # out_vregs[0] and XorSwizzle's internal v_tmp2 temp.
         ctx.v_mul(ctx.vreg("v_tmp3"), str(row_stride_bytes),
-                  ctx.vreg("v_tmp0"), comment=f"row_base_a = lane_row * {row_stride_bytes}")
+                  ctx.vreg("v_tmp0"), comment=f"row_base_a = m_row * {row_stride_bytes}")
         ki_count = swz_layout.ki_count
         a_out = [ctx.vreg("v_lds_rd_a")] + [ctx.vreg(f"v_lds_rd_a_k{ki}") for ki in range(1, ki_count)]
         swz.emit_read_setup(ctx, swz_layout, LDS_GFX950,
                             ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),
                             ctx.vreg("v_tmp3"), a_out)
         ctx.raw("")
+
+        # B: n_row = wave_n * n_per_wave + lane_row
         ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.m - 1,
                   comment=f"lane_row (re-derive)")
-        # Same fix for B: use v_tmp3 to avoid aliasing.
+        ctx.v_mul(ctx.vreg("v_tmp4"), str(tile.n_per_wave),
+                  ctx.vreg("v_wave_n"), comment=f"wave_n * {tile.n_per_wave}")
+        ctx.v_add(ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"), ctx.vreg("v_tmp4"),
+                  comment="+ lane_row -> n_row_b")
         ctx.v_mul(ctx.vreg("v_tmp3"), str(row_stride_bytes),
-                  ctx.vreg("v_tmp0"), comment=f"row_base_b = lane_row * {row_stride_bytes}")
+                  ctx.vreg("v_tmp0"), comment=f"row_base_b = n_row * {row_stride_bytes}")
         b_out = [ctx.vreg("v_lds_rd_b")] + [ctx.vreg(f"v_lds_rd_b_k{ki}") for ki in range(1, ki_count)]
         swz.emit_read_setup(ctx, swz_layout, LDS_GFX950,
                             ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),
@@ -511,7 +522,7 @@ def _emit_acc_init(ctx: AsmContext, tile: TileConfig) -> None:
 
 def _emit_mx_const_scale(ctx: AsmContext) -> None:
     """Init MX constant scale VGPR if needed."""
-    layout = ctx._metadata.get("layout")
+    layout = ctx.config.layout
     if layout.mfma_has_scale_operands:
         ctx.comment("Init MX constant scale = 1.0 (E8M0 0x7F)")
         ctx.v_mov(ctx.vreg("v_mxscale"), "0x7F7F7F7F",
@@ -613,7 +624,7 @@ def phase_dtl_interleaved_setup(level: TileLevel, ctx: AsmContext) -> None:
 
     # TensileLite kernarg layout (batched MXFP4, KernArgsVersion >= 1):
     # Kernarg header: 16 bytes for our launcher, 0 for TensileLite client
-    mainloop = ctx._metadata.get("mainloop")
+    mainloop = ctx.config.mainloop
     hdr = 0 if (mainloop and getattr(mainloop, 'tensilelite_abi', False)) else 16
     karg = ctx.sreg("s_kernarg")
     ctx.inst("s_load_dword", ctx.sreg("s_M"), karg, str(hdr + 0), comment="M")
@@ -622,7 +633,7 @@ def phase_dtl_interleaved_setup(level: TileLevel, ctx: AsmContext) -> None:
     ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_D"), karg, str(hdr + 16), comment="D ptr")
     ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_A"), karg, str(hdr + 32), comment="A ptr")
     # B ptr offset: 64 for MX (MXSA at 56), 56 for non-MX (no MXSA)
-    layout = ctx._metadata.get("layout")
+    layout = ctx.config.layout
     b_offset = str(layout.b_ptr_offset() - 16 + hdr)
     ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_B"), karg, b_offset,
              comment="B ptr")
@@ -630,7 +641,7 @@ def phase_dtl_interleaved_setup(level: TileLevel, ctx: AsmContext) -> None:
     ctx.raw("")
 
     # Grid decomposition: mainloop.grid handles 2D (noop) or 1D+WGMXCC
-    mainloop = ctx._metadata.get("mainloop")
+    mainloop = ctx.config.mainloop
     if mainloop is not None:
         mainloop.grid.emit(ctx, tile)
 
@@ -665,15 +676,15 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
     The scale is per-MFMA-tile (shared across all lanes), loaded via
     buffer_load_dword into a VGPR, then broadcast.
     """
-    tile = ctx._metadata["tile"]
+    tile = ctx.config.tile
     mfma = tile.mfma
-    mainloop = ctx._metadata.get("mainloop")
+    mainloop = ctx.config.mainloop
     use_dtl = True  # mainloop always uses DTL
-    mainloop = ctx._metadata.get("mainloop")
+    mainloop = ctx.config.mainloop
     from ..mainloop import VMEMScaleStrategy
     use_swizzled_scales = (isinstance(mainloop.scale_strategy, VMEMScaleStrategy)
                            and mainloop.scale_strategy.swizzled if mainloop else False)
-    layout = ctx._metadata.get("layout")
+    layout = ctx.config.layout
     if not layout.has_scales:
         return
 
@@ -683,17 +694,17 @@ def phase_mx_scale_setup(level: TileLevel, ctx: AsmContext) -> None:
     ctx.comment("=== MX Scale Setup (direct VGPR, no LDS) ===")
 
     # Wave ABI already loads scale ptrs/strides in setup phase
-    mainloop_ref = ctx._metadata.get("mainloop")
+    mainloop_ref = ctx.config.mainloop
     if not (mainloop_ref and mainloop_ref.wave_abi):
         karg = ctx.sreg("s_kernarg")
-        ml = ctx._metadata.get("mainloop")
+        ml = ctx.config.mainloop
         hdr = 0 if (ml and getattr(ml, 'tensilelite_abi', False)) else 16
         ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_scale_a"), karg, str(hdr + 40),
                  comment="scale A ptr (MXSA)")
         ctx.inst("s_load_dwordx2", ctx.sreg("s_ptr_scale_b"), karg, str(hdr + 56),
                  comment="scale B ptr (MXSB)")
         # Scale stride offsets depend on layout (StreamK shifts strides by 16)
-        layout = ctx._metadata.get("layout")
+        layout = ctx.config.layout
         stride_base = layout.strides_offset - 16 if (layout and ml and getattr(ml, 'tensilelite_abi', False)) else layout.strides_offset if layout else 80
         ctx.inst("s_load_dword", ctx.sreg("s_stride_scale_a"), karg, str(stride_base + 24),
                  comment="strideMXSA0")

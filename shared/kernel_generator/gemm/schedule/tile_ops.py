@@ -147,7 +147,7 @@ def emit_recompute_srds(
     emit_recompute_data_srd(ctx, tile, "a")
     emit_recompute_data_srd(ctx, tile, "b")
 
-    layout = ctx._metadata.get("layout")
+    layout = ctx.config.layout
     if layout and layout.has_scales:
         from ..mainloop import VMEMScaleStrategy
         use_swizzled = (isinstance(mainloop.scale_strategy, VMEMScaleStrategy)

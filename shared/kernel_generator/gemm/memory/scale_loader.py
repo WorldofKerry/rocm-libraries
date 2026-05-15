@@ -473,9 +473,16 @@ class LDSScaleLoader(ScaleLoader):
         self._scale_a_lds_off = lds_scale_offset
         self._scale_b_lds_off = lds_scale_offset + self._scale_a_lds_size
 
-        # K-stride for SRD advance: pre-swizzled layout uses 256 bytes
-        # per d3 stride (see AITER e8m0_shuffle format)
-        self._scale_k_stride = 256
+        # K-stride for SRD advance: each K-iteration covers k_per_iter
+        # scale columns for all rows in the tile.  In our layout, all
+        # 32-row groups for one K-iteration are packed contiguously
+        # (n_row_blocks * 256 bytes per K-iteration).
+        k_per_iter = tile.unroll_k // self._mx_block
+        n_row_blocks_a = tile.wg_m // 32
+        n_row_blocks_b = tile.wg_n // 32
+        self._scale_k_stride_a = n_row_blocks_a * 256
+        self._scale_k_stride_b = n_row_blocks_b * 256
+        self._scale_k_stride = self._scale_k_stride_a  # compat
 
         # Scale VGPR names: 2 groups per matrix (g0, g1 for A; g0, g1 for B)
         # Each group covers 2 mi (or ni) values × 2 ki values = 4 bytes
@@ -499,7 +506,8 @@ class LDSScaleLoader(ScaleLoader):
     def streams(self, tile: TileConfig) -> list:
         """LDS scale streams for DTL-based scale loading."""
         from .streams import ScaleStream
-        return [ScaleStream("a", tile), ScaleStream("b", tile)]
+        return [ScaleStream("a", tile, scale_k_stride=self._scale_k_stride_a),
+                ScaleStream("b", tile, scale_k_stride=self._scale_k_stride_b)]
 
     def mfma_emitter(self, mfma: MfmaConfig) -> MFMAEmitter:
         """LDS scales: MFMA reads scale from VGPRs loaded via ds_read."""

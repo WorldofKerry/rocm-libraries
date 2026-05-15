@@ -25,6 +25,7 @@ from .emit.emitter import alloc_registers, alloc_registers_dtl, emit_header, emi
 from .emit.layouts import GemmLayouts
 from .emit.phases import default_mfma_visitor
 from .kernarg_layout import layout_for
+from .config import KernelConfig
 from .mainloop import Mainloop
 from .problem import DataType, GemmProblem, MfmaConfig, TileConfig
 from .tiling import GemmTiling
@@ -122,7 +123,8 @@ class GemmKernel:
               wg_mapping_xcc: int = 1,
               colmajor_output: bool = False,
               pipeline_strategy: Optional[object] = None,
-              streamk: bool = False) -> 'GemmKernel':
+              streamk: bool = False,
+              skip_store: bool = False) -> 'GemmKernel':
         """Build a GemmKernel.  GemmTiling is the source of truth.
 
         Args:
@@ -196,6 +198,7 @@ class GemmKernel:
                     colmajor_output=colmajor_output)
 
         k.mainloop = mainloop
+        k._skip_store = skip_store
 
         # Validate PGR vs buffer count
         if mainloop.pgr > mainloop.num_buffers:
@@ -203,8 +206,13 @@ class GemmKernel:
                 f"PGR={mainloop.pgr} exceeds num_buffers={mainloop.num_buffers}.")
 
         # Swap epilogue phase from mainloop
-        k.tile_tree = k.tile_tree.replace_phase(
-            "store_d", mainloop.epilogue.phase_func())
+        if skip_store:
+            from .mainloop import NoStore
+            k.tile_tree = k.tile_tree.replace_phase(
+                "store_d", NoStore().phase_func())
+        else:
+            k.tile_tree = k.tile_tree.replace_phase(
+                "store_d", mainloop.epilogue.phase_func())
 
         # Legacy: store pipeline_strategy for external use
         k.pipeline_strategy = pipeline_strategy
@@ -222,7 +230,12 @@ class GemmKernel:
         # LDS sizing derived from mainloop
         lds_total = mainloop.lds_total(tile)
 
-        ctx = AsmContext()
+        config = KernelConfig(
+            tile=tile, problem=self.problem, layout=layout,
+            layouts=self.layouts, mainloop=mainloop, kernel=self,
+        )
+        ctx = AsmContext(config=config)
+        # Compat: sync _metadata for code not yet migrated
         ctx._metadata = {
             "tile": tile,
             "problem": self.problem,
@@ -250,7 +263,12 @@ class GemmKernel:
 
         emit_header(ctx, self.kernel_name)
         walk_tile_tree(self.tile_tree, ctx, visitor=self.mfma_visitor)
-        ctx.inst("s_endpgm", comment="end of kernel")
+        # Emit s_endpgm only if the tree has a store phase (complete kernel).
+        # When store_d is removed (e.g. for inline ASM), the caller handles
+        # the epilogue and program exit.
+        has_store = self.tile_tree.get_phase("store_d") is not None
+        if has_store and not self._skip_store:
+            ctx.inst("s_endpgm", comment="end of kernel")
         emit_descriptor(ctx, self.kernel_name, lds_total, tile, layout)
 
         return AsmKernel(

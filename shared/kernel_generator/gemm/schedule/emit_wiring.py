@@ -46,7 +46,7 @@ def wire_emit_callbacks(
         ctx: AsmContext for register resolution.
         scale_loader: Optional ScaleLoader for scale reads.
     """
-    tile = ctx._metadata["tile"]
+    tile = ctx.config.tile
     mr = tile.mfma_m_repeat
     nr = tile.mfma_n_repeat
     ki_count = tile.k_iterations

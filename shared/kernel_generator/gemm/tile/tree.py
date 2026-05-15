@@ -306,6 +306,24 @@ class TileLevel:
             )
         return self
 
+    def remove_phase(self, phase_name: str) -> TileLevel:
+        """Return a copy of the tree with the named phase removed entirely."""
+        new_pro = [p for p in self.prologue_phases if p.name != phase_name]
+        new_epi = [p for p in self.epilogue_phases if p.name != phase_name]
+        removed = (len(new_pro) < len(self.prologue_phases) or
+                   len(new_epi) < len(self.epilogue_phases))
+        inner = self.inner
+        if not removed and inner:
+            inner = inner.remove_phase(phase_name)
+        return TileLevel(
+            name=self.name, m=self.m, n=self.n, k=self.k,
+            inner=inner, emit=self.emit,
+            prologue_phases=new_pro, epilogue_phases=new_epi,
+            partitioned=self.partitioned,
+            partition_m=self.partition_m, partition_n=self.partition_n,
+            parallel=self.parallel, comment=self.comment,
+        )
+
     def get_phase(self, phase_name: str) -> Optional[TilePhase]:
         """Find a phase by name in this subtree."""
         for p in self.prologue_phases + self.epilogue_phases:

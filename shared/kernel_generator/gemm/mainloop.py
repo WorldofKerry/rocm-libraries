@@ -48,6 +48,18 @@ class DirectStore(StoreEpilogue):
     pass
 
 
+class NoStore(StoreEpilogue):
+    """Skip the store phase -- results remain in acc registers.
+
+    Used when the caller handles epilogue externally (e.g. Triton Gluon
+    inline ASM bridge reads accumulators directly).
+    """
+
+    def phase_func(self) -> Callable:
+        from .emit.phases import phase_noop
+        return phase_noop
+
+
 class StreamKStore(StoreEpilogue):
     """StreamK 3-way epilogue: sole-owner / partial / owner-reduce."""
 
@@ -227,6 +239,7 @@ def mainloop_bf16(
     streamk: bool = False,
     wg_mapping_xcc: int = 1,
     colmajor_output: bool = False,
+    tensilelite_abi: bool = False,
 ) -> Mainloop:
     """Standard BF16 mainloop. Same structure as FP16."""
     from .memory.global_loader import DTLLoader
@@ -240,6 +253,7 @@ def mainloop_bf16(
         pgr=pgr,
         epilogue=StreamKStore() if streamk else DirectStore(),
         colmajor_output=colmajor_output,
+        tensilelite_abi=tensilelite_abi,
     )
 
 

@@ -609,8 +609,9 @@ def _format_fp16_custom_kernel(
     mfma: MfmaConfig,
     pgr: int,
     streamk: bool = False,
+    dtype_code: str = "H",
 ) -> str:
-    """Format the complete .s file for an FP16 custom kernel."""
+    """Format the complete .s file for an FP16/BF16 custom kernel."""
     sk_val = 3 if streamk else 0
     k_iters = unroll_k // mfma.k
     mi_input = mfma.k // 2
@@ -651,8 +652,8 @@ custom.config:
     SupportCustomStaggerU: false
   ProblemType:
     OperationType: GEMM
-    DataType: H
-    DestDataType: H
+    DataType: {dtype_code}
+    DestDataType: {dtype_code}
     ComputeDataType: S
     HighPrecisionAccumulate: true
     TransposeA: 1
@@ -803,7 +804,7 @@ def generate_custom_kernel(
     Args:
         wg_m, wg_n, unroll_k: Tile dimensions.
         kernel_name: Override kernel function name.
-        dtype: Data type -- ``"mxfp4"`` or ``"fp16"``.
+        dtype: Data type -- ``"mxfp4"``, ``"fp16"``, or ``"bf16"``.
         pgr2: Enable PGR=2 double-prefetch (FP16 only; MXFP4 always uses 2).
         swizzled_scales: Use pre-swizzled MX scale layout (MXScaleFormat=1).
         streamk: Enable StreamK work distribution.
@@ -812,61 +813,56 @@ def generate_custom_kernel(
         The full .s file text including assembly body,
         .amdhsa_kernel descriptor, and .amdgpu_metadata YAML config.
     """
-    from .mainloop import mainloop_fp16, mainloop_mxfp4_tensilelite
+    from .mainloop import mainloop_fp16, mainloop_bf16, mainloop_mxfp4_tensilelite
 
-    if dtype == "fp16":
-        mfma = MfmaConfig.f16_16x16x16()
-        unroll_k = min(unroll_k, 64)
-        # Build DTL rotation swizzle for bank-conflict-free reads
-        from .memory.swizzle import DTLRotationSwizzle, DataLayout as SwzLayout
-        swz_layout = SwzLayout(
-            row_stride_bytes=int(unroll_k * 2),
-            mfma_k=mfma.k, mfma_m=mfma.m, elem_bytes=2,
-        )
-        dtl_swz = DTLRotationSwizzle.from_layout(swz_layout)
-        t = GemmTiling.high_perf(
-            wg_m=wg_m, wg_n=wg_n, unroll_k=unroll_k,
-            mfma=mfma, lds_swizzle=True, swizzle=dtl_swz,
-        )
-        p = GemmProblem(4096, 4096, 4096, dtype=DataType.F16)
-        effective_pgr = 2 if pgr2 else 1
-        ml = mainloop_fp16(
-            pgr=effective_pgr, wg_mapping_xcc=8, colmajor_output=True, tensilelite_abi=True,
-        )
-    else:
-        mfma = MfmaConfig.mxfp4_16x16x128()
-        from .memory.swizzle import DTLRotationSwizzle, DataLayout as SwzLayout
-        swz_layout_mx = SwzLayout(row_stride_bytes=int(unroll_k * 0.5),
-                                  mfma_k=mfma.k, mfma_m=mfma.m,
-                                  elem_bytes=0.5, wave_size=64)
-        dtl_swz_mx = DTLRotationSwizzle.from_layout(swz_layout_mx)
-        t = GemmTiling.high_perf(
-            wg_m=wg_m, wg_n=wg_n, unroll_k=unroll_k,
-            mfma=mfma, lds_swizzle=True, swizzle=dtl_swz_mx,
-        )
-        p = GemmProblem(4096, 4096, 4096, dtype=DataType.MXFP4)
-        effective_pgr = 2  # MXFP4 always PGR=2
+    # Data type config from registry
+    from .config import dtype_config
+    dcfg = dtype_config(dtype)
+    mfma = dcfg.mfma_factory()
+    unroll_k = min(unroll_k, dcfg.max_unroll_k)
+    effective_pgr = dcfg.default_pgr if not pgr2 else 2
+
+    # Build swizzle and tiling (same pattern for all types)
+    from .memory.swizzle import DTLRotationSwizzle, DataLayout as SwzLayout
+    elem = dcfg.element_bytes
+    swz_layout = SwzLayout(
+        row_stride_bytes=int(unroll_k * elem),
+        mfma_k=mfma.k, mfma_m=mfma.m,
+        elem_bytes=elem,
+        wave_size=64,
+    )
+    dtl_swz = DTLRotationSwizzle.from_layout(swz_layout)
+    t = GemmTiling.high_perf(
+        wg_m=wg_m, wg_n=wg_n, unroll_k=unroll_k,
+        mfma=mfma, lds_swizzle=True, swizzle=dtl_swz,
+    )
+
+    # Problem + mainloop (MX types need special mainloop)
+    dtype_enum = {"fp16": DataType.F16, "bf16": DataType.BF16,
+                  "mxfp4": DataType.MXFP4}[dtype]
+    p = GemmProblem(4096, 4096, 4096, dtype=dtype_enum)
+
+    if dcfg.has_mx_scales:
         ml = mainloop_mxfp4_tensilelite(
             pgr=effective_pgr, wg_mapping_xcc=1, colmajor_output=True,
-            swizzled_scales=swizzled_scales,
-            streamk=streamk,
+            swizzled_scales=swizzled_scales, streamk=streamk,
+        )
+    else:
+        # FP16 and BF16 share the same mainloop structure
+        mainloop_fn = mainloop_bf16 if dtype == "bf16" else mainloop_fp16
+        ml = mainloop_fn(
+            pgr=effective_pgr, wg_mapping_xcc=8, colmajor_output=True,
+            tensilelite_abi=True,
         )
 
     k = GemmKernel.build(p, tiling=t, mainloop=ml)
 
     if kernel_name is None:
-        if dtype == "fp16":
-            kernel_name = (
-                f"Custom_Cijk_Alik_Bljk_HHS_BH"
-                f"_MT{wg_m}x{wg_n}x{unroll_k}_MI16x16x1"
-                f"_kgen_gfx950"
-            )
-        else:
-            kernel_name = (
-                f"Custom_Cijk_Alik_Bljk_F4BS_MXA32_MXB32"
-                f"_MT{wg_m}x{wg_n}x{unroll_k}_MI16x16x1"
-                f"_kgen_gfx950"
-            )
+        kernel_name = (
+            f"Custom_Cijk_Alik_Bljk_{dcfg.kernel_name_fragment}"
+            f"_MT{wg_m}x{wg_n}x{unroll_k}_MI16x16x1"
+            f"_kgen_gfx950"
+        )
 
     k.kernel_name = kernel_name
     result = k.emit()
@@ -879,7 +875,7 @@ def generate_custom_kernel(
     mr = tile_cfg.mfma_m_repeat
     nr = tile_cfg.mfma_n_repeat
 
-    if dtype == "fp16":
+    if not dcfg.has_mx_scales:
         return _format_fp16_custom_kernel(
             kernel_name=kernel_name,
             body=body,
@@ -897,6 +893,7 @@ def generate_custom_kernel(
             mfma=mfma,
             pgr=effective_pgr,
             streamk=streamk,
+            dtype_code=dcfg.tensile_data_type,
         )
     else:
         return _format_mxfp4_custom_kernel(

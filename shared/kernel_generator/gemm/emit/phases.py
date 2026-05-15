@@ -8,11 +8,11 @@ coordinate transforms via ``emit_affine()``.
 
 Phase signature: ``(level: TileLevel, ctx: AsmContext) -> None``
 
-Phases access kernel state through ``ctx._metadata``:
-  - ``ctx._metadata["tile"]``:    TileConfig
-  - ``ctx._metadata["problem"]``: GemmProblem
-  - ``ctx._metadata["layouts"]``: GemmLayouts (transform descriptors)
-  - ``ctx._metadata["kernel"]``:  GemmKernel (for tree access)
+Phases access kernel config through ``ctx.config``:
+  - ``ctx.config.tile``:    TileConfig
+  - ``ctx.config.problem``: GemmProblem
+  - ``ctx.config.layouts``: GemmLayouts (transform descriptors)
+  - ``ctx.config.kernel``:  GemmKernel (for tree access)
 """
 from __future__ import annotations
 
@@ -30,22 +30,27 @@ __all__ = [
 
 
 # ===================================================================
-# Helpers: extract ctx._metadata
+# Helpers: extract config from ctx
 # ===================================================================
 
 def _tile(ctx: AsmContext) -> TileConfig:
-    return ctx._metadata["tile"]
+    return ctx.config.tile
 
 def _problem(ctx: AsmContext) -> GemmProblem:
-    return ctx._metadata["problem"]
+    return ctx.config.problem
 
 def _layouts(ctx: AsmContext) -> GemmLayouts:
-    return ctx._metadata["layouts"]
+    return ctx.config.layouts
 
 
 # ===================================================================
 # Store epilogue (uses transforms for address computation)
 # ===================================================================
+def phase_noop(level: TileLevel, ctx: AsmContext) -> None:
+    """No-op phase -- emits nothing.  Results stay in accumulators."""
+    pass
+
+
 def phase_store_d(level: TileLevel, ctx: AsmContext) -> None:
     """Store accumulators to D using buffer_store_short with a buffer SRD.
 
@@ -63,9 +68,9 @@ def phase_store_d(level: TileLevel, ctx: AsmContext) -> None:
     elem = 2
     elem_int = 2
     # TensileLite uses column-major BF16; standalone uses row-major FP16
-    mainloop = ctx._metadata.get("mainloop")
+    mainloop = ctx.config.mainloop
     colmajor = mainloop.colmajor_output if mainloop else False
-    layout = ctx._metadata.get("layout")
+    layout = ctx.config.layout
     use_bf16 = (problem.dtype == DataType.BF16) or (colmajor and layout.colmajor_output_bf16)
 
     ctx.comment("=== Store D via buffer SRD ===")
@@ -540,7 +545,7 @@ def phase_store_streamk(level: TileLevel, ctx: AsmContext) -> None:
     tile = _tile(ctx)
 
     # Persistent loop already handled store -- skip epilogue
-    if ctx._metadata.get("_persistent_store_done"):
+    if ctx._state.get("_persistent_store_done"):
         return
 
     ctx.comment("=== StreamK Epilogue (atomic tree reduction) ===")

@@ -48,6 +48,91 @@ def _unpack_fp4_to_float(packed: np.ndarray) -> np.ndarray:
     return result
 
 
+def _e8m0_to_float(byte_val: np.ndarray) -> np.ndarray:
+    """Convert E8M0 scale bytes to float32.  value = 2^(code - 127)."""
+    return np.ldexp(np.ones_like(byte_val, dtype=np.float32),
+                    byte_val.astype(np.int32) - 127)
+
+
+def _apply_mx_scales(data_f32: np.ndarray, scale_bytes: np.ndarray,
+                     mx_block: int = 32) -> np.ndarray:
+    """Apply MX E8M0 scales to unpacked float32 matrix data.
+
+    Args:
+        data_f32: ``[rows, K]`` float32 matrix (already unpacked from FP4).
+        scale_bytes: flat uint8 array of E8M0 scale values, laid out as
+            ``[rows, K // mx_block]`` in row-major order.
+        mx_block: number of elements per MX scaling block (default 32).
+
+    Returns:
+        Scaled ``[rows, K]`` float32 matrix.
+    """
+    rows, K = data_f32.shape
+    n_blocks = K // mx_block
+    if scale_bytes.size < rows * n_blocks:
+        return data_f32  # not enough scale data, skip
+    scales_2d = scale_bytes[:rows * n_blocks].reshape(rows, n_blocks)
+    scale_vals = _e8m0_to_float(scales_2d)  # [rows, n_blocks]
+    # Broadcast: each scale covers mx_block consecutive K elements
+    scale_expanded = np.repeat(scale_vals, mx_block, axis=1)  # [rows, K]
+    return data_f32 * scale_expanded
+
+
+
+def _preswizzle_scales_gfx950(scales_flat: np.ndarray,
+                              M: int, K_scales: int) -> np.ndarray:
+    """Apply AITER e8m0_shuffle permutation to scale data.
+
+    Transforms linear scale layout ``[M, K/32]`` into the pre-swizzled
+    format expected by gfx950 MFMA scale instructions::
+
+        view(M//32, 2, 16, K_s//8, 2, 4).permute(0, 3, 5, 2, 4, 1)
+
+    For K_scales <= 8 (K <= 256), the d3 dimension is 1, so the
+    permutation along K degenerates -- but the M-dimension reordering
+    still applies.
+
+    Args:
+        scales_flat: flat uint8 array of length >= M * K_scales.
+        M: number of rows (matrix M or N dimension).
+        K_scales: number of scale columns = K // mx_block.
+
+    Returns:
+        Pre-swizzled flat uint8 array, same length as input.
+    """
+    padM = ((M + 31) // 32) * 32
+    padK = ((K_scales + 7) // 8) * 8
+    padded = np.full((padM, padK), 0x7F, dtype=np.uint8)
+    scales_2d = scales_flat[:M * K_scales].reshape(M, K_scales)
+    padded[:M, :K_scales] = scales_2d
+
+    # 6D view: [M/32, 2, 16, K_s/8, 2, 4]
+    d = padded.reshape(padM // 32, 2, 16, padK // 8, 2, 4)
+    # Kernel-matched permutation: K-iter (d3) outermost, then row-blocks (d0).
+    # AITER uses (0, 3, 5, 2, 4, 1) which interleaves d0 and d3, but our
+    # kernel expects all row-blocks for one K-iter contiguously so the SRD
+    # advance = n_row_blocks * 256 skips to the next K-iter cleanly.
+    d = np.ascontiguousarray(d.transpose(3, 0, 5, 2, 4, 1))
+    result = d.reshape(padM, padK)[:M, :K_scales].copy()
+    return result.ravel()
+
+
+def _bf16_uint16_to_float32(arr: np.ndarray) -> np.ndarray:
+    """Convert array of BF16 values (stored as uint16) to float32.
+
+    BF16 is the upper 16 bits of IEEE 754 float32, so we shift left
+    by 16 bits to reconstruct the float32 value.
+    """
+    raw = arr.view(np.uint16).astype(np.uint32) << 16
+    return raw.view(np.float32)
+
+
+def _float32_to_bf16_uint16(arr: np.ndarray) -> np.ndarray:
+    """Truncate float32 to BF16 (stored as uint16) via simple truncation."""
+    raw = arr.astype(np.float32).view(np.uint32) >> 16
+    return raw.astype(np.uint16)
+
+
 def _load_hip() -> ctypes.CDLL:
     """Load libamdhip64.so with proper argtypes to avoid 64-bit pointer truncation."""
     try:
@@ -170,7 +255,7 @@ class GemmLauncher:
             return np.uint8  # packed: 2 FP4 elements per byte
         return {
             DataType.F16: np.float16,
-            DataType.BF16: np.float16,  # numpy has no bfloat16; use f16 approx
+            DataType.BF16: np.uint16,  # BF16 stored as raw uint16 bytes
             DataType.F32: np.float32,
         }[dt]
 
@@ -200,6 +285,16 @@ class GemmLauncher:
                 else:
                     self._B = rng.randint(0, 256, size=(p.k // 2, p.n),
                                           dtype=np.uint8)
+            elif p.dtype == DataType.BF16:
+                # BF16: generate float32, truncate to BF16 stored as uint16
+                scale = 1.0 / np.sqrt(p.k)
+                A_f32 = (rng.randn(p.m, p.k) * scale).astype(np.float32)
+                self._A = _float32_to_bf16_uint16(A_f32).reshape(A_f32.shape)
+                if p.trans_b:
+                    B_f32 = (rng.randn(p.n, p.k) * scale).astype(np.float32)
+                else:
+                    B_f32 = (rng.randn(p.k, p.n) * scale).astype(np.float32)
+                self._B = _float32_to_bf16_uint16(B_f32).reshape(B_f32.shape)
             else:
                 # Scale inputs to avoid overflow in f16
                 scale = 1.0 / np.sqrt(p.k)
@@ -210,8 +305,9 @@ class GemmLauncher:
                     self._B = (rng.randn(p.k, p.n) * scale).astype(dtype)
 
         if p.dtype == DataType.MXFP4:
-            # Output is fp16 (MXFP4 GEMM outputs fp16/fp32, not fp4)
             C = np.zeros((p.m, p.n), dtype=np.float16)
+        elif p.dtype == DataType.BF16:
+            C = np.zeros((p.m, p.n), dtype=np.uint16)
         else:
             C = np.zeros((p.m, p.n), dtype=dtype)
         return self._A, self._B, C
@@ -231,19 +327,36 @@ class GemmLauncher:
         p = self.problem
         A, B, C = self.generate_inputs()
 
-        if p.dtype == DataType.MXFP4:
+        if p.dtype == DataType.BF16:
+            # BF16 stored as uint16: convert to float32
+            A_op = _bf16_uint16_to_float32(A.ravel()).reshape(A.shape).astype(np.float32)
+            if p.trans_a:
+                A_op = A_op.T
+            B_op = _bf16_uint16_to_float32(B.ravel()).reshape(B.shape).astype(np.float32)
+            if p.trans_b:
+                B_op = B_op.T
+        elif p.dtype == DataType.MXFP4:
             # Unpack FP4 -> float32 before matmul
             # A is [M, K//2] packed -> [M, K]
             A_op = _unpack_fp4_to_float(A)
+            # Apply MX scales to A (scales in [M, K/32] row-major layout)
+            if self._scale_A is not None:
+                A_op = _apply_mx_scales(A_op, self._scale_A)
             if p.trans_a:
                 A_op = A_op.T
             # B: unpack along the K (packed) dimension, then arrange as [K, N]
             if p.trans_b:
-                # B stored as [N, K//2] -> unpack -> [N, K] -> transpose -> [K, N]
-                B_op = _unpack_fp4_to_float(B).T
+                # B stored as [N, K//2] -> unpack -> [N, K]
+                B_unpacked = _unpack_fp4_to_float(B)
+                if self._scale_B is not None:
+                    B_unpacked = _apply_mx_scales(B_unpacked, self._scale_B)
+                B_op = B_unpacked.T  # -> [K, N]
             else:
-                # B stored as [K//2, N] -> .T -> [N, K//2] -> unpack -> [N, K] -> .T -> [K, N]
-                B_op = _unpack_fp4_to_float(B.T).T
+                # B stored as [K//2, N] -> .T -> [N, K//2] -> unpack -> [N, K]
+                B_unpacked = _unpack_fp4_to_float(B.T)
+                if self._scale_B is not None:
+                    B_unpacked = _apply_mx_scales(B_unpacked, self._scale_B)
+                B_op = B_unpacked.T  # -> [K, N]
         else:
             # A stored as [M, K]; if trans_a, op(A) = A^T -> [K, M]
             A_op = A.astype(np.float32)
@@ -259,9 +372,13 @@ class GemmLauncher:
         # Accumulate in f32
         D_f32 = p.alpha * (A_op @ B_op) + p.beta * C.astype(np.float32)
 
-        # Output is always fp16 for MXFP4, otherwise match input dtype
-        out_dtype = np.float16 if p.dtype == DataType.MXFP4 else self._np_dtype(p.dtype)
-        D_ref = D_f32.astype(out_dtype)
+        # Output type: BF16 rounds via uint16 truncation, others use numpy
+        if p.dtype == DataType.BF16:
+            D_ref = _bf16_uint16_to_float32(
+                _float32_to_bf16_uint16(D_f32)).reshape(D_f32.shape)
+        else:
+            out_dtype = np.float16 if p.dtype == DataType.MXFP4 else self._np_dtype(p.dtype)
+            D_ref = D_f32.astype(out_dtype)
         return A, B, C, D_ref
 
     # -- Verification -------------------------------------------------------
@@ -418,8 +535,9 @@ class GemmLauncher:
             _check(hip.hipMalloc(ctypes.byref(d_scale_B), scale_b_bytes),
                    "hipMalloc scale_B")
             if self._scale_A is not None:
-                # Pad scale array to allocation size to avoid OOB reads
-                src_a = self._scale_A.ravel()
+                # Pre-swizzle to AITER e8m0_shuffle layout expected by kernel
+                src_a = _preswizzle_scales_gfx950(
+                    self._scale_A.ravel(), p.m, scale_a_cols)
                 if len(src_a) < scale_a_bytes:
                     src_a = np.pad(src_a, (0, scale_a_bytes - len(src_a)),
                                   constant_values=0x7F)
@@ -429,7 +547,8 @@ class GemmLauncher:
                 _check(hip.hipMemset(d_scale_A, 0x7F, scale_a_bytes),
                        "memset scale_A=1.0")
             if self._scale_B is not None:
-                src_b = self._scale_B.ravel()
+                src_b = _preswizzle_scales_gfx950(
+                    self._scale_B.ravel(), p.n, scale_b_cols)
                 if len(src_b) < scale_b_bytes:
                     src_b = np.pad(src_b, (0, scale_b_bytes - len(src_b)),
                                   constant_values=0x7F)
@@ -618,14 +737,21 @@ class GemmLauncher:
         hip.hipEventDestroy(ev_start)
         hip.hipEventDestroy(ev_stop)
 
-        # Copy result back
-        out_dtype = np.float16 if p.dtype == DataType.MXFP4 else self._np_dtype(p.dtype)
+        # Copy result back.  BF16 kernels output bfloat16 which numpy
+        # cannot represent natively; read raw uint16 and convert.
+        is_bf16_output = (p.dtype == DataType.BF16) or (
+            use_1d_grid and layout.colmajor_output_bf16)
+        out_dtype = np.uint16 if is_bf16_output else (
+            np.float16 if p.dtype == DataType.MXFP4 else self._np_dtype(p.dtype))
         if use_1d_grid:
-            # Column-major output: D[m + n*M], read as Fortran-order
             D_out = np.zeros((p.m, p.n), dtype=out_dtype, order='F')
         else:
             D_out = np.zeros((p.m, p.n), dtype=out_dtype)
         _check(hip.hipMemcpy(D_out.ctypes.data, d_D, d_bytes, 2), "D2H D")
+        if is_bf16_output:
+            D_out = _bf16_uint16_to_float32(D_out).reshape(p.m, p.n)
+            if use_1d_grid:
+                D_out = np.asfortranarray(D_out)
 
         # Cleanup
         hip.hipFree(d_A)
@@ -639,7 +765,8 @@ class GemmLauncher:
 
         # Compute correctness against CPU reference
         _, _, _, D_ref = self.reference_numpy()
-        max_err = float(np.max(np.abs(D_out.astype(np.float32) - D_ref.astype(np.float32))))
+        max_err = float(np.max(np.abs(
+            np.asarray(D_out, dtype=np.float32) - np.asarray(D_ref, dtype=np.float32))))
         return GemmResult(D=D_out, time_seconds=avg_time, max_abs_error=max_err)
 
 
@@ -703,7 +830,8 @@ class GemmLauncher:
             _check(hip.hipMalloc(ctypes.byref(d_scale_A), scale_a_bytes), "malloc scaleA")
             _check(hip.hipMalloc(ctypes.byref(d_scale_B), scale_b_bytes), "malloc scaleB")
             if self._scale_A is not None:
-                src_a = self._scale_A.ravel()
+                src_a = _preswizzle_scales_gfx950(
+                    self._scale_A.ravel(), p.m, scale_a_cols)
                 if len(src_a) < scale_a_bytes:
                     src_a = np.pad(src_a, (0, scale_a_bytes - len(src_a)),
                                   constant_values=0x7F)
@@ -712,7 +840,8 @@ class GemmLauncher:
             else:
                 _check(hip.hipMemset(d_scale_A, 0x7F, scale_a_bytes), "memset scaleA")
             if self._scale_B is not None:
-                src_b = self._scale_B.ravel()
+                src_b = _preswizzle_scales_gfx950(
+                    self._scale_B.ravel(), p.n, scale_b_cols)
                 if len(src_b) < scale_b_bytes:
                     src_b = np.pad(src_b, (0, scale_b_bytes - len(src_b)),
                                   constant_values=0x7F)

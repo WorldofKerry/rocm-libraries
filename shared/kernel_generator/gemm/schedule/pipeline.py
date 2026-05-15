@@ -36,7 +36,7 @@ __all__ = [
 class TilePartitioner:
     """Base class: determines what each workgroup computes.
 
-    Must set in ctx._metadata:
+    Must set in ctx.config or ctx._state:
         s_k_tiles: number of K-tile iterations for this WG
     Global addresses must be adjusted if k_start != 0.
     """
@@ -58,7 +58,7 @@ class GridPartitioner(TilePartitioner):
     """
 
     def emit(self, ctx: AsmContext) -> None:
-        tile = ctx._metadata["tile"]
+        tile = ctx.config.tile
         log2_uk = int(math.log2(tile.unroll_k))
         ctx.s_lshr(ctx.sreg("s_k_tiles"), ctx.sreg("s_K"), log2_uk,
                    comment=f"k_tiles = K / {tile.unroll_k}")
@@ -101,9 +101,9 @@ def _build_loader_reader_scale(ctx: AsmContext) -> tuple[GlobalLoader, LDSReader
 
     Returns (loader, reader, scale_loader, pgr).
     """
-    tile = ctx._metadata["tile"]
-    problem = ctx._metadata["problem"]
-    mainloop = ctx._metadata["mainloop"]
+    tile = ctx.config.tile
+    problem = ctx.config.problem
+    mainloop = ctx.config.mainloop
 
     loader = mainloop.loader_cls(ctx, tile, problem)
     swizzle = mainloop.resolve_swizzle(tile)
@@ -283,8 +283,8 @@ def _emit_sk_tile_from_iter(
           s_iter_start (local K offset within tile, for SRD adjustment)
           s_is_partial (1 if partial K, 0 if full tile)
     """
-    layout = ctx._metadata.get("layout")
-    problem = ctx._metadata["problem"]
+    layout = ctx.config.layout
+    problem = ctx.config.problem
     elem = problem.element_bytes
 
     # tile_idx = dp_tiles + iter_current / iters_per_tile
@@ -417,7 +417,7 @@ def _emit_persistent_loop(ctx, tile, mainloop, scheduled, buffer_mgr,
 
     # Store: phase_store_streamk handles full/partial dispatch internally
     # (checks s_is_partial, branches to sk_store_direct or workspace path)
-    level = ctx._metadata.get("_tile_level")
+    level = ctx._state.get("_tile_level")
     if level is None:
         from ..tile.tree import TileLevel
         level = TileLevel("workgroup", m=tile.wg_m, n=tile.wg_n, k=tile.unroll_k)
@@ -434,7 +434,7 @@ def _emit_persistent_loop(ctx, tile, mainloop, scheduled, buffer_mgr,
     ctx.raw("")
 
     ctx.label("persistent_loop_end")
-    ctx._metadata["_persistent_store_done"] = True
+    ctx._state["_persistent_store_done"] = True
     ctx.raw("")
 
 
@@ -444,13 +444,13 @@ def pipeline_v2_kloop_phase(level: TileLevel, ctx: AsmContext) -> None:
     Default pipeline strategy. Uses LDSStream + LDSBufferManager +
     PipelineScheduler + PipelineEmitter.
     """
-    ctx._metadata["_tile_level"] = level
-    tile = ctx._metadata["tile"]
-    mainloop = ctx._metadata["mainloop"]
+    ctx._state["_tile_level"] = level
+    tile = ctx.config.tile
+    mainloop = ctx.config.mainloop
 
     loader, reader, scale_loader, pgr = \
         _build_loader_reader_scale(ctx)
-    ctx._metadata["_dtl_loader"] = loader
+    ctx._state["_dtl_loader"] = loader
 
     # --- New architecture ---
     from ..memory.streams import DTLDataStream
@@ -461,7 +461,7 @@ def pipeline_v2_kloop_phase(level: TileLevel, ctx: AsmContext) -> None:
     from .emit_wiring import wire_emit_callbacks
     from ..memory.mfma_emitter import MFMAEmitter
 
-    problem = ctx._metadata["problem"]
+    problem = ctx.config.problem
 
     # Scale streams first so scale loads issue before DTL loads.
     # This avoids vmcnt(0) stalls before scale ds_writes:
@@ -499,7 +499,7 @@ def pipeline_v2_kloop_phase(level: TileLevel, ctx: AsmContext) -> None:
     if scale_loader is not None:
         emitter = scale_loader.mfma_emitter(tile.mfma)
     else:
-        layout = ctx._metadata.get("layout")
+        layout = ctx.config.layout
         if layout and layout.mfma_has_scale_operands:
             emitter = MFMAEmitter.for_mx_constant(tile.mfma)
         else:

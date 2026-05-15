@@ -1,4 +1,8 @@
 """Tests for BF16 GEMM kernel generation."""
+import os
+import tempfile
+
+import numpy as np
 import pytest
 
 from kernel_generator.gemm.problem import GemmProblem, DataType, MfmaConfig
@@ -78,3 +82,110 @@ class TestBF16Emit:
             result = GemmKernel.build(p).emit()
             co = result.assemble()
             assert co.endswith(".co"), f"Failed for {m}x{n}x{k}"
+
+
+# ---------------------------------------------------------------------------
+# GPU correctness tests for BF16 kernels
+# ---------------------------------------------------------------------------
+
+
+def _has_gpu():
+    """Return True if HIP runtime and a GPU are available."""
+    try:
+        import ctypes
+        hip = ctypes.CDLL("libamdhip64.so")
+        hip.hipMalloc.restype = ctypes.c_int
+        hip.hipMalloc.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
+        hip.hipFree.restype = ctypes.c_int
+        hip.hipFree.argtypes = [ctypes.c_void_p]
+        d = ctypes.c_void_p()
+        if hip.hipMalloc(ctypes.byref(d), 4) != 0:
+            return False
+        hip.hipFree(d)
+        return True
+    except OSError:
+        return False
+
+
+requires_gpu = pytest.mark.skipif(not _has_gpu(), reason="No GPU / HIP runtime")
+
+
+def _run_bf16(M, N, K, *, fill=None, seed=42):
+    """Build, emit, assemble, and launch a BF16 GEMM kernel.
+
+    Args:
+        fill: If ``"zeros"`` or ``"ones"``, override inputs instead of random.
+        seed: RNG seed for random inputs.
+
+    Returns:
+        (D_gpu, D_ref) as np.float16 arrays.
+    """
+    from kernel_generator.gemm.launcher import GemmLauncher
+
+    problem = GemmProblem(M, N, K, dtype=DataType.BF16)
+    kernel = GemmKernel.build(problem)
+    result = kernel.emit()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        co_path = os.path.join(tmpdir, f"test_bf16_{M}_{N}_{K}.co")
+        co_path = result.assemble(output_path=co_path)
+
+        launcher = GemmLauncher(problem, kernel.tile, seed=seed)
+
+        if fill == "zeros":
+            launcher._A = np.zeros((M, K), dtype=np.uint16)
+            launcher._B = np.zeros((N, K), dtype=np.uint16)
+        elif fill == "ones":
+            # BF16 1.0 = 0x3F80
+            launcher._A = np.full((M, K), 0x3F80, dtype=np.uint16)
+            launcher._B = np.full((N, K), 0x3F80, dtype=np.uint16)
+
+        gpu_result = launcher.run_asm_kernel(
+            co_path, kernel_name="gemm_kernel",
+            num_warmup=1, num_iters=1)
+
+        _, _, _, D_ref = launcher.reference_numpy()
+
+    return gpu_result.D, D_ref
+
+
+@requires_gpu
+class TestBF16GPU:
+    """GPU correctness tests for BF16 GEMM kernels."""
+
+    def test_zeros(self):
+        """All-zero inputs must produce all-zero output."""
+        D_gpu, D_ref = _run_bf16(256, 256, 256, fill="zeros")
+        assert D_gpu.shape == (256, 256)
+        assert np.all(D_gpu == 0), \
+            f"Expected all zeros, max abs: {np.max(np.abs(D_gpu))}"
+
+    def test_ones(self):
+        """All-ones inputs: D[i,j] = K."""
+        M, N, K = 256, 256, 256
+        D_gpu, D_ref = _run_bf16(M, N, K, fill="ones")
+        assert D_gpu.shape == (M, N)
+        assert np.allclose(D_gpu, float(K), atol=1.0), \
+            f"Expected {K}, got min={np.min(D_gpu)} max={np.max(D_gpu)}"
+
+    @pytest.mark.parametrize("M,N,K", [
+        (256, 256, 256),
+        (512, 512, 512),
+    ])
+    def test_random(self, M, N, K):
+        """Random data: GPU must match numpy reference."""
+        D_gpu, D_ref = _run_bf16(M, N, K, seed=42)
+        max_err = float(np.max(np.abs(
+            D_gpu.astype(np.float32) - D_ref.astype(np.float32))))
+        assert np.allclose(D_gpu, D_ref, atol=1.0, rtol=0.05), \
+            f"BF16 {M}x{N}x{K}: max_err={max_err}"
+
+    def test_large(self):
+        """Large problem: 4096x4096x4096."""
+        M, N, K = 4096, 4096, 4096
+        D_gpu, D_ref = _run_bf16(M, N, K, seed=42)
+        max_err = float(np.max(np.abs(
+            D_gpu.astype(np.float32) - D_ref.astype(np.float32))))
+        assert np.allclose(D_gpu, D_ref, atol=1.0, rtol=0.05), \
+            f"BF16 {M}x{N}x{K}: max_err={max_err}"

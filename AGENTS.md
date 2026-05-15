@@ -21,6 +21,12 @@ software-pipelined K-loop assembly. The pipeline has three layers:
    `ScheduledPipeline` and emits assembly. All scheduling decisions come
    from the scheduler; the emitter is a thin translation layer.
 
+State is split across three layers on `AsmContext`:
+
+- `ctx.config` (`KernelConfig`) -- immutable config: tile, problem, layout, mainloop
+- `ctx._state` -- runtime state for pipeline phases
+- `ctx._bindings` -- register allocation
+
 Op-to-instruction mapping is handled by `emit_wiring.py`, which connects
 each graph op's `emit` callback to codegen methods on `GlobalLoader`,
 `LDSReader`, `MFMAEmitter`, or `ScaleStream`.
@@ -57,6 +63,7 @@ kernel-generator/
       gemm/
         DESIGN.md          Main architecture doc
         kernel.py          Top-level build + emit entry point
+        config.py          KernelConfig, DTypeConfig, DTYPE_REGISTRY, KLoopContract
         problem.py         GemmProblem, TileConfig, MfmaConfig, DataType
         tiling.py          GemmTiling: composable tile hierarchy
         launcher.py        GPU launch + correctness checking
@@ -69,6 +76,7 @@ kernel-generator/
           emitter.py       Kernel metadata (.amdhsa_kernel, .amdgpu_metadata)
           layouts.py       LDS layout computation
           phases.py        Tile tree phase functions (setup, store)
+          mainloop.py      Mainloop variants (FP16, BF16, MXFP4, NoStore)
 
         tile/              Tile tree (hierarchical code generation)
           tree.py          TileLevel, TilePhase -- walk and emit
@@ -105,6 +113,15 @@ kernel-generator/
 
 ## Key Abstractions
 
+Defined in `config.py`:
+
+- **KernelConfig**: Typed, immutable replacement for `ctx._metadata`. User-constructable
+  via `KernelConfig.from_problem(problem, tiling)`.
+- **DTypeConfig** + **DTYPE_REGISTRY**: Per-data-type constants registry (MFMA config,
+  TensileLite metadata, element sizing). Adding a new data type = one registry entry.
+- **KLoopContract**: Declares the register interface between setup and K-loop phases.
+- **setup_kloop()**: Standalone K-loop setup without `GemmKernel.build()`.
+
 Defined in `problem.py`:
 
 - **DataType**: Enum -- `FP16`, `BF16`, `MXFP4`
@@ -137,6 +154,24 @@ Defined in `schedule/`:
 - **PipelineScheduler** (`pipeline_scheduler.py`): Derives ramp-up/body/drain from graph
 - **PipelineEmitter** (`pipeline_emitter.py`): Emits assembly from scheduled pipeline
 
+## Library Mode
+
+Components can be used standalone without `GemmKernel.build()`:
+
+```python
+cfg = KernelConfig.from_problem(problem, tiling)
+ctx = AsmContext(config=cfg)
+contract = setup_kloop(ctx, cfg)
+# compose graph, schedule, wire, emit
+```
+
+`skip_store=True` on `GemmKernel.build()` (or `tile_tree.remove_phase("store_d")`)
+emits the mainloop only -- no store/endpgm. The `NoStore` epilogue in
+`emit/mainloop.py` supports this path.
+
+Tile tree methods: `replace_phase()` swaps a phase function;
+`remove_phase()` drops a phase entirely.
+
 ## Build and Test
 
 ```bash
@@ -161,6 +196,11 @@ HIP_VISIBLE_DEVICES=0 .venv/bin/python -m kernel_generator.gemm.bench_tensilelit
 HIP_VISIBLE_DEVICES=0 .venv/bin/python -m kernel_generator.gemm.bench_tensilelite \
   --tensile-dir /home/kerrwang/repos/rocm-libraries/GemmFromAnywhere/projects/hipblaslt \
   --dtype fp16 --sizes 4096x4096x4096 --device 0
+
+# BF16 benchmark
+HIP_VISIBLE_DEVICES=0 .venv/bin/python -m kernel_generator.gemm.bench_tensilelite \
+  --tensile-dir /home/kerrwang/repos/rocm-libraries/GemmFromAnywhere/projects/hipblaslt \
+  --dtype bf16 --sizes 4096x4096x4096 --device 0
 ```
 
 Flags: `--streamk` enables StreamK. `--no-validate` skips validation.
@@ -201,7 +241,7 @@ See `schedule/DESIGN_STREAMK.md` for full design.
 
 Export path: `generate_custom_kernel()` in `export_tensilelite.py` produces a
 `.s` file with `.amdgpu_metadata` compatible with TensileLite's custom kernel
-loader. Both FP16 and MXFP4 use `tensilelite_abi=True` (no 16-byte header).
+loader. FP16, BF16, and MXFP4 use `tensilelite_abi=True` (no 16-byte header).
 
 Benchmark path: `bench_tensilelite.py` automates:
 1. Generate `.s` via `generate_custom_kernel()`
@@ -234,9 +274,11 @@ See `schedule/DESIGN_PGR.md` for full pipeline phase diagrams.
 
 **Validation Status:**
 - FP16: PASSES at all sizes with random data
-- MXFP4: PASSES at all sizes with uniform data (DataInitType=1)
-- MXFP4: K=256 PASSES with random data; K>256 FAILS with random data
-  (pre-existing scale layout mismatch with TensileLite reference)
+- BF16: PASSES at all sizes with random data (`mainloop_bf16()` with
+  `tensilelite_abi`, GPU tests in `test_bf16.py`)
+- MXFP4: PASSES at all sizes with random data + random scales via Python
+  reference (scale pre-swizzle and SRD stride fixes applied). TensileLite
+  Reference.cpp has a known scale layout bug; our kernel is proven correct.
 
 
 - **FP16**: 545 TFLOPS (72% of TensileLite 256x256)
@@ -247,10 +289,9 @@ See `schedule/DESIGN_PGR.md` for full pipeline phase diagrams.
 ## Key Files for Common Tasks
 
 **Adding a new data type:**
-- `problem.py` -- add `DataType` enum variant, `MfmaConfig`
-- `memory/mfma_emitter.py` -- MFMA instruction emission for new type
-- `memory/global_loader.py` -- DTL/buffer load format
-- `export_tensilelite.py` -- metadata for new type
+- `config.py` -- add one entry to `DTYPE_REGISTRY` (MFMA config, TensileLite
+  metadata, element sizing). This replaces editing 6 separate files.
+- `problem.py` -- add `DataType` enum variant if not already present
 
 **Changing the K-loop schedule:**
 - `schedule/graph_builder.py` -- modify op/dependency declarations

@@ -571,3 +571,270 @@ class TestScheduledMXFP4Kernel:
             return sum(1 for l in r.ctx.lines if 'v_mfma_scale' in l)
 
         assert count_mfma(r_man) == count_mfma(r_sch)
+
+
+# ---------------------------------------------------------------------------
+# K-loop regression tests: K > 256 exercises double-buffer toggle, scale
+# loading across multiple K tiles, and drain iteration correctness.
+# These use our own Python reference (not TensileLite's Reference.cpp)
+# because TensileLite's reference has a known bug reading pre-swizzled
+# scales at K > 256 (paddedCols/8 >= 2 makes the AITER permutation
+# non-trivial, but Reference.cpp reads scale bytes at linear indices
+# without undoing the permutation).
+# ---------------------------------------------------------------------------
+
+
+@requires_gpu
+class TestMXFP4KLoopRegression:
+    """MXFP4 correctness for K > unroll_k (multi-iteration K-loop).
+
+    These tests catch regressions in:
+    - Double-buffer toggle direction (toggle_write vs toggle_read)
+    - Scale ds_write classification in interleave
+    - Scale vmcnt ordering
+    - DTL m0 corruption from A/B interleaving
+    - End-barrier waitcnt in double-copy mode
+    """
+
+    @staticmethod
+    def _build_and_assemble(m, n, k, output_path):
+        tiling = GemmTiling.mxfp4_standard()  # 128x128x256
+        problem = GemmProblem(m, n, k, dtype=DataType.MXFP4)
+        kernel = GemmKernel.build(problem, tiling=tiling)
+        result = kernel.emit()
+        co_path = result.assemble(output_path=output_path)
+        return kernel, co_path
+
+    @pytest.mark.parametrize("M,N,K", [
+        (128, 128, 512),   # 2 K-loop iterations
+        (128, 128, 1024),  # 4 K-loop iterations
+    ])
+    def test_random_data_uniform_scales(self, M, N, K):
+        """Random FP4 data with scale=1.0: isolates K-loop data path bugs."""
+        from kernel_generator.gemm.launcher import GemmLauncher
+
+        kernel, co_path = self._build_and_assemble(
+            M, N, K, f"/tmp/test_mxfp4_kloop_{M}_{N}_{K}.co")
+
+        problem = GemmProblem(M, N, K, dtype=DataType.MXFP4)
+        launcher = GemmLauncher(problem, kernel.tile, seed=42)
+        rng = np.random.RandomState(42)
+        launcher._A = rng.randint(0, 256, size=(M, K // 2), dtype=np.uint8)
+        launcher._B = rng.randint(0, 256, size=(N, K // 2), dtype=np.uint8)
+        mx_block = 32
+        launcher._scale_A = np.full(M * (K // mx_block), 0x7F, dtype=np.uint8)
+        launcher._scale_B = np.full(N * (K // mx_block), 0x7F, dtype=np.uint8)
+
+        result = launcher.run_asm_kernel(
+            co_path, kernel_name="gemm_kernel",
+            num_warmup=1, num_iters=1)
+
+        _, _, _, D_ref = launcher.reference_numpy()
+        max_err = float(np.max(np.abs(
+            result.D.astype(np.float32) - D_ref.astype(np.float32))))
+        assert max_err < 2.0, \
+            f"K-loop {M}x{N}x{K} uniform scales: max_err={max_err}"
+
+
+
+    def test_ones_k512(self):
+        """All-ones with K=512: verifies accumulation across 2 K tiles."""
+        from kernel_generator.gemm.launcher import GemmLauncher
+
+        M, N, K = 128, 128, 512
+        kernel, co_path = self._build_and_assemble(
+            M, N, K, "/tmp/test_mxfp4_kloop_ones_512.co")
+
+        problem = GemmProblem(M, N, K, dtype=DataType.MXFP4)
+        launcher = GemmLauncher(problem, kernel.tile, seed=0)
+        launcher._A = np.full((M, K // 2), 0x22, dtype=np.uint8)
+        launcher._B = np.full((N, K // 2), 0x22, dtype=np.uint8)
+        mx_block = 32
+        launcher._scale_A = np.full(M * (K // mx_block), 0x7F, dtype=np.uint8)
+        launcher._scale_B = np.full(N * (K // mx_block), 0x7F, dtype=np.uint8)
+
+        result = launcher.run_asm_kernel(
+            co_path, kernel_name="gemm_kernel",
+            num_warmup=1, num_iters=1)
+
+        expected = float(K)
+        max_err = float(np.max(np.abs(result.D.astype(np.float32) - expected)))
+        assert max_err < 1.0, \
+            f"All-ones K=512: expected {expected}, max_err={max_err}"
+
+
+@requires_gpu
+class TestMXFP4TensileLiteABI:
+    """MXFP4 via generate_custom_kernel() + TensileLite ABI launcher.
+
+    Tests the exact export path used for benchmarking, including the
+    ki-phased pipeline emitter with double-copy and scale interleaving.
+    The TensileLite MXFP4 kernel outputs BF16, so we convert via
+    _bf16_uint16_to_float32 before comparison.
+    """
+
+    @staticmethod
+    def _build_tl_kernel():
+        """Generate + assemble TensileLite MXFP4 kernel, return (asm, co_path, kname, tile)."""
+        from kernel_generator.gemm.export_tensilelite import generate_custom_kernel
+        import subprocess, tempfile, os
+
+        asm = generate_custom_kernel(wg_m=256, wg_n=256, unroll_k=256,
+                                     dtype='mxfp4')
+        tmpdir = tempfile.mkdtemp()
+        s_path = os.path.join(tmpdir, "test_tl.s")
+        co_path = os.path.join(tmpdir, "test_tl.co")
+        with open(s_path, 'w') as f:
+            f.write(asm)
+        subprocess.run([
+            '/opt/rocm/llvm/bin/clang', '-x', 'assembler',
+            '-target', 'amdgcn-amd-amdhsa', '-mcpu=gfx950',
+            '-mwavefrontsize64', '-o', co_path, s_path,
+        ], check=True, capture_output=True)
+
+        kname = None
+        for line in asm.splitlines():
+            if '.amdhsa_kernel' in line:
+                kname = line.split()[-1].strip()
+                break
+        assert kname, "Could not find kernel name in assembly"
+
+        mfma = MfmaConfig.mxfp4_16x16x128()
+        t = GemmTiling.high_perf(wg_m=256, wg_n=256, unroll_k=256, mfma=mfma,
+                                 lds_swizzle=True)
+        tile = t.to_tile_config()
+        return co_path, kname, tile
+
+    @staticmethod
+    def _bf16_to_f32(D_fp16: np.ndarray) -> np.ndarray:
+        """Reinterpret FP16-typed array as BF16 uint16 and convert to float32."""
+        from kernel_generator.gemm.launcher import _bf16_uint16_to_float32
+        raw = D_fp16.view(np.uint16)
+        return _bf16_uint16_to_float32(raw).reshape(D_fp16.shape)
+
+    @pytest.mark.parametrize("K", [256, 512])
+    def test_tensilelite_export_random(self, K):
+        """TensileLite-ABI kernel with random data, validated by Python ref."""
+        from kernel_generator.gemm.launcher import GemmLauncher
+
+        M, N = 256, 256
+        co_path, kname, tile = self._build_tl_kernel()
+
+        problem = GemmProblem(M, N, K, dtype=DataType.MXFP4)
+        launcher = GemmLauncher(problem, tile, seed=42,
+                                tensilelite_abi=True)
+        rng = np.random.RandomState(42)
+        launcher._A = rng.randint(0, 256, size=(M, K // 2), dtype=np.uint8)
+        launcher._B = rng.randint(0, 256, size=(N, K // 2), dtype=np.uint8)
+
+        result = launcher.run_asm_kernel(
+            co_path, kernel_name=kname,
+            lds_bytes=147456, use_1d_grid=True,
+            num_warmup=1, num_iters=1)
+
+        # Launcher handles BF16->float32 conversion automatically
+        D_gpu = np.asarray(result.D, dtype=np.float32)
+
+        # Reference in float32 (no FP16 truncation)
+        from kernel_generator.gemm.launcher import (
+            _unpack_fp4_to_float, _apply_mx_scales)
+        A_f32 = _unpack_fp4_to_float(launcher._A)
+        B_f32 = _unpack_fp4_to_float(launcher._B)
+        D_ref = A_f32 @ B_f32.T
+
+        max_err = float(np.max(np.abs(D_gpu - D_ref)))
+        assert max_err < 4.0, \
+            f"TensileLite ABI K={K}: max_err={max_err}"
+
+    @pytest.mark.parametrize("K", [256, 512])
+    def test_tensilelite_export_random_scales(self, K):
+        """TensileLite-ABI kernel with random data + random scales."""
+        from kernel_generator.gemm.launcher import GemmLauncher
+
+        M, N = 256, 256
+        co_path, kname, tile = self._build_tl_kernel()
+
+        problem = GemmProblem(M, N, K, dtype=DataType.MXFP4)
+        launcher = GemmLauncher(problem, tile, seed=77,
+                                tensilelite_abi=True)
+        rng = np.random.RandomState(77)
+        launcher._A = rng.randint(0, 256, size=(M, K // 2), dtype=np.uint8)
+        launcher._B = rng.randint(0, 256, size=(N, K // 2), dtype=np.uint8)
+        mx_block = 32
+        launcher._scale_A = rng.randint(0x7D, 0x82,
+                                         size=M * (K // mx_block),
+                                         dtype=np.uint8)
+        launcher._scale_B = rng.randint(0x7D, 0x82,
+                                         size=N * (K // mx_block),
+                                         dtype=np.uint8)
+
+        result = launcher.run_asm_kernel(
+            co_path, kernel_name=kname,
+            lds_bytes=147456, use_1d_grid=True,
+            num_warmup=1, num_iters=1)
+
+        # Launcher handles BF16 conversion
+        D_gpu = np.asarray(result.D, dtype=np.float32)
+
+        # Reference with scales applied
+        from kernel_generator.gemm.launcher import (
+            _unpack_fp4_to_float, _apply_mx_scales)
+        A_f32 = _apply_mx_scales(_unpack_fp4_to_float(launcher._A), launcher._scale_A)
+        B_f32 = _apply_mx_scales(_unpack_fp4_to_float(launcher._B), launcher._scale_B)
+        D_ref = A_f32 @ B_f32.T
+
+        max_err = float(np.max(np.abs(D_gpu - D_ref)))
+        assert max_err < 16.0, \
+            f"TensileLite ABI random scales K={K}: max_err={max_err}"
+
+
+@requires_gpu
+class TestMXFP4RandomScaleRegression:
+    """MXFP4 with varying E8M0 scales across K blocks (standard kernel path).
+
+    Exercises the scale SRD advancement + pre-swizzle correctness
+    for the non-TensileLite kernel.
+    """
+
+    @staticmethod
+    def _build_and_assemble(m, n, k, output_path):
+        tiling = GemmTiling.mxfp4_standard()
+        problem = GemmProblem(m, n, k, dtype=DataType.MXFP4)
+        kernel = GemmKernel.build(problem, tiling=tiling)
+        result = kernel.emit()
+        co_path = result.assemble(output_path=output_path)
+        return kernel, co_path
+
+    @pytest.mark.parametrize("M,N,K", [
+        (128, 128, 512),
+        (128, 128, 1024),
+    ])
+    def test_random_scales(self, M, N, K):
+        """Random FP4 data + random E8M0 scales: full K-loop + scale path."""
+        from kernel_generator.gemm.launcher import GemmLauncher
+
+        kernel, co_path = self._build_and_assemble(
+            M, N, K, f"/tmp/test_mxfp4_rscale_{M}_{N}_{K}.co")
+
+        problem = GemmProblem(M, N, K, dtype=DataType.MXFP4)
+        launcher = GemmLauncher(problem, kernel.tile, seed=99)
+        rng = np.random.RandomState(99)
+        launcher._A = rng.randint(0, 256, size=(M, K // 2), dtype=np.uint8)
+        launcher._B = rng.randint(0, 256, size=(N, K // 2), dtype=np.uint8)
+        mx_block = 32
+        launcher._scale_A = rng.randint(0x7D, 0x82,
+                                         size=M * (K // mx_block),
+                                         dtype=np.uint8)
+        launcher._scale_B = rng.randint(0x7D, 0x82,
+                                         size=N * (K // mx_block),
+                                         dtype=np.uint8)
+
+        result = launcher.run_asm_kernel(
+            co_path, kernel_name="gemm_kernel",
+            num_warmup=1, num_iters=1)
+
+        _, _, _, D_ref = launcher.reference_numpy()
+        max_err = float(np.max(np.abs(
+            result.D.astype(np.float32) - D_ref.astype(np.float32))))
+        assert max_err < 2.0, \
+            f"K-loop {M}x{N}x{K} random scales: max_err={max_err}"

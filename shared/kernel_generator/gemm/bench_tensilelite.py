@@ -115,43 +115,31 @@ def _build_yaml(
     streamk: bool = False,
 ) -> str:
     """Build a complete TensileLite benchmark YAML."""
-    # ProblemType
-    if dtype == "mxfp4":
-        problem_type = {
-            "OperationType": "GEMM",
-            "DataType": "F4",
-            "DestDataType": "B",
-            "ComputeDataType": "S",
-            "HighPrecisionAccumulate": True,
-            "TransposeA": 1,
-            "TransposeB": 0,
-            "UseBeta": True,
-            "Batched": True,
-            "UseBias": 0,
-            "Activation": False,
-            "UseScaleAlphaVec": 0,
+    # ProblemType -- driven by DTypeConfig registry
+    from .config import dtype_config
+    dcfg = dtype_config(dtype)
+    problem_type = {
+        "OperationType": "GEMM",
+        "DataType": dcfg.tensile_data_type,
+        "DestDataType": dcfg.tensile_dest_type,
+        "ComputeDataType": "S",
+        "HighPrecisionAccumulate": True,
+        "TransposeA": 1,
+        "TransposeB": 0,
+        "UseBeta": True,
+        "Batched": True,
+        "UseBias": 0,
+        "Activation": False,
+        "UseScaleAlphaVec": 0,
+    }
+    if dcfg.has_mx_scales:
+        problem_type.update({
             "SwizzleTensorA": False,
             "SwizzleTensorB": False,
-            "MXBlockA": 32,
-            "MXBlockB": 32,
-        }
-        mi = [16, 16, 128, 1, 1, 8, 8, 2, 2]
-    else:
-        problem_type = {
-            "OperationType": "GEMM",
-            "DataType": "H",
-            "DestDataType": "H",
-            "ComputeDataType": "S",
-            "HighPrecisionAccumulate": True,
-            "TransposeA": 1,
-            "TransposeB": 0,
-            "UseBeta": True,
-            "Batched": True,
-            "UseBias": 0,
-            "Activation": False,
-            "UseScaleAlphaVec": 0,
-        }
-        mi = [16, 16, 16, 1, 1, 8, 8, 2, 2]
+            "MXBlockA": dcfg.mx_block,
+            "MXBlockB": dcfg.mx_block,
+        })
+    mi = list(dcfg.tensile_mi)
 
     # Format args for YAML inline
     args_lines = []
@@ -314,7 +302,7 @@ def main() -> None:
         "--tensile-dir", required=True,
         help="Path to projects/hipblaslt on the GemmFromAnywhere branch",
     )
-    parser.add_argument("--dtype", default="mxfp4", choices=["mxfp4", "fp16"])
+    parser.add_argument("--dtype", default="mxfp4", choices=["mxfp4", "fp16", "bf16"])
     parser.add_argument("--wg-m", type=int, default=256)
     parser.add_argument("--wg-n", type=int, default=256)
     parser.add_argument("--unroll-k", type=int, default=256)
@@ -378,7 +366,7 @@ def main() -> None:
     macrotile = [args.wg_m, args.wg_n, args.unroll_k]
     threads = [256, 1, 1]
     # FP16 uses WGMXCC=8 (1D grid); MXFP4 uses WGMXCC=1 (2D grid)
-    use_1d = (args.dtype != "mxfp4") and not args.streamk
+    use_1d = (args.dtype not in ("mxfp4",)) and not args.streamk
     yaml_text = _build_yaml(
         kernel_name=kernel_name,
         yaml_args=yaml_args,
