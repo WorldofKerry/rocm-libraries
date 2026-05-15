@@ -55,10 +55,12 @@ def wire_emit_callbacks(
 
     # Late-bind codegen references on DTLDataStreams so they can
     # implement advance/toggle/load without emit_wiring special cases.
-    from ..memory.streams import DTLDataStream
+    from ..memory.streams import DTLDataStream, LDSInputStream
     for s in streams:
         if isinstance(s, DTLDataStream):
             s.set_codegen(loader, reader)
+        elif isinstance(s, LDSInputStream):
+            s.set_codegen(None, reader)
 
     for op_name, op in graph.ops.items():
         # -- Producer ops (uniform stream dispatch) --

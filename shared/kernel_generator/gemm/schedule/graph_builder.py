@@ -65,14 +65,20 @@ def build_kloop_graph(
     # ------------------------------------------------------------------
     # 1. Producer ops  (iteration = pgr)
     # ------------------------------------------------------------------
+    # Only create producer ops (advance/toggle/load) for streams that
+    # actually load from global memory.  LDSInputStream has
+    # num_global_loads=0 and skips the entire producer chain.
     terminal_producers: List[str] = []  # last op per stream's chain
 
     for s in streams:
+        if s.num_global_loads == 0:
+            # No producer ops -- data already in LDS (e.g. LDSInputStream)
+            continue
+
         adv = f"advance_{s.name}"
         tog = f"toggle_wr_{s.name}"
         ld  = f"load_{s.name}"
 
-        # TODO: emit callbacks will be wired in Phase 4.
         graph.add_op(KLoopOp(adv, OpKind.SCALAR, emit=None,
                              iteration=pgr,
                              comment=f"advance {s.name} SRD"))
@@ -220,6 +226,10 @@ def build_kloop_graph(
     last_mfma = f"mfma_m{mr - 1}_n{nr - 1}_k{ki_count - 1}"
 
     for s in streams:
+        if s.num_global_loads == 0:
+            # LDS-input streams don't toggle (no double-buffer needed)
+            continue
+
         tname = f"toggle_rd_{s.name}"
         graph.add_op(KLoopOp(
             tname, OpKind.SCALAR, emit=None,

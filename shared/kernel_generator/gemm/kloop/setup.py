@@ -405,15 +405,15 @@ def _emit_lds_read_addresses(ctx: AsmContext, tile: TileConfig,
         ctx.v_lshr(ctx.vreg("v_tmp1"), ctx.vreg("v_lane_id"),
                    int(math.log2(mfma.m)), comment=f"k_group = lane_id / {mfma.m}")
 
-        # A: m_row = wave_m * m_per_wave + lane_row
-        ctx.v_mul(ctx.vreg("v_tmp4"), str(tile.m_per_wave),
-                  ctx.vreg("v_wave_m"), comment=f"wave_m * {tile.m_per_wave}")
-        ctx.v_add(ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"), ctx.vreg("v_tmp4"),
-                  comment="+ lane_row -> m_row_a")
-        # Compute row_base into v_tmp3 to avoid aliasing with
-        # out_vregs[0] and XorSwizzle's internal v_tmp2 temp.
+        # A: row_base = (wave_m * m_per_wave + lane_row) * row_stride
+        # The swizzle operates on lane_row (v_tmp0), NOT m_row.
+        # Wave offset goes into row_base only.
         ctx.v_mul(ctx.vreg("v_tmp3"), str(row_stride_bytes),
-                  ctx.vreg("v_tmp0"), comment=f"row_base_a = m_row * {row_stride_bytes}")
+                  ctx.vreg("v_tmp0"), comment=f"row_base_a = lane_row * {row_stride_bytes}")
+        ctx.v_mul(ctx.vreg("v_tmp4"), str(tile.m_per_wave * row_stride_bytes),
+                  ctx.vreg("v_wave_m"), comment=f"wave_m * {tile.m_per_wave * row_stride_bytes}")
+        ctx.v_add(ctx.vreg("v_tmp3"), ctx.vreg("v_tmp3"), ctx.vreg("v_tmp4"),
+                  comment="row_base_a += wave_m offset")
         ki_count = swz_layout.ki_count
         a_out = [ctx.vreg("v_lds_rd_a")] + [ctx.vreg(f"v_lds_rd_a_k{ki}") for ki in range(1, ki_count)]
         swz.emit_read_setup(ctx, swz_layout, LDS_GFX950,
@@ -421,15 +421,15 @@ def _emit_lds_read_addresses(ctx: AsmContext, tile: TileConfig,
                             ctx.vreg("v_tmp3"), a_out)
         ctx.raw("")
 
-        # B: n_row = wave_n * n_per_wave + lane_row
+        # B: row_base = (wave_n * n_per_wave + lane_row) * row_stride
         ctx.v_and(ctx.vreg("v_tmp0"), ctx.vreg("v_lane_id"), mfma.m - 1,
                   comment=f"lane_row (re-derive)")
-        ctx.v_mul(ctx.vreg("v_tmp4"), str(tile.n_per_wave),
-                  ctx.vreg("v_wave_n"), comment=f"wave_n * {tile.n_per_wave}")
-        ctx.v_add(ctx.vreg("v_tmp0"), ctx.vreg("v_tmp0"), ctx.vreg("v_tmp4"),
-                  comment="+ lane_row -> n_row_b")
         ctx.v_mul(ctx.vreg("v_tmp3"), str(row_stride_bytes),
-                  ctx.vreg("v_tmp0"), comment=f"row_base_b = n_row * {row_stride_bytes}")
+                  ctx.vreg("v_tmp0"), comment=f"row_base_b = lane_row * {row_stride_bytes}")
+        ctx.v_mul(ctx.vreg("v_tmp4"), str(tile.n_per_wave * row_stride_bytes),
+                  ctx.vreg("v_wave_n"), comment=f"wave_n * {tile.n_per_wave * row_stride_bytes}")
+        ctx.v_add(ctx.vreg("v_tmp3"), ctx.vreg("v_tmp3"), ctx.vreg("v_tmp4"),
+                  comment="row_base_b += wave_n offset")
         b_out = [ctx.vreg("v_lds_rd_b")] + [ctx.vreg(f"v_lds_rd_b_k{ki}") for ki in range(1, ki_count)]
         swz.emit_read_setup(ctx, swz_layout, LDS_GFX950,
                             ctx.vreg("v_tmp0"), ctx.vreg("v_tmp1"),

@@ -11,7 +11,7 @@ from kernel_generator.gemm.kernel import GemmKernel
 def generate(wg_m=256, wg_n=256, unroll_k=64, output="bf16_mainloop.s"):
     mfma = MfmaConfig.bf16_16x16x32()
     t = GemmTiling.high_perf(wg_m=wg_m, wg_n=wg_n, unroll_k=unroll_k,
-                             mfma=mfma, lds_swizzle=True)
+                             mfma=mfma, lds_swizzle=False)
     p = GemmProblem(4096, 4096, 4096, dtype=DataType.BF16)
     k = GemmKernel.build(p, tiling=t, skip_store=True)
     result = k.emit()

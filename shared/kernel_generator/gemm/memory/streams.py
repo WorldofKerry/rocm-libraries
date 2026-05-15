@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DTLDataStream",
+    "LDSInputStream",
     "ScaleStream",
     ]
 
@@ -137,6 +138,92 @@ class DTLDataStream(LDSStream):
         if self._matrix == "a":
             self._reader.toggle_read()
         # matrix "b": no-op -- reader.toggle_read() covers both
+
+
+class LDSInputStream(LDSStream):
+    """Matrix data pre-loaded into LDS by the caller.
+
+    No global loads, no SRD, no advance.  The caller is responsible
+    for writing data into LDS in the layout that ``LDSReader`` expects
+    before the K-loop starts.
+
+    Use case: fused kernels where a prior operation (e.g. Q projection
+    in flash attention) already placed data in LDS.
+
+    The K-loop consumer side (ds_read + MFMA) is identical to
+    ``DTLDataStream`` -- same ``LDSReader``, same graph ops.  Only the
+    producer side (global load + SRD management) is removed.
+
+    Example::
+
+        # Q already in LDS, K loaded from global
+        streams = [LDSInputStream("a", tile, problem),
+                   DTLDataStream("b", tile, problem)]
+        graph = build_kloop_graph(streams, tile, pgr=1)
+        # Graph has producer ops only for B, not A.
+    """
+
+    def __init__(self, matrix: str, tile: 'TileConfig',
+                 problem: 'GemmProblem') -> None:
+        assert matrix in ("a", "b")
+        self._matrix = matrix
+        self._reader = None
+        self._tile = tile
+        self._elem = problem.element_bytes
+        self._lds_offset = 0
+
+        # LDS region must match DTLDataStream so the reader works
+        tpr = int(tile.unroll_k * self._elem) // 16
+        rpl = tile.block_size // tpr
+        wg_dim = tile.wg_m if matrix == "a" else tile.wg_n
+        self._num_loads_equiv = wg_dim // rpl
+        lds_row = int(rpl * tile.unroll_k * self._elem)
+        self._region = lds_row * self._num_loads_equiv + tile.lds_pad * (self._num_loads_equiv - 1)
+
+    def set_codegen(self, loader: object, reader: object) -> None:
+        """Wire LDSReader (loader is ignored -- no global loads)."""
+        self._reader = reader
+
+    @property
+    def name(self) -> str:
+        return f"data_{self._matrix}"
+
+    @property
+    def region_size(self) -> int:
+        return self._region
+
+    @property
+    def num_global_loads(self) -> int:
+        return 0  # no global loads -- data already in LDS
+
+    @property
+    def needs_lds_write(self) -> bool:
+        return False  # caller already wrote LDS
+
+    def setup(self, ctx: 'AsmContext', lds_offset: int) -> None:
+        self._lds_offset = lds_offset
+
+    def emit_global_loads(self, ctx: 'AsmContext') -> None:
+        pass  # no-op
+
+    def emit_lds_writes(self, ctx: 'AsmContext') -> None:
+        pass  # no-op
+
+    def read_op_count(self) -> int:
+        mr = self._tile.mfma_m_repeat if self._matrix == "a" else self._tile.mfma_n_repeat
+        ki = self._tile.k_iterations
+        return mr * ki
+
+    def advance(self, ctx: 'AsmContext') -> None:
+        pass  # no SRD to advance
+
+    def toggle_write(self, ctx: 'AsmContext') -> None:
+        pass  # no write pointer to toggle
+
+    def toggle_read(self, ctx: 'AsmContext') -> None:
+        """Toggle LDS read bases for double-buffering."""
+        if self._matrix == "a":
+            self._reader.toggle_read()
 
 
 class ScaleStream(LDSStream):
