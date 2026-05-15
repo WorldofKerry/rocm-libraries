@@ -40,8 +40,6 @@ class AsmContext(TileContext):
         super().__init__(module=None)  # no stinkytofu module
         self._lines: List[str] = []
         self.config: 'KernelConfig | None' = config
-        # Compat bridge: _metadata reads/writes sync with config
-        self._metadata: dict = {}
         self._state: dict = {}  # runtime state (_dtl_loader, etc.)
 
     # -- Assembly text output -----------------------------------------------

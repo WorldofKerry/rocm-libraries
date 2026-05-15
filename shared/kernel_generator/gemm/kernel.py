@@ -235,15 +235,6 @@ class GemmKernel:
             layouts=self.layouts, mainloop=mainloop, kernel=self,
         )
         ctx = AsmContext(config=config)
-        # Compat: sync _metadata for code not yet migrated
-        ctx._metadata = {
-            "tile": tile,
-            "problem": self.problem,
-            "layout": layout,
-            "mainloop": mainloop,
-            "layouts": self.layouts,
-            "kernel": self,
-        }
         # DTL kernels use a different register allocation
         is_dtl = any(p.name in ("dtl_setup", "dtl_interleaved_setup",
                                 "wave_abi_setup")

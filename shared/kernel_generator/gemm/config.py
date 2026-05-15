@@ -320,13 +320,7 @@ def setup_kloop(ctx: 'AsmContext', config: 'KernelConfig') -> KLoopContract:
     problem = config.problem
     layout = config.layout or layout_for(problem.dtype)
 
-    # Populate ctx.config and _metadata compat layer
     ctx.config = config
-    ctx._metadata = {
-        "tile": tile, "problem": problem,
-        "layout": layout, "layouts": config.layouts,
-        "mainloop": config.mainloop, "kernel": config.kernel,
-    }
 
     # Allocate all registers (thread ID, SRDs, LDS addrs, accumulators, etc.)
     alloc_registers_dtl(ctx, problem, tile, layout)
