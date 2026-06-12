@@ -838,7 +838,7 @@ class Solution(collections.abc.Mapping):
       state["SourceSwap"] = False
       # Force BufferStore=1: UseSubtileImpl optimized storeD path is only implemented
       # for buffer stores for now.
-      state["BufferStore"] = 1
+      state["BufferStore"] = True
       # Not currently implemented in subtile implementation
       state["Use64bShadowLimit"] = False
       state["Use64bShadowLimitMX"] = False
@@ -1777,7 +1777,7 @@ class Solution(collections.abc.Mapping):
         if state["EnableMatrixInstruction"]:
           state["MIWaveTileMetadata"] = state["MIWaveTileB"]
         if state["DirectToLdsMetadata"] and not state["DirectToLdsB"]:
-          state["DirectToLdsMetadata"] = False
+          state["DirectToLdsMetadata"] = 0
       else:
         if not state["DirectToVgprSparseMetadata"]:
           state["ThreadTileMetadata"] = state["ThreadTileA"]
@@ -1789,10 +1789,10 @@ class Solution(collections.abc.Mapping):
         if state["EnableMatrixInstruction"]:
           state["MIWaveTileMetadata"] = state["MIWaveTileA"]
         if state["DirectToLdsMetadata"] and not state["DirectToLdsA"]:
-          state["DirectToLdsMetadata"] = False
+          state["DirectToLdsMetadata"] = 0
     elif not state["ProblemType"]["Sparse"]:
       state["DirectToVgprSparseMetadata"] = False
-      state["DirectToLdsMetadata"] = False
+      state["DirectToLdsMetadata"] = 0
       state["MIWaveTileMetadata"] = 0
 
     if state["NonTemporal"] != -1:
@@ -2727,7 +2727,9 @@ class Solution(collections.abc.Mapping):
 
       if state["StaggerUStride"] == -1 or state["StaggerUStride"] < (state["DepthU"] * bpeAB):
         # (StaggerUStride) shoud be greater than or equal to (DepthU * bpeAB)
-        state["StaggerUStride"] = state["DepthU"] * bpeAB
+        # numBytes() returns a float, so coerce to int to keep StaggerUStride an
+        # int (msgpack wire type must match the C++ int field).
+        state["StaggerUStride"] = int(state["DepthU"] * bpeAB)
 
       state["_staggerStrideShift"] = (int)(math.ceil(math.log(state["StaggerUStride"] / (state["DepthU"] * bpeAB), 2)))
 
@@ -4086,10 +4088,10 @@ class Solution(collections.abc.Mapping):
       grvwm = state["GlobalReadVectorWidthMetadata"]
       grvwmCheck = (grvwm == 4) or (grvwm == 16 and isaInfoMap[state["ISA"]].asmCaps["HasDirectToLdsx4"])
       if state["DirectToLds%s"%sparseTc] and (not state["DirectToVgprSparseMetadata"]) and grvwmCheck:
-        state["DirectToLdsMetadata"] = True
+        state["DirectToLdsMetadata"] = 1
         state["LocalWriteUseSgprMetadata"] = True
       else:
-        state["DirectToLdsMetadata"] = False
+        state["DirectToLdsMetadata"] = 0
         state["LocalWriteUseSgprMetadata"] = False
 
     # Update parent variable so kernel display is accurate

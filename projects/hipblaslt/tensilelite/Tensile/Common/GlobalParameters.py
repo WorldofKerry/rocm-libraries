@@ -434,7 +434,7 @@ defaultBenchmarkCommonParameters = [
     {"ScheduleGlobalRead": [1]},
     {"ScheduleLocalWrite": [1]},
     {"ScheduleIterAlg": [3]},
-    {"GlobalReadPerMfma": [1]},
+    {"GlobalReadPerMfma": [1.0]},
     {"LocalWritePerMfma": [-1]},
     {"InterleaveAlpha": [0]},
     {"OptNoLoadLoop": [1]},
@@ -766,6 +766,8 @@ def assignGlobalParameters(config, isaInfoMap: Dict[IsaVersion, IsaInfo]):
         "OutputPath",
         "Experimental",
         "GenSolTable",
+        # Consumed via DebugConfig (see Common/Types.py), not a global parameter.
+        "PrintSolutionRejectionReason",
     ]
     for key in config:
         if key in ignoreKeys:
