@@ -1,0 +1,285 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+
+TestParameters:
+  marks: [skip-gfx900, skip-gfx906, skip-gfx908, skip-gfx90a, skip-gfx940, skip-gfx941, skip-gfx942, skip-gfx950, skip-gfx1010, skip-gfx1011, skip-gfx1012, skip-gfx1030, skip-gfx1100, skip-gfx1101, skip-gfx1102, skip-gfx1200, skip-gfx1201]
+
+GlobalParameters:
+  NumElementsToValidate: 128
+  PrintLevel: 3
+  Device: 0
+  CMakeBuildType: Release
+  KernelTime: True
+  DataInitTypeA: 12
+  DataInitTypeB: 13
+  DataInitTypeC: 3
+  DataInitTypeAlpha: 1
+  DataInitTypeBeta: 2
+  BoundsCheck: 0
+  KeepBuildTmp: True
+  CpuThreads: 1
+  Architecture: gfx1250
+  ISA: [[12, 5, 0]]
+  PrintSolutionRejectionReason: True
+  RotatingBufferSize: 512
+  NumWarmups: 100
+  EnqueuesPerSync: 10000
+
+BenchmarkProblems:
+  # 1: 4096x4096x16384  MT 256x256
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: 1
+      TransposeB: 0
+      UseBeta: True
+      Batched: True
+
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1, 1, 8, 8, 2, 2]  # MT 256x256
+        - DepthU: [128]
+        - WavefrontSize: [32]
+        - PrefetchGlobalRead: [2]
+        - ScheduleIterAlg: [3]
+        - PreloadKernArgs: [True]
+        - UseSubtileImpl: [1]
+        - StreamK: [0]
+        - TDMInst: [3]
+        - StaggerU: [0]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - 1LDSBuffer: [0]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - GlobalSplitU: [1]
+        - ClusterDim: [[4, 4]]
+      BenchmarkForkParameters:
+      JoinParameters:
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [4096, 4096, 1, 16384]
+
+  ## 2: 6144x6144x7168  MT 384x192 -- commented out, was hanging
+  #-
+  #  - # ProblemType
+  #    OperationType: GEMM
+  #    DataType: b
+  #    DestDataType: b
+  #    ComputeDataType: s
+  #    HighPrecisionAccumulate: True
+  #    TransposeA: 1
+  #    TransposeB: 0
+  #    UseBeta: True
+  #    Batched: True
+  #
+  #  - InitialSolutionParameters:
+  #    BenchmarkCommonParameters:
+  #      - KernelLanguage: ["Assembly"]
+  #    ForkParameters:
+  #      - MatrixInstruction:
+  #        - [16, 16, 32, 1, 1, 12, 6, 2, 2]  # MT 384x192
+  #      - DepthU: [128]
+  #      - WavefrontSize: [32]
+  #      - PrefetchGlobalRead: [2]
+  #      - ScheduleIterAlg: [3]
+  #      - PreloadKernArgs: [True]
+  #      - UseSubtileImpl: [1]
+  #      - StreamK: [0]
+  #      - TDMInst: [3]
+  #      - StaggerU: [0]
+  #      - LdsPadA: [-1]
+  #      - LdsPadB: [-1]
+  #      - 1LDSBuffer: [0]
+  #      - StoreVectorWidth: [-1]
+  #      - GlobalReadVectorWidthA: [-1]
+  #      - GlobalReadVectorWidthB: [-1]
+  #      - GlobalSplitU: [1]
+  #      - ClusterDim: [[4, 4]]
+  #    BenchmarkForkParameters:
+  #    JoinParameters:
+  #    BenchmarkJoinParameters:
+  #    BenchmarkFinalParameters:
+  #      - ProblemSizes:
+  #        - Exact: [6144, 6144, 1, 7168]
+
+  # 3: 7168x512x16384  MT 256x64
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: 1
+      TransposeB: 0
+      UseBeta: True
+      Batched: True
+
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1, 1, 8, 2, 2, 2]  # MT 256x64
+        - DepthU: [128]
+        - WavefrontSize: [32]
+        - PrefetchGlobalRead: [2]
+        - ScheduleIterAlg: [3]
+        - PreloadKernArgs: [True]
+        - UseSubtileImpl: [1]
+        - StreamK: [0]
+        - TDMInst: [3]
+        - StaggerU: [0]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - 1LDSBuffer: [0]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - GlobalSplitU: [1]
+        - ClusterDim: [[4, 4]]
+      BenchmarkForkParameters:
+      JoinParameters:
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [7168, 512, 1, 16384]
+
+  # 4: 7168x7168x16384  MT 320x256
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: 1
+      TransposeB: 0
+      UseBeta: True
+      Batched: True
+
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1, 1, 10, 8, 2, 2]  # MT 320x256
+        - DepthU: [128]
+        - WavefrontSize: [32]
+        - PrefetchGlobalRead: [2]
+        - ScheduleIterAlg: [3]
+        - PreloadKernArgs: [True]
+        - UseSubtileImpl: [1]
+        - StreamK: [0]
+        - TDMInst: [3]
+        - StaggerU: [0]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - 1LDSBuffer: [0]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - GlobalSplitU: [1]
+        - ClusterDim: [[4, 4]]
+      BenchmarkForkParameters:
+      JoinParameters:
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [7168, 7168, 1, 16384]
+
+  # 5: 16384x4096x4096  MT 256x256
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: 1
+      TransposeB: 0
+      UseBeta: True
+      Batched: True
+
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1, 1, 8, 8, 2, 2]  # MT 256x256
+        - DepthU: [128]
+        - WavefrontSize: [32]
+        - PrefetchGlobalRead: [2]
+        - ScheduleIterAlg: [3]
+        - PreloadKernArgs: [True]
+        - UseSubtileImpl: [1]
+        - StreamK: [0]
+        - TDMInst: [3]
+        - StaggerU: [0]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - 1LDSBuffer: [0]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - GlobalSplitU: [1]
+        - ClusterDim: [[4, 4]]
+      BenchmarkForkParameters:
+      JoinParameters:
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [16384, 4096, 1, 4096]
+
+  # 6: 129408x512x7168  MT 256x256 (RotatingBufferSize 0 to disable -- tensors too large)
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: 1
+      TransposeB: 0
+      UseBeta: True
+      Batched: True
+
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1, 1, 8, 8, 2, 2]  # MT 256x256
+        - DepthU: [128]
+        - WavefrontSize: [32]
+        - PrefetchGlobalRead: [2]
+        - ScheduleIterAlg: [3]
+        - PreloadKernArgs: [True]
+        - UseSubtileImpl: [1]
+        - StreamK: [0]
+        - TDMInst: [3]
+        - StaggerU: [0]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - 1LDSBuffer: [0]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - GlobalSplitU: [1]
+        - ClusterDim: [[4, 4]]
+      BenchmarkForkParameters:
+      JoinParameters:
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [129408, 512, 1, 7168]
