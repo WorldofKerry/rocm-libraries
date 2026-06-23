@@ -1660,7 +1660,7 @@ class LogicalScheduler:
                     if tensor not in first_lr:
                         first_lr[tensor] = lr
                     if tensor in last_lr_mt and last_lr_mt[tensor] != mt:
-                        lr.preOps.append(LRIncOp(tensor=tensor))
+                        last_lr[tensor].postOps.append(LRIncOp(tensor=tensor))
                         lr_inc_tensors.add(tensor)
                     last_lr[tensor] = lr
                     last_lr_mt[tensor] = mt
