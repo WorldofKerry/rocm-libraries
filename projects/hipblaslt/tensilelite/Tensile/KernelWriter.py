@@ -6835,8 +6835,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
     if self.states.tailloopInNll or \
        (kernel["StreamK"] and \
         hasMx and isgfx950) or \
-       disableStaggerForMxPap or \
-       kernel["UseSubtileImpl"]:
+       disableStaggerForMxPap:
       self.states.staggerUCode = False
     self.states.tailloopInNllmaxUnit = 1
     if self.states.tailloopInNll:

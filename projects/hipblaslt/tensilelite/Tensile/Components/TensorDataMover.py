@@ -113,7 +113,7 @@ class TensorDataMoverLoad(TensorDataMover):
                 else:
                     #TODO: support general batch
                     assert False, "Currently, TDM does not support general batch"
-            #TODO: support stagger U
+            # StaggerU offset is applied externally by calculateStagger() after descriptor setup
         return mod
 
     def calculateStartAddrWaveSeparated(self, writer: "KernelWriterAssembly", kernel: Mapping, tp: Mapping, sgprAddr: int | str, dstGroup0: str = None, waveIdxSgpr: int | str = "WaveIdx") -> Module:
@@ -212,7 +212,7 @@ class TensorDataMoverLoad(TensorDataMover):
                 else:
                     #TODO: support general batch
                     assert False, "Currently, TDM does not support general batch"
-            #TODO: support stagger U
+            # StaggerU offset is applied externally by calculateStagger() after descriptor setup
         return mod
 
     def issueLoad(self, group0: int | str, group1: int | str, group2: Optional[int | str], group3: Optional[int | str]) -> Module:
