@@ -1092,13 +1092,13 @@ def initTDMDescriptorSubtile(writer, kernel, tP):
   }
   ldsConstOffset = ldsOffsetMap.get(tc, 0)
 
-  sizeTile0, sizeTile1 = du, mt
+  tileInfoForTc = writer.states.a.tileInfo if tc == 'A' else writer.states.b.tileInfo
+  tdmTileK, tdmTileM = du, mt
   # TDM D# Group1 pad fields
   #   padAmountBytes   -> pad_amount   [31:25], bytes inserted per pad event
   #   padIntervalBytes -> pad_interval [24:22], bytes written between pads
   # Sourced from TileInfo.ldsRowPadBytes so GR and LR
   # see the same value.
-  tileInfoForTc = writer.states.a.tileInfo if tc == 'A' else writer.states.b.tileInfo
   padAmountBytes = int(getattr(tileInfoForTc, "ldsRowPadBytes", 0))
   padIntervalBytes = int(du * bpe) if padAmountBytes else 0
 
@@ -1149,8 +1149,8 @@ def initTDMDescriptorSubtile(writer, kernel, tP):
   mod.add(comp.setTensorDim1(descSgprName(1), sizeRefName(ti), writer))
 
   sizeShifterTile = sizeShifter
-  mod.add(comp.setTensorTile0(descSgprName(1), sizeTile0, writer, sizeShifterTile))
-  mod.add(comp.setTensorTile1(descSgprName(1), sizeTile1 // numWaves, writer))
+  mod.add(comp.setTensorTile0(descSgprName(1), tdmTileK, writer, sizeShifterTile))
+  mod.add(comp.setTensorTile1(descSgprName(1), tdmTileM // numWaves, writer))
   mod.add(comp.setTensorStride0(descSgprName(1), strideRefName(), sizeShifterTile))
   return mod
 

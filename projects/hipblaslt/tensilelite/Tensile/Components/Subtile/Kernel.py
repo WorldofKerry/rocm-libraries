@@ -289,7 +289,7 @@ AB_B16 = ABTilePair(
 # Wave32 bf16: 8 VGPRs per operand (WMMA V3 gfx1250)
 _B16_W32 = dict(mmaLayout=MMALayout(instM=16, blocks=1, vgprs=8, waveSize=32), instK=32, bpe=2, supportedTypes=('bf16', 'fp16'))
 AB_B16_W32 = ABTilePair(
-    gr=ABGRGeometry(tag=GRTag_1x2(), **_B16_W32, subtileShape=(1, 2), loadShape=LoadShape(m=1, k=8)),
+    gr=ABGRGeometry(tag=GRTag_1x2(), **_B16_W32),
     lr=ABLRGeometry(tag=LRTag_1x2(), **_B16_W32, subtileShape=(1, 2), loadShape=LoadShape(m=1, k=8)),
 )
 

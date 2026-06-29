@@ -670,7 +670,7 @@ def emitSingleDsRead(tileInfo, sId0, sId1, subIterK, dstTile, swizzled=True):
   else:
     # Non-swizzled: full DepthU tile is contiguous in LDS with K as the fast
     # dimension.  Each M-row is depthUBytes wide.  A subtile row covers
-    # subtileShape[0] * instM M-rows, so stride = that * depthUBytes.
+    # subtileShape[0] * instM M-rows, so stride = that * depthUBytes + padding.
     instM = int(tileInfo.mmaTileShape[0])
     instK = int(tileInfo.mmaTileShape[1])
     subtileShapeM = int(tileInfo.subtileShape[0])
