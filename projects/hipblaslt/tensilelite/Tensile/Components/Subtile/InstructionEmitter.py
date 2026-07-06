@@ -121,6 +121,7 @@ class InstructionEmitter:
             'inline':       lambda em, ui: self.emit_inline(em.source),
             'gl2_prefetch':     lambda em, ui: self.emit_gl2_prefetch(),
             'gl2_prefetch_inc': lambda em, ui: self.emit_gl2_prefetch_inc(),
+            'gl2_prefetch_guarded_inc_and_load': lambda em, ui: self.emit_gl2_prefetch_guarded_inc_and_load(),
         }
 
         # Sentinel for the long-lived per-lane diff vgpr. Set by
@@ -334,13 +335,46 @@ class InstructionEmitter:
         pgr = kernel["PrefetchGlobalRead"]
         mod.add(SCmpLeU32(src0=loopCounter, src1=pgr + pgl,
                           comment=f"counterL <= PGR({pgr})+PGL({pgl})?"))
-        mod.add(SCMovB32(dst=sgpr("GL2PrefetchIncA"), src=0))
-        mod.add(SCMovB32(dst=sgpr("GL2PrefetchIncB"), src=0))
-        if kernel["ProblemType"].get("MXBlockA", 0):
-            mod.add(SCMovB32(dst=sgpr("GL2PrefetchIncMXSA"), src=0))
-        if kernel["ProblemType"].get("MXBlockB", 0):
-            mod.add(SCMovB32(dst=sgpr("GL2PrefetchIncMXSB"), src=0))
+        if kernel["PrefetchGL2A"]:
+            mod.add(SCMovB32(dst=sgpr("GL2PrefetchIncA"), src=0))
+            if kernel["ProblemType"].get("MXBlockA", 0):
+                mod.add(SCMovB32(dst=sgpr("GL2PrefetchIncMXSA"), src=0))
+        if kernel["PrefetchGL2B"]:
+            mod.add(SCMovB32(dst=sgpr("GL2PrefetchIncB"), src=0))
+            if kernel["ProblemType"].get("MXBlockB", 0):
+                mod.add(SCMovB32(dst=sgpr("GL2PrefetchIncMXSB"), src=0))
         mod.add(writer.gl2PrefetchIncrementAddr(kernel, tPA, tPB))
+        return list(mod.flatitems())
+
+    def emit_gl2_prefetch_guarded_inc_and_load(self):
+        """Branch-guarded GL2 prefetch increment + second load for preloop.
+
+        Emits a compare + branch to skip the increment and second prefetch
+        when LoopCounterL is near end-of-K, avoiding wasted VALU and L2
+        traffic. Used in preloop only.
+        """
+        writer = self.writer
+        kernel = self.kernel
+        tPA = self.tensorParametersMap.get('A')
+        tPB = self.tensorParametersMap.get('B')
+        if tPA is None or tPB is None:
+            return []
+        from rocisa.code import Module
+        from rocisa.instruction import SCmpLeU32, SCBranchSCC1
+        from rocisa.container import sgpr
+        mod = Module("GL2 Prefetch Guarded Inc+Load")
+        loopCounter = writer.loopCounter(kernel, writer.states.unrollIdx)
+        pgl = kernel["PrefetchGL2"]
+        pgr = kernel["PrefetchGlobalRead"]
+        skipLabel = Label("SkipGL2SecondPrefetch", "")
+        mod.add(SCmpLeU32(src0=loopCounter, src1=pgr + pgl,
+                          comment=f"counterL <= PGR({pgr})+PGL({pgl})?"))
+        mod.add(SCBranchSCC1(
+            labelName=skipLabel.getLabelName(),
+            comment="skip GL2 second prefetch near end-of-K"))
+        mod.add(writer.gl2PrefetchIncrementAddr(kernel, tPA, tPB))
+        mod.add(writer.gl2PrefetchIssueLoad(kernel, tPA, tPB))
+        mod.add(skipLabel)
         return list(mod.flatitems())
 
     def emit_skip(self, source):

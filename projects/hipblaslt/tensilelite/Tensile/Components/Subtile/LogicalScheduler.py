@@ -565,6 +565,22 @@ class GL2PrefetchIncOp(BaseOp):
 
 
 @dataclass
+class GL2PrefetchGuardedIncAndLoadOp(BaseOp):
+    """Branch-guarded GL2 prefetch increment + second load for preloop.
+
+    Emits: compare LoopCounter, branch-skip if near end-of-K,
+    increment addresses, issue second prefetch, skip-label.
+    Used in preloop only; mainloop uses separate Inc+Load ops with s_cmov.
+    """
+
+    def __post_init__(self):
+        self.kind = 'gl2_prefetch_guarded_inc_and_load'
+
+    def __str__(self):
+        return "gl2_prefetch_guarded_inc_and_load"
+
+
+@dataclass
 class SkipOp(BaseOp):
     """Skip guard: compare LoopCounter and branch.
 
@@ -2824,7 +2840,7 @@ class LogicalScheduler:
                     src = em.source
                     if em.opType == 'gr' and src.mtIteration == 2:
                         removed.add(em.moduleId)
-                    elif em.opType in ('gl2_prefetch', 'gl2_prefetch_inc'):
+                    elif em.opType in ('gl2_prefetch', 'gl2_prefetch_inc', 'gl2_prefetch_guarded_inc_and_load'):
                         removed.add(em.moduleId)
                     elif em.opType == 'wait_gr':
                         if src.wait_gr_counts is not None:
@@ -2870,7 +2886,7 @@ class LogicalScheduler:
                         # Only multi-DU drops the MT-transition lr_inc in the NLL;
                         # single-DU PGR=2 keeps lr_inc (gr_inc is still dropped).
                         removed.add(em.moduleId)
-                    elif em.opType in ('gl2_prefetch', 'gl2_prefetch_inc'):
+                    elif em.opType in ('gl2_prefetch', 'gl2_prefetch_inc', 'gl2_prefetch_guarded_inc_and_load'):
                         removed.add(em.moduleId)
 
                 has_lr = any(em.opType == 'lr' and em.moduleId not in removed
@@ -3297,8 +3313,7 @@ class LogicalScheduler:
             if cfg.pgl > 0:
                 gl2_preloop_ops.append(GL2PrefetchOp())
                 if cfg.pgl == 2:
-                    gl2_preloop_ops.append(GL2PrefetchIncOp())
-                    gl2_preloop_ops.append(GL2PrefetchOp())
+                    gl2_preloop_ops.append(GL2PrefetchGuardedIncAndLoadOp())
             maxUnroll = max(cfg.numUnroll.values()) if cfg.numUnroll else 1
             if maxUnroll > 1:
                 preloop_ops = []

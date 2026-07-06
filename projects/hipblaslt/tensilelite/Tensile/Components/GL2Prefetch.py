@@ -4,7 +4,7 @@ from typing import Mapping
 from rocisa.code import Module
 from rocisa.instruction import SMulI32, SAndB32, SLShiftLeftB32, SAddU64, VMovB32,\
     VAndB32, VAddU32, VAddCOU32, VAddCCOU32, VAddNCU64, VLShiftRightB32, VMulLOU32, VMulHIU32, VLShiftLeftB32,\
-    GlobalPrefetchB8, SMovB64, VCmpGtU32, VCndMaskB32, SSubU32, SMovB32, SAddU32, SAddCU32
+    GlobalPrefetchB8, SMovB64, VCmpGtU32, VCndMaskB32, SSubU32, SMovB32, SAddU32, SAddCU32, SWaitAlu
 from rocisa.container import sgpr, vgpr, RegisterContainer, VCC, GLOBALModifiers
 from rocisa.functions import vectorMultiply64Bpe, scalarMultiplyBpe
 from rocisa.enum import TemporalHint, CacheScope
@@ -240,5 +240,6 @@ class GL2PrefetchLoad(GL2Prefetch):
                 addrNameHi = addrName + "+1"
                 mod.add(VAddCOU32(vgpr(addrName), VCC(), vgpr(addrName), inc))
                 mod.add(VAddCCOU32(vgpr(addrNameHi), VCC(), vgpr(addrNameHi), 0, VCC()))
+        mod.add(SWaitAlu(va_vdst=0, comment="wait for GL2 prefetch addr increment"))
 
         return mod

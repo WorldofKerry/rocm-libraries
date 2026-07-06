@@ -5265,6 +5265,14 @@ class Solution(collections.abc.Mapping):
         reject(state, printRejectionReason, "with PrefetchLocalRead %u LoopIters %u LocalReadVectorWidthB %u, not enough LoopIters to prefetch %ux%u iterations, " \
           % (state["PrefetchLocalRead"],state["LoopIters"],state["LocalReadVectorWidthB"], state["PrefetchLocalRead"] , wlrMultiple) )
 
+    # Derive per-tensor GL2 prefetch: -1 means inherit from PrefetchGL2
+    if state["PrefetchGL2A"] == -1:
+      state["PrefetchGL2A"] = state["PrefetchGL2"]
+    if state["PrefetchGL2B"] == -1:
+      state["PrefetchGL2B"] = state["PrefetchGL2"]
+    # PrefetchGL2 becomes the max of per-tensor values (used for loop guards, distance)
+    state["PrefetchGL2"] = max(state["PrefetchGL2A"], state["PrefetchGL2B"])
+
     if state["PrefetchGL2"] > 0:
       if not isaInfoMap[isa].asmCaps["HasGlobalPrefetch"]:
         reject(state, printRejectionReason, "ISA %s does not support global prefetch" % isa)

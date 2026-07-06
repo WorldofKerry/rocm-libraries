@@ -475,6 +475,8 @@ defaultBenchmarkCommonParameters = [
     {"PrefetchGlobalRead": [1]},
     {"PrefetchLocalRead": [1]},
     {"PrefetchGL2": [0]},
+    {"PrefetchGL2A": [-1]},
+    {"PrefetchGL2B": [-1]},
     {"ClusterLocalRead": [1]},
     {"SuppressNoLoadLoop": [False]},
     {"ExpandPointerSwap": [True]},

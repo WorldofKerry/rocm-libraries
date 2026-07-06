@@ -302,6 +302,9 @@ validParameters = { # we need to make sure this matches develop
     #   DataTypeA and DataTypeB must not be 6-bit float
     # Also does not support GSU, StreamK and general batch yet. May remove these limitations in the future.
     "PrefetchGL2": [0, 1, 2],
+    # Per-tensor GL2 prefetch. -1 means inherit from PrefetchGL2.
+    "PrefetchGL2A": [-1, 0, 1, 2],
+    "PrefetchGL2B": [-1, 0, 1, 2],
     # MatrixInstruction Only
     # If set ClusterLocalRead, each iteration dedicated vgprBuffer for localRead
     # So we can schedule these localReads to the front of the loop
