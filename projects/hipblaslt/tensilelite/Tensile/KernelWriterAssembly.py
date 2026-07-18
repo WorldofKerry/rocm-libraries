@@ -14619,7 +14619,7 @@ class KernelWriterAssembly(KernelWriter):
     if not isSize1:
       divisor   = kernel["MacroTile0"]
       destBpe   = int(kernel["ProblemType"]["DestDataType"].numBytes()) if self.states.storeAlign8 else 1
-      alignSize = 16 // destBpe  # storeAlign8: dwordx4 store width (16B) / destBpe; else: 16
+      alignSize = divisor if self.states.storeAlign8 else (16 // destBpe)  # storeAlign8: any remainder is edge
       wgSgpr    = "WorkGroup0"
       nwgSgpr   = "NumWorkGroups0"
       # tmpS0 = SizeI % MT0  (the trailing-row count for the last WG)
@@ -14631,7 +14631,7 @@ class KernelWriterAssembly(KernelWriter):
       module.add(SCmpGeU32(src0=sgpr(wgSgpr), src1=sgpr(tmpS1), comment="wg0 >= nwg0-1 ?"))
     else:
       divisor   = kernel["MacroTile1"]
-      alignSize  = 1 if self.states.storeAlign8 else kernel["MatrixInstN"]
+      alignSize  = divisor if self.states.storeAlign8 else kernel["MatrixInstN"]  # storeAlign8: any remainder is edge
       wgSgpr    = "WorkGroup1"
       nwgSgpr   = "NumWorkGroups1"
       # tmpS0 = SizeJ % MT1
