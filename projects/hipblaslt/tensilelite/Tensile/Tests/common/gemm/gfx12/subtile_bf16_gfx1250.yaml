@@ -108,6 +108,10 @@ BenchmarkProblems:
           - Exact: [161, 159, 1, 128]
           - Exact: [33,  127, 1, 128]
           - Exact: [129, 33,  1, 256]
+          # Small M,N < MatrixInstM (edge store path regression)
+          - Exact: [8,   8,  1, 1024]
+          - Exact: [8,  64,  1, 1024]
+          - Exact: [24, 64,  1, 1024]
   -
     - # ProblemType
       OperationType: GEMM
@@ -163,3 +167,46 @@ BenchmarkProblems:
           - Exact: [351, 257, 1, 64]
           - Exact: [383, 255, 1, 128]
           - Exact: [319, 321, 1, 64]
+
+  - # Asymmetric MT 256x16 edge repro
+    - # ProblemType
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: true
+      TransposeB: false
+      UseBeta: True
+      Batched: True
+
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1,  1, 8, 1,  2, 1]  # MT 256x16  WG 2x1
+        - DepthU: [128]
+        - WavefrontSize: [32]
+        - PrefetchGlobalRead: [1]
+        - PrefetchLocalRead: [1]
+        - ScheduleIterAlg: [3]
+        - UseSubtileImpl: [true]
+        - SourceSwap: [True]
+        - TDMInst: [3]
+        - StaggerU: [0]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - 1LDSBuffer: [0]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [8]
+        - GlobalReadVectorWidthB: [8]
+        - GlobalSplitU: [1]
+        - PreloadKernArgs: [False]
+        - StreamK: [0]
+      BenchmarkForkParameters:
+      JoinParameters:
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [96, 96, 1, 7168]
