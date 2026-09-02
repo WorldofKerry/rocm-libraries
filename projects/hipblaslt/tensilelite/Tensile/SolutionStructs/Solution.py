@@ -1286,7 +1286,14 @@ class Solution(collections.abc.Mapping):
           # the GR emit then indexes past the end of localSubtilesRegister.  An
           # odd tile count cannot satisfy either (the smallest stack is 2), and
           # reaches here for bf16 whenever the macro tile is 16 * odd.
-          if mtTiles % stack and stack < mtTiles:
+          #
+          # With one wave on the axis that wave owns every strip, so TileInfo
+          # takes the same round-up globalSubtileGrid does and the partial strip
+          # is just the documented surplus -- fetched, never read.  Several axis
+          # waves cannot: there localSubtileGrid[0] also scales the per-wave M
+          # base, and rounding it up would move where a wave reads A/B without
+          # moving where the epilogue stores its rows.
+          if axisWaves > 1 and mtTiles % stack and stack < mtTiles:
             reject(state, printRejectionReason,
                    "UseSubtileImpl=1 TLU=1 cannot tile the free dim on tensor %s: a "
                    "%d-tile stack neither divides nor covers %d MFMA tiles "
