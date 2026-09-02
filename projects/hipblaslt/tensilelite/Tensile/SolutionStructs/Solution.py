@@ -1243,6 +1243,20 @@ class Solution(collections.abc.Mapping):
           fullLine = _subtileStackFullLine(state["MatrixInstM"], bpeTLU)
           stack = _subtileStackForTile(mtTiles, fullLine)
 
+          # The strips must tile the free dim: either the stack divides it, or a
+          # single padded strip covers the whole thing.  Anything else leaves a
+          # partial trailing strip, which globalSubtileGrid does not count and
+          # the GR emit then indexes past the end of localSubtilesRegister.  An
+          # odd tile count cannot satisfy either (the smallest stack is 2), and
+          # reaches here for bf16 whenever the macro tile is 16 * odd.
+          if mtTiles % stack and stack < mtTiles:
+            reject(state, printRejectionReason,
+                   "UseSubtileImpl=1 TLU=1 cannot tile the free dim on tensor %s: a "
+                   "%d-tile stack neither divides nor covers %d MFMA tiles "
+                   "(MacroTile=%d), leaving a partial strip"
+                   % (tc, stack, mtTiles, mtFree))
+            return
+
           # A strip offers (blocks per strip) x (K windows) fetch slots.  With
           # fewer slots than waves in the group the surplus waves reissue a
           # load someone else made, so the operand comes off memory more than
