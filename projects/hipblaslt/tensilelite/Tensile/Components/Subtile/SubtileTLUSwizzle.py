@@ -91,17 +91,37 @@ class TLUColScatter:
 
 
 def _buildColScatter(stackM: int, instM: int, instK: int, bpe: float,
-                     waveSize: int) -> TLUColScatter:
-    """Derive the col_scatter parameters for one TLU fp4 stack (all from N)."""
+                     waveSize: int, elemsPerRead: int) -> TLUColScatter:
+    """Derive the col_scatter parameters for one TLU stack.
+
+    Everything in the bit layout is a function of ``cpc`` (chunks per K-column),
+    not of the stack: both wired dtypes satisfy ``instM*instK*bpe == waveSize*16``,
+    so ``cpc * gGroups == waveSize`` and the thread field is always 6 bits.  That
+    makes fp4 8x1 and bf16 2x1 the same layout (cpc 4), as are fp4 16x1 and bf16
+    4x1 (cpc 8) -- only the load count N and the byte strides differ.
+    """
     N = stackM
     logN = int(math.log2(N))
     cpc = int(stackM * instM * bpe) // 16          # chunks per K-column
     gGroups = instK // N                            # col_groups per load
-    cBits = logN - 1                                # m_chunk bits
-    gBits = 7 - logN                                # col_group bits
-    gdBit = 5 - logN                                # distinguishing group bit
-    padBytes = 8
+    cBits = cpc.bit_length() - 1                    # m_chunk bits = log2(cpc)
+    gBits = (waveSize.bit_length() - 1) - cBits     # col_group bits
+    gdBit = gBits - 2                               # distinguishing group bit
+    # A transpose read covers elemsPerRead K-columns of freeRuns free-dim runs.
+    # The pad has to step a whole run span, or consecutive loads overlap instead
+    # of landing on the next bank pair: fp4 spans one run (8 B), bf16 four (32 B).
+    freeRuns = max(1, instM // elemsPerRead)
+    padBytes = int(freeRuns * elemsPerRead * bpe)
     blkBytes = waveSize * 16 + padBytes
+    # Guard the shape assumptions the bit layout rests on.  These hold for every
+    # stack selectTLUColScatter admits; a new dtype or MMA shape that breaks one
+    # would otherwise emit a silently wrong permutation rather than fail.
+    if cpc & (cpc - 1) or cBits > 3:
+        raise ValueError("col_scatter needs a power-of-two cpc with at most 3 "
+                         "m_chunk bits (contiguous in bytes), got cpc=%d" % cpc)
+    if elemsPerRead % N or elemsPerRead // N < 1:
+        raise ValueError("col_scatter needs the transpose read to step whole "
+                         "col-groups: elemsPerRead=%d, N=%d" % (elemsPerRead, N))
     # Thread bit layout [5:0]: bit 3 is reserved for col_group[gdBit] (bank-pair
     # separation).  The remaining positions 0,1,2,4,5 are filled sequentially,
     # first with m_chunk[0..cBits-1], then with col_group[i != gdBit].
@@ -117,8 +137,9 @@ def _buildColScatter(stackM: int, instM: int, instK: int, bpe: float,
     # step because the interleave is affine in the changing col-group bits.  The
     # model verifies it is a single constant across all lanes; recompute it here
     # closed-form from the col-group bits that flip when k_col += 16.
-    #   k_col += 16 -> load unchanged (16 % N == 0 for N in {8,16}), cg += 16//N.
-    cgDelta = 16 // N
+    #   k_col += elemsPerRead -> load unchanged (elemsPerRead % N == 0), so the
+    #   step lands entirely in the col-group field as cg += elemsPerRead//N.
+    cgDelta = elemsPerRead // N
     readStrideBytes = 0
     for i in range(gBits):
         if (cgDelta >> i) & 1:
@@ -159,6 +180,19 @@ def _sharedStrip(tileInfo) -> bool:
             or int(getattr(tileInfo, "grKSplit", 1)) > 1)
 
 
+# VGPR return count of the TLU=1 transpose read, keyed by bytes per element.
+# The opcode itself lives in SubtileLREmit; only the register count feeds the
+# layout math, so it sits here and keeps this module free of any dependency on
+# the emit modules (SubtileLREmit already imports this one).
+_TLU_TR_REGS_PER_READ = {0.5: 2, 2.0: 2}
+
+
+def tluElemsPerRead(bpe) -> Optional[int]:
+    """Elements one TLU=1 transpose read covers per lane, or None if unwired."""
+    regs = _TLU_TR_REGS_PER_READ.get(float(bpe))
+    return None if regs is None else int(regs * 4 / float(bpe))
+
+
 def _stackOf(tileInfo) -> Optional[int]:
     """Stack size for this tile, or None if it is not an fp4 TLU stack."""
     try:
@@ -167,7 +201,22 @@ def _stackOf(tileInfo) -> Optional[int]:
         # Narrow on purpose: returning None here means "no swizzle", so a wider
         # catch would turn a rename into silently bank-conflicting kernels.
         return None
+    # The XOR table below is fp4-verified only; bf16 takes col_scatter at every
+    # stack it can select, so it must never reach _SWIZZLE_BY_STACK.
     return stack if float(tileInfo.bpe) == 0.5 else None
+
+
+def _cpcOf(tileInfo) -> Optional[int]:
+    """Chunks per K-column for this tile, or None if the dtype is not wired."""
+    try:
+        stack = int(tileInfo.subtileShape[0])
+        instM = int(tileInfo.mmaTileShape[0])
+        bpe = float(tileInfo.bpe)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if bpe not in _TLU_TR_REGS_PER_READ:
+        return None
+    return int(stack * instM * bpe) // 16
 
 
 def selectTLUSwizzle(tileInfo) -> Optional[TLUSwizzle]:
@@ -182,31 +231,39 @@ def selectTLUSwizzle(tileInfo) -> Optional[TLUSwizzle]:
     return _SWIZZLE_BY_STACK.get(stack) if stack is not None else None
 
 
-# Stacks that use the column-scatter layout instead of a single-bit XOR.
-_COL_SCATTER_STACKS = frozenset({8, 16})
+# Chunks-per-K-column values that take the column-scatter layout instead of a
+# single-bit XOR.  Keyed on cpc rather than the stack because the layout is a
+# function of cpc alone: fp4 8x1 and bf16 2x1 both land on cpc 4, fp4 16x1 and
+# bf16 4x1 on cpc 8.  Above 8 the layout degenerates -- cgDelta falls to 0 (the
+# transpose read stops stepping K-columns) and m_chunk stops being contiguous in
+# bytes -- so wider strips stay unswizzled.
+_COL_SCATTER_CPC = frozenset({4, 8})
+_COL_SCATTER_CPC_SHARED = frozenset({1, 2, 4, 8})
 
 
 def selectTLUColScatter(tileInfo) -> Optional[TLUColScatter]:
-    """Return the col_scatter layout for this tile's stack, or None.
+    """Return the col_scatter layout for this tile, or None.
 
-    Mutually exclusive with selectTLUSwizzle: the XOR path handles 2x1/4x1 and
-    the col_scatter path 8x1 and 16x1.  Guarded to fp4.
+    Mutually exclusive with selectTLUSwizzle: for fp4 the XOR path handles the
+    narrow strips (cpc 1 and 2, i.e. 2x1 and 4x1) and col_scatter the wide ones.
+    bf16 strips are 4x wider per stack, so both its stacks land in col_scatter.
     """
-    stack = _stackOf(tileInfo)
-    if stack is None:
+    cpc = _cpcOf(tileInfo)
+    if cpc is None:
         return None
-    if _sharedStrip(tileInfo):
-        # A shared strip rules out the XOR (see _sharedStrip), so every stack
-        # falls here; the bank model reaches 1-way at 2, 4, 8 and 16 alike (the
-        # XOR wins elsewhere only on VALU cost).
-        if stack not in (2, 4, 8, 16):
-            return None
-    elif stack not in _COL_SCATTER_STACKS:
+    # A shared strip rules out the XOR (see _sharedStrip), so every width falls
+    # here; the bank model reaches 1-way across the range (the XOR wins
+    # elsewhere only on VALU cost).
+    allowed = _COL_SCATTER_CPC_SHARED if _sharedStrip(tileInfo) else _COL_SCATTER_CPC
+    if cpc not in allowed:
         return None
+    stack = int(tileInfo.subtileShape[0])
     instM = int(tileInfo.mmaTileShape[0])
     instK = int(tileInfo.mmaTileShape[1])
     waveSize = int(getattr(tileInfo, "waveSize", 0)) or 64
-    return _buildColScatter(stack, instM, instK, float(tileInfo.bpe), waveSize)
+    elemsPerRead = tluElemsPerRead(tileInfo.bpe)
+    return _buildColScatter(stack, instM, instK, float(tileInfo.bpe), waveSize,
+                            elemsPerRead)
 
 
 def tluPadBytes(tileInfo) -> int:
