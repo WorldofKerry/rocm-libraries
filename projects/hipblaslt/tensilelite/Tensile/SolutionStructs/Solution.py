@@ -228,16 +228,41 @@ def _subtilePerWaveMTiles(mtTiles, stack, wgSize):
   return max(1, padded // int(wgSize))
 
 
-# A TLU=1 fp4 strip is stackM * MatrixInstM * 0.5 bytes wide, so a 16-tile stack
-# fills one 128B cache line and a 2-tile stack uses only 16B of each line it
-# touches.  Taller is therefore better, up to a full line.
-_SUBTILE_STACK_SIZES = (16, 8, 4, 2)
+# A TLU=1 strip is stackM * MatrixInstM * bpe bytes wide, so the stack that fills
+# one cache line depends on the dtype: 16 tiles for fp4, 4 for bf16.  Below that
+# the strip uses only part of each line it touches, so taller is better up to a
+# full line.
 _SUBTILE_STACK_MIN = 2
-_SUBTILE_STACK_FULL_LINE = 16
+_SUBTILE_LINE_BYTES = 128
 
 
-def _subtileStackForTile(mtTiles):
-  """Free-dim MFMA-M tiles per LDS strip for one TLU=1 fp4 operand.
+# TLU=1 subtile geometry per free-dim stack height, keyed by dtype family.  bf16
+# fills a cache line at 4 tiles, so it needs no taller stacks than that.
+_SUBTILE_TLU1_B4_STACKS = {
+  2:  "AB_B4_TLU1",
+  4:  "AB_B4_TLU1_4x1",
+  8:  "AB_B4_TLU1_8x1",
+  16: "AB_B4_TLU1_16x1",
+}
+_SUBTILE_TLU1_B16_STACKS = {
+  2: "AB_B16_TLU1",
+  4: "AB_B16_TLU1_4x1",
+}
+
+
+def _subtileStackFullLine(instM, bpe):
+  """Free-dim MFMA-M tiles whose TLU=1 strip covers one cache line."""
+  perTileBytes = int(instM) * float(bpe)
+  return max(_SUBTILE_STACK_MIN, int(_SUBTILE_LINE_BYTES // perTileBytes))
+
+
+def _subtileStackLadder(fullLine):
+  """Candidate stack heights for this dtype, tallest first."""
+  return tuple(1 << b for b in range(int(fullLine).bit_length() - 1, 0, -1))
+
+
+def _subtileStackForTile(mtTiles, fullLine):
+  """Free-dim MFMA-M tiles per LDS strip for one TLU=1 operand.
 
   Tallest power-of-two stack that still holds the tile in one strip, else the
   tallest exact divisor.  The pad tiles rounding adds are written to LDS but
@@ -246,11 +271,17 @@ def _subtileStackForTile(mtTiles):
   partial trailing strip that the subtile grids do not count.
   """
   mtTiles = int(mtTiles)
-  exact = next((s for s in _SUBTILE_STACK_SIZES if mtTiles % s == 0),
+  fullLine = int(fullLine)
+  exact = next((s for s in _subtileStackLadder(fullLine) if mtTiles % s == 0),
                _SUBTILE_STACK_MIN)
   if mtTiles <= 1:
     return exact
-  roundedUp = min(_SUBTILE_STACK_FULL_LINE, 1 << (mtTiles - 1).bit_length())
+  # Rounding up is only safe while the rounded stack still holds the whole tile
+  # in one strip.  A stack that neither divides the tile nor covers it would need
+  # a partial trailing strip, which the subtile grids do not count and the GR
+  # emit cannot address.  bf16 reaches this: its cache line caps the stack at 4,
+  # so a 6-tile tile must take the exact stack of 2 rather than round to 4.
+  roundedUp = min(fullLine, 1 << (mtTiles - 1).bit_length())
   if roundedUp > exact and roundedUp >= mtTiles:
     return roundedUp
   return exact
@@ -289,15 +320,15 @@ def _subtileStripSharingReason(state, tc, mtTiles, stack):
   return None
 
 
-def _subtileTLU1StackReason(state, tc, mtTiles, stack):
-  """Why `stack` cannot lay out the TLU=1 fp4 operand tc, or None when it can."""
+def _subtileTLU1StackReason(state, tc, mtTiles, stack, bpe):
+  """Why `stack` cannot lay out the TLU=1 operand tc, or None when it can."""
   mtFree = state["MacroTile0"] if tc == 'A' else state["MacroTile1"]
   strips = -(-mtTiles // stack)
   # A partial tail strip has no register list of its own, so the GR emit indexes
   # past the end of localSubtilesRegister.  Padding is only emittable while the
   # operand is a single strip.
   if mtTiles % stack != 0 and strips > 1:
-    return ("UseSubtileImpl=1 TLU=1 fp4 pads tensor %s across more than one "
+    return ("UseSubtileImpl=1 TLU=1 pads tensor %s across more than one "
             "LDS strip: %d MMA tiles on a stack of %d is %d strips with a "
             "partial tail, which the GR emit cannot address (MacroTile=%d)"
             % (tc, mtTiles, stack, strips, mtFree))
@@ -318,19 +349,19 @@ def _subtileTLU1StackReason(state, tc, mtTiles, stack):
   otherWaves = max(1, numWaves // wgSize)
   perWave    = _subtilePerWaveMTiles(mtTiles, stack, wgSize)
   fetchGroup = max(1, stack // perWave) * otherWaves
-  stripBytes = stack * state["MatrixInstM"] * state["MatrixInstK"] * 0.5
+  stripBytes = stack * state["MatrixInstM"] * state["MatrixInstK"] * float(bpe)
   slots      = int(stripBytes // (state["WavefrontSize"] * 16)) \
                * (state["DepthU"] // state["MatrixInstK"])
   if slots < fetchGroup:
-    return ("UseSubtileImpl=1 TLU=1 fp4 leaves the LDS strip on tensor %s with "
+    return ("UseSubtileImpl=1 TLU=1 leaves the LDS strip on tensor %s with "
             "%d (block x K window) slots for a fetch group of %d, so the surplus "
             "waves refetch it (MacroTile=%d, DepthU=%d, stack=%d)"
             % (tc, slots, fetchGroup, mtFree, state["DepthU"], stack))
   return None
 
 
-def _subtileStackForTLU1(state, tc, mtTiles):
-  """Stack height for a TLU=1 fp4 operand, backing off when the geometry refuses it.
+def _subtileStackForTLU1(state, tc, mtTiles, bpe):
+  """Stack height for a TLU=1 operand, backing off when the geometry refuses it.
 
   _subtileStackForTile picks purely on cache-line utilization.  A height it
   likes can still be unlayoutable for this wave group, and a shorter one often
@@ -338,9 +369,10 @@ def _subtileStackForTLU1(state, tc, mtTiles):
   The preferred height is tried first, so a solution that is valid today keeps
   the stack it has today.
   """
-  preferred = _subtileStackForTile(mtTiles)
-  for stack in [preferred] + [s for s in _SUBTILE_STACK_SIZES if s < preferred]:
-    if _subtileTLU1StackReason(state, tc, mtTiles, stack) is None:
+  fullLine = _subtileStackFullLine(state["MatrixInstM"], bpe)
+  preferred = _subtileStackForTile(mtTiles, fullLine)
+  for stack in [preferred] + [s for s in _subtileStackLadder(fullLine) if s < preferred]:
+    if _subtileTLU1StackReason(state, tc, mtTiles, stack, bpe) is None:
       return stack
   return preferred
 
@@ -1268,7 +1300,7 @@ class Solution(collections.abc.Mapping):
         tlu = state["ProblemType"][f"TLU{tc}"]
         if tlu:
           if dtype.isBFloat16() or dtype.isHalf():
-            state[f"_ABTilePair{tc}"] = "AB_B16_TLU1"
+            bpeTLU, stackGeometries = 2.0, _SUBTILE_TLU1_B16_STACKS
           elif dtype.isFloat4():
             # Two fp4 share a byte, so an odd free-dim extent leaves the K
             # stride on a half byte and the elements-to-bytes shift truncates
@@ -1278,20 +1310,24 @@ class Solution(collections.abc.Mapping):
             state[key] = max(state[key], 2)
             # fp4 only: 6-bit shares this geometry's 0.5 bpe but neither
             # bank-conflict layout covers it, so it falls to the reject below.
-            mtFree = state["MacroTile0"] if tc == 'A' else state["MacroTile1"]
-            mtTiles = mtFree // state["MatrixInstM"]
-            stack = _subtileStackForTLU1(state, tc, mtTiles)
-            stackReason = _subtileTLU1StackReason(state, tc, mtTiles, stack)
-            if stackReason:
-              reject(state, printRejectionReason, stackReason)
-              return
-            # Lazy import for the same reason as _validateSubtileGRKPartition:
-            # Components/Subtile at module scope deadlocks the package load.
-            from Tensile.Components.Subtile.Kernel import abB4Tlu1Name
-            state[f"_ABTilePair{tc}"] = abB4Tlu1Name(stack)
+            bpeTLU, stackGeometries = 0.5, _SUBTILE_TLU1_B4_STACKS
           else:
             reject(state, printRejectionReason, f"No TLU=1 subtile geometry for dtype {dtype}")
             return
+
+          mtFree = state["MacroTile0"] if tc == 'A' else state["MacroTile1"]
+          mtTiles = mtFree // state["MatrixInstM"]
+          stack = _subtileStackForTLU1(state, tc, mtTiles, bpeTLU)
+          stackReason = _subtileTLU1StackReason(state, tc, mtTiles, stack, bpeTLU)
+          if stackReason:
+            reject(state, printRejectionReason, stackReason)
+            return
+          if stack not in stackGeometries:
+            reject(state, printRejectionReason,
+                   "UseSubtileImpl=1 TLU=1 has no subtile geometry for a %d-tile stack "
+                   "on tensor %s at %s bytes per element" % (stack, tc, bpeTLU))
+            return
+          state[f"_ABTilePair{tc}"] = stackGeometries[stack]
         elif dtype.isBFloat16() or dtype.isHalf():
           if state["WavefrontSize"] == 32:
             state[f"_ABTilePair{tc}"] = "AB_B16_W32"

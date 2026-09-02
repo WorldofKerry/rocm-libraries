@@ -1143,14 +1143,21 @@ def _graTileAssignment_tlu(writer, kernel, tileInfo):
   tmpVgpr = writer.vgprPool.checkOut(1, tag="_graTileAssignment_tlu_tmpVgpr")
   swzTmp = writer.vgprPool.checkOut(1, tag="_graTileAssignment_tlu_swzTmp") if swz else None
 
-  # M-tiling across b128 loads (fp4 taller stacks).  When a b128 covers only part
-  # of a K row (chunksPerK > 1), physical chunk P = i*wavesize + laneId splits
-  # into K row (P // chunksPerK) plus an intra-row M block (P % chunksPerK) of
-  # elemsPerChunk elements.  Scoped to fp4; other TLU dtypes keep the pure ramp.
+  # M-tiling across b128 loads.  A lane's b128 covers elemsPerChunk (16/bpe)
+  # contiguous free-dim elements at one K row, and a strip holds
+  # chunksPerK = mStripBytes/16 of them.  At chunksPerK == 1 a b128 is a whole K
+  # row and the per-lane offset is a pure K ramp; above that, physical chunk
+  # P = i*wavesize + laneId splits into K row (P // chunksPerK) plus an intra-row
+  # M block (P % chunksPerK).  bpe-driven, not dtype-specific.
   instM = int(tileInfo.mmaTileShape[0])
   mStripBytes = int(tileInfo.subtileShape[0] * instM * tileInfo.bpe)
-  isFp4 = float(tileInfo.bpe) == 0.5
-  chunksPerK = max(1, mStripBytes // 16) if isFp4 else 1
+  chunksPerK = max(1, mStripBytes // 16)
+  # The split below masks and shifts by chunksPerK, so a non-power-of-two would
+  # silently mis-address rather than fail.
+  if chunksPerK & (chunksPerK - 1):
+    raise ValueError("TLU=1 GR requires a power-of-two chunksPerK, got %d "
+                     "(mStripBytes=%d, subtileShape=%s, bpe=%s)"
+                     % (chunksPerK, mStripBytes, tileInfo.subtileShape, tileInfo.bpe))
   elemsPerChunk = int(16 / tileInfo.bpe)
   mTileTmp = writer.vgprPool.checkOut(1, tag="_graTileAssignment_tlu_mTileTmp") if chunksPerK > 1 else None
 
