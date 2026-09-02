@@ -260,11 +260,39 @@ def _subtileStackFullLine(instM, bpe):
   return max(_SUBTILE_STACK_MIN, int(_SUBTILE_LINE_BYTES // perTileBytes))
 
 
-def _subtileStackForTile(mtTiles, fullLine):
+def _subtileStripsCoverTile(mtTiles, stack, wgSize):
+  """Do the axis-waves' strips cover the free dim exactly, or None if shared.
+
+  Mirrors the kernel's own arithmetic rather than the padded view
+  _subtilePerWaveMTiles takes, because the two disagree and the kernel is what
+  emits: TileInfo derives localMMATileGrid[0] as an unpadded floor
+  (globalMMATileGrid[0] // waveGroupSize) and then truncates again in
+  localSubtileGrid[0] = int(perWave / stack), while globalSubtileGrid[0] rounds
+  *up*.  When wgSize * localSubtileGrid[0] falls short of globalSubtileGrid[0]
+  the trailing strips are never fetched and the GR emit indexes past the end of
+  localSubtilesRegister.
+
+  Returns None when the stack is taller than a wave's extent -- there the waves
+  share a strip and split its K rows instead, a mode this rule does not model
+  and callers must leave alone.
+  """
+  perWave = int(mtTiles) // int(wgSize)
+  if perWave <= 0 or int(stack) > perWave:
+    return None
+  localStrips = max(1, perWave // int(stack))
+  globalStrips = -(-int(mtTiles) // int(stack))
+  return int(wgSize) * localStrips == globalStrips
+
+
+def _subtileStackForTile(mtTiles, fullLine, wgSize=None):
   """Free-dim MFMA-M tiles per LDS strip for one TLU=1 operand.
 
   Prefers the tallest stack that divides the tile exactly, then takes a taller
   power-of-two stack instead when its padding stays within the ratio cap.
+  Finally, when the result would leave the waves unable to cover the free dim,
+  steps down to a shorter stack that can -- a 12-tile dim over two waves needs a
+  stack of 2 (6 strips, 3 each) where the exact-divisor rule would pick 4 and
+  strand half a strip per wave.
   """
   mtTiles = int(mtTiles)
   fullLine = int(fullLine)
@@ -278,10 +306,18 @@ def _subtileStackForTile(mtTiles, fullLine):
   # emit cannot address.  bf16 reaches this: its cache line caps the stack at 4,
   # so a 6-tile tile must take the exact stack of 2 rather than round to 4.
   roundedUp = min(fullLine, 1 << (mtTiles - 1).bit_length())
+  stack = exact
   if (roundedUp > exact and roundedUp >= mtTiles
       and roundedUp <= mtTiles * _SUBTILE_STACK_MAX_PAD_RATIO):
-    return roundedUp
-  return exact
+    stack = roundedUp
+  if wgSize is None or _subtileStripsCoverTile(mtTiles, stack, wgSize) is not False:
+    return stack
+  candidate = stack
+  while candidate > _SUBTILE_STACK_MIN:
+    candidate //= 2
+    if _subtileStripsCoverTile(mtTiles, candidate, wgSize) is True:
+      return candidate
+  return stack
 
 
 def _validateSubtileGRKPartition(state, printRejectionReason):
@@ -1241,7 +1277,8 @@ class Solution(collections.abc.Mapping):
           mtFree = state["MacroTile0"] if tc == 'A' else state["MacroTile1"]
           mtTiles = mtFree // state["MatrixInstM"]
           fullLine = _subtileStackFullLine(state["MatrixInstM"], bpeTLU)
-          stack = _subtileStackForTile(mtTiles, fullLine)
+          axisWaves = state["MIWaveGroup"][0 if tc == 'A' else 1]
+          stack = _subtileStackForTile(mtTiles, fullLine, axisWaves)
 
           # The strips must tile the free dim: either the stack divides it, or a
           # single padded strip covers the whole thing.  Anything else leaves a
