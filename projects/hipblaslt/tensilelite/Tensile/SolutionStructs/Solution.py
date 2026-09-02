@@ -222,37 +222,64 @@ def _subtilePerWaveMTiles(mtTiles, stack, wgSize):
   return max(1, padded // int(wgSize))
 
 
-# A TLU=1 fp4 strip is stackM * MatrixInstM * 0.5 bytes wide, so a 16-tile stack
-# fills one 128B cache line and a 2-tile stack uses only 16B of each line it
-# touches.  Taller is therefore better, up to a full line.
-_SUBTILE_STACK_SIZES = (16, 8, 4, 2)
+# A TLU=1 strip is stackM * MatrixInstM * bpe bytes wide, so the stack that fills
+# one cache line depends on the dtype: 16 tiles for fp4, 4 for bf16.  Below that
+# the strip uses only part of each line it touches, so taller is better up to a
+# full line.
 _SUBTILE_STACK_MIN = 2
-_SUBTILE_STACK_FULL_LINE = 16
+_SUBTILE_LINE_BYTES = 128
 
 # Rounding a tile up to a taller stack pads it with tiles that are fetched and
 # written to LDS but never read, so the operand's global traffic and its LDS
 # footprint both grow by exactly the rounding ratio.  What that buys is bounded:
-# utilization is stack/_SUBTILE_STACK_FULL_LINE and stops improving once the
-# strip covers a whole line, and much of the gap it closes is served from cache
-# anyway, since the lines a narrow strip half-uses are finished by other lanes
-# and waves.  So the padding is a certain cost against a capped, partly-redundant
-# benefit; admit it only while it stays a small fraction of the operand.
+# utilization is stack/fullLine and stops improving once the strip covers a whole
+# line, and much of the gap it closes is served from cache anyway, since the
+# lines a narrow strip half-uses are finished by other lanes and waves.  So the
+# padding is a certain cost against a capped, partly-redundant benefit; admit it
+# only while it stays a small fraction of the operand.
 _SUBTILE_STACK_MAX_PAD_RATIO = 1.25
 
 
-def _subtileStackForTile(mtTiles):
-  """Free-dim MFMA-M tiles per LDS strip for one TLU=1 fp4 operand.
+# TLU=1 subtile geometry per free-dim stack height, keyed by dtype family.  bf16
+# fills a cache line at 4 tiles, so it needs no taller stacks than that.
+_SUBTILE_TLU1_B4_STACKS = {
+  2:  "AB_B4_TLU1",
+  4:  "AB_B4_TLU1_4x1",
+  8:  "AB_B4_TLU1_8x1",
+  16: "AB_B4_TLU1_16x1",
+}
+_SUBTILE_TLU1_B16_STACKS = {
+  2: "AB_B16_TLU1",
+  4: "AB_B16_TLU1_4x1",
+}
+
+
+def _subtileStackFullLine(instM, bpe):
+  """Free-dim MFMA-M tiles whose TLU=1 strip covers one cache line."""
+  perTileBytes = int(instM) * float(bpe)
+  return max(_SUBTILE_STACK_MIN, int(_SUBTILE_LINE_BYTES // perTileBytes))
+
+
+def _subtileStackForTile(mtTiles, fullLine):
+  """Free-dim MFMA-M tiles per LDS strip for one TLU=1 operand.
 
   Prefers the tallest stack that divides the tile exactly, then takes a taller
   power-of-two stack instead when its padding stays within the ratio cap.
   """
   mtTiles = int(mtTiles)
-  exact = next((s for s in _SUBTILE_STACK_SIZES if mtTiles % s == 0),
-               _SUBTILE_STACK_MIN)
+  fullLine = int(fullLine)
+  sizes = tuple(1 << b for b in range(fullLine.bit_length() - 1, 0, -1))
+  exact = next((s for s in sizes if mtTiles % s == 0), _SUBTILE_STACK_MIN)
   if mtTiles <= 1:
     return exact
-  roundedUp = min(_SUBTILE_STACK_FULL_LINE, 1 << (mtTiles - 1).bit_length())
-  if roundedUp > exact and roundedUp <= mtTiles * _SUBTILE_STACK_MAX_PAD_RATIO:
+  # Rounding up is only safe while the rounded stack still holds the whole tile
+  # in one strip.  A stack that neither divides the tile nor covers it would need
+  # a partial trailing strip, which the subtile grids do not count and the GR
+  # emit cannot address.  bf16 reaches this: its cache line caps the stack at 4,
+  # so a 6-tile tile must take the exact stack of 2 rather than round to 4.
+  roundedUp = min(fullLine, 1 << (mtTiles - 1).bit_length())
+  if (roundedUp > exact and roundedUp >= mtTiles
+      and roundedUp <= mtTiles * _SUBTILE_STACK_MAX_PAD_RATIO):
     return roundedUp
   return exact
 
@@ -1196,7 +1223,7 @@ class Solution(collections.abc.Mapping):
         tlu = state["ProblemType"].get(f"TLU{tc}", False)
         if tlu:
           if dtype.isBFloat16() or dtype.isHalf():
-            state[f"_ABTilePair{tc}"] = "AB_B16_TLU1"
+            bpeTLU, stackGeometries = 2.0, _SUBTILE_TLU1_B16_STACKS
           elif dtype.isFloat4():
             # Two fp4 share a byte, so an odd free-dim extent leaves the K
             # stride on a half byte and the elements-to-bytes shift truncates
@@ -1206,39 +1233,42 @@ class Solution(collections.abc.Mapping):
             state[key] = max(state[key], 2)
             # fp4 only: 6-bit shares this geometry's 0.5 bpe but neither
             # bank-conflict layout covers it, so it falls to the reject below.
-            mtFree = state["MacroTile0"] if tc == 'A' else state["MacroTile1"]
-            mtTiles = mtFree // state["MatrixInstM"]
-            stack = _subtileStackForTile(mtTiles)
-
-            # A strip offers (blocks per strip) x (K windows) fetch slots.  With
-            # fewer slots than waves in the group the surplus waves reissue a
-            # load someone else made, so the operand comes off memory more than
-            # once.  Test the slots, not the tile shape -- a wide wavefront or a
-            # shallow DepthU reaches the same shortage.
-            wgSize     = state["MIWaveGroup"][0 if tc == 'A' else 1]
-            numWaves   = state["MIWaveGroup"][0] * state["MIWaveGroup"][1]
-            otherWaves = max(1, numWaves // wgSize)
-            perWave    = _subtilePerWaveMTiles(mtTiles, stack, wgSize)
-            fetchGroup = max(1, stack // perWave) * otherWaves
-            stripBytes = stack * state["MatrixInstM"] * state["MatrixInstK"] * 0.5
-            slots      = int(stripBytes // (state["WavefrontSize"] * 16)) \
-                         * (state["DepthU"] // state["MatrixInstK"])
-            if slots < fetchGroup:
-              reject(state, printRejectionReason,
-                     "UseSubtileImpl=1 TLU=1 fp4 leaves the LDS strip on tensor %s with "
-                     "%d (block x K window) slots for a fetch group of %d, so the surplus "
-                     "waves refetch it (MacroTile=%d, DepthU=%d, stack=%d)"
-                     % (tc, slots, fetchGroup, mtFree, state["DepthU"], stack))
-              return
-            state[f"_ABTilePair{tc}"] = {
-              2: "AB_B4_TLU1",
-              4: "AB_B4_TLU1_4x1",
-              8: "AB_B4_TLU1_8x1",
-              16: "AB_B4_TLU1_16x1",
-            }[stack]
+            bpeTLU, stackGeometries = 0.5, _SUBTILE_TLU1_B4_STACKS
           else:
             reject(state, printRejectionReason, f"No TLU=1 subtile geometry for dtype {dtype}")
             return
+
+          mtFree = state["MacroTile0"] if tc == 'A' else state["MacroTile1"]
+          mtTiles = mtFree // state["MatrixInstM"]
+          fullLine = _subtileStackFullLine(state["MatrixInstM"], bpeTLU)
+          stack = _subtileStackForTile(mtTiles, fullLine)
+
+          # A strip offers (blocks per strip) x (K windows) fetch slots.  With
+          # fewer slots than waves in the group the surplus waves reissue a
+          # load someone else made, so the operand comes off memory more than
+          # once.  Test the slots, not the tile shape -- a wide wavefront or a
+          # shallow DepthU reaches the same shortage.
+          wgSize     = state["MIWaveGroup"][0 if tc == 'A' else 1]
+          numWaves   = state["MIWaveGroup"][0] * state["MIWaveGroup"][1]
+          otherWaves = max(1, numWaves // wgSize)
+          perWave    = _subtilePerWaveMTiles(mtTiles, stack, wgSize)
+          fetchGroup = max(1, stack // perWave) * otherWaves
+          stripBytes = stack * state["MatrixInstM"] * state["MatrixInstK"] * bpeTLU
+          slots      = int(stripBytes // (state["WavefrontSize"] * 16)) \
+                       * (state["DepthU"] // state["MatrixInstK"])
+          if slots < fetchGroup:
+            reject(state, printRejectionReason,
+                   "UseSubtileImpl=1 TLU=1 leaves the LDS strip on tensor %s with "
+                   "%d (block x K window) slots for a fetch group of %d, so the surplus "
+                   "waves refetch it (MacroTile=%d, DepthU=%d, stack=%d)"
+                   % (tc, slots, fetchGroup, mtFree, state["DepthU"], stack))
+            return
+          if stack not in stackGeometries:
+            reject(state, printRejectionReason,
+                   "UseSubtileImpl=1 TLU=1 has no subtile geometry for a %d-tile stack "
+                   "on tensor %s at %s bytes per element" % (stack, tc, bpeTLU))
+            return
+          state[f"_ABTilePair{tc}"] = stackGeometries[stack]
         elif dtype.isBFloat16() or dtype.isHalf():
           if state["WavefrontSize"] == 32:
             state[f"_ABTilePair{tc}"] = "AB_B16_W32"

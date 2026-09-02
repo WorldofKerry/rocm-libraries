@@ -1134,20 +1134,25 @@ def _graTileAssignment_tlu(writer, kernel, tileInfo):
   tmpVgpr = writer.vgprPool.checkOut(1, tag="_graTileAssignment_tlu_tmpVgpr")
   swzTmp = writer.vgprPool.checkOut(1, tag="_graTileAssignment_tlu_swzTmp") if swz else None
 
-  # M-tiling across b128 loads (fp4 taller stacks).  Each lane's b128 covers
-  # elemsPerChunk (16/bpe) contiguous free-dim (M/N) elements at one K row.  A
-  # strip is mStripBytes wide, i.e. chunksPerK = mStripBytes/16 b128 chunks per
-  # K row.  For the baseline 2x1 fp4 stack chunksPerK==1 (one b128 == one full
-  # K row) and the per-lane offset is a pure K ramp; for taller fp4 stacks (4x1,
-  # 8x1) a single b128 covers only part of a K row, so physical chunk
+  # M-tiling across b128 loads.  Each lane's b128 covers elemsPerChunk (16/bpe)
+  # contiguous free-dim (M/N) elements at one K row.  A strip is mStripBytes
+  # wide, i.e. chunksPerK = mStripBytes/16 b128 chunks per K row.  When
+  # chunksPerK==1 one b128 is a whole K row and the per-lane offset is a pure K
+  # ramp; otherwise a single b128 covers only part of a K row, so physical chunk
   # P = i*wavesize + laneId splits into K row (P // chunksPerK) plus an intra-row
   # M block (P % chunksPerK) of elemsPerChunk elements.  See the LDS image in
-  # SubtileLREmit emitSingleDsRead.  Scoped to fp4 (bpe 0.5); other TLU dtypes
-  # (e.g. bf16 AB_B16_TLU1) keep the original single-chunk-per-K-row ramp.
+  # SubtileLREmit emitSingleDsRead.  This is bpe-driven, not dtype-specific: the
+  # 2x1 fp4 stack is the chunksPerK==1 case, taller fp4 stacks and every bf16
+  # stack (a bf16 strip is 4x wider per MFMA tile) take the split.
   instM = int(tileInfo.mmaTileShape[0])
   mStripBytes = int(tileInfo.subtileShape[0] * instM * tileInfo.bpe)
-  isFp4 = float(tileInfo.bpe) == 0.5
-  chunksPerK = max(1, mStripBytes // 16) if isFp4 else 1
+  chunksPerK = max(1, mStripBytes // 16)
+  # The split below masks and shifts by chunksPerK, so a non-power-of-two would
+  # silently mis-address rather than fail.
+  if chunksPerK & (chunksPerK - 1):
+    raise ValueError("TLU=1 GR requires a power-of-two chunksPerK, got %d "
+                     "(mStripBytes=%d, subtileShape=%s, bpe=%s)"
+                     % (chunksPerK, mStripBytes, tileInfo.subtileShape, tileInfo.bpe))
   elemsPerChunk = int(16 / tileInfo.bpe)
   mTileTmp = writer.vgprPool.checkOut(1, tag="_graTileAssignment_tlu_mTileTmp") if chunksPerK > 1 else None
 
