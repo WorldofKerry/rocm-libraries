@@ -316,6 +316,14 @@ AB_B16_2x2 = ABTilePair(
 # recovered on the LDS read via ds_load_tr16_b128, which fills the whole 4-VGPR
 # bf16 operand in a single read.  A bf16 strip already covers a 128 B cache line
 # at 4 MFMA-M tiles, so no taller stack is wired.
+# One MFMA-M tile per strip: 16 bf16 = 32 B, a quarter of a cache line, so the
+# global read coalesces worse than every stack below.  It exists only so an axis
+# with several waves can take a free dim whose per-wave tile count is odd, which
+# no taller stack can own or share; Solution.py picks it only in that case.
+AB_B16_TLU1_1x1 = ABTilePair(
+    gr=ABGRGeometry(tag=GRTag_TLU1(), **_B16, tlu=True, subtileShape=(1, 1), subtileCount=1, subtileStride=0, loadShape=LoadShape(m=8, k=1)),  # 1 MFMA-M tile = 16 bf16 = 32 B contiguous along M, 2 b128 GR loads
+    lr=ABLRGeometry(tag=LRTag_TLU1(), **_B16, tlu=True, subtileShape=(1, 1), loadShape=LoadShape(m=8, k=1)),
+)
 AB_B16_TLU1 = ABTilePair(
     gr=ABGRGeometry(tag=GRTag_TLU1(), **_B16, tlu=True, subtileShape=(2, 1), subtileCount=1, subtileStride=0, loadShape=LoadShape(m=8, k=1)),  # 2 MFMA-M tiles = 32 bf16 = 64 B contiguous along M
     lr=ABLRGeometry(tag=LRTag_TLU1(), **_B16, tlu=True, subtileShape=(2, 1), loadShape=LoadShape(m=8, k=1)),                                   # 128-bit LR: 8 bf16 along M
@@ -379,6 +387,7 @@ AB_GEOMETRY_MAP = {
   "AB_B4":       AB_B4,
   "AB_B4_2x2":   AB_B4_2x2,
   "AB_B8":       AB_B8,
+  "AB_B16_TLU1_1x1": AB_B16_TLU1_1x1,
   "AB_B16_TLU1": AB_B16_TLU1,
   "AB_B16_TLU1_4x1": AB_B16_TLU1_4x1,
   "AB_B16_W32":  AB_B16_W32,

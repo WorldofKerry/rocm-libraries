@@ -249,6 +249,7 @@ _SUBTILE_TLU1_B4_STACKS = {
   16: "AB_B4_TLU1_16x1",
 }
 _SUBTILE_TLU1_B16_STACKS = {
+  1: "AB_B16_TLU1_1x1",
   2: "AB_B16_TLU1",
   4: "AB_B16_TLU1_4x1",
 }
@@ -284,15 +285,19 @@ def _subtileStripsCoverTile(mtTiles, stack, wgSize):
   return int(wgSize) * localStrips == globalStrips
 
 
-def _subtileStackForTile(mtTiles, fullLine, wgSize=None):
+def _subtileStackForTile(mtTiles, fullLine, wgSize=None, allowUnitStack=False):
   """Free-dim MFMA-M tiles per LDS strip for one TLU=1 operand.
 
   Prefers the tallest stack that divides the tile exactly, then takes a taller
   power-of-two stack instead when its padding stays within the ratio cap.
-  Finally, when the result would leave the waves unable to cover the free dim,
+  Next, when the result would leave the waves unable to cover the free dim,
   steps down to a shorter stack that can -- a 12-tile dim over two waves needs a
   stack of 2 (6 strips, 3 each) where the exact-divisor rule would pick 4 and
   strand half a strip per wave.
+
+  allowUnitStack admits a final fallback to a stack of 1, which no other rule
+  can reach (the candidate sizes stop at _SUBTILE_STACK_MIN).  See below for why
+  it is a last resort rather than a preference.
   """
   mtTiles = int(mtTiles)
   fullLine = int(fullLine)
@@ -310,13 +315,30 @@ def _subtileStackForTile(mtTiles, fullLine, wgSize=None):
   if (roundedUp > exact and roundedUp >= mtTiles
       and roundedUp <= mtTiles * _SUBTILE_STACK_MAX_PAD_RATIO):
     stack = roundedUp
-  if wgSize is None or _subtileStripsCoverTile(mtTiles, stack, wgSize) is not False:
-    return stack
-  candidate = stack
-  while candidate > _SUBTILE_STACK_MIN:
-    candidate //= 2
-    if _subtileStripsCoverTile(mtTiles, candidate, wgSize) is True:
-      return candidate
+  if wgSize is not None and _subtileStripsCoverTile(mtTiles, stack, wgSize) is False:
+    candidate = stack
+    while candidate > _SUBTILE_STACK_MIN:
+      candidate //= 2
+      if _subtileStripsCoverTile(mtTiles, candidate, wgSize) is True:
+        stack = candidate
+        break
+  # A stack of 1 divides any per-wave tile count, so it is the only way an axis
+  # carrying several waves can take a free dim whose per-wave count is odd:
+  # MT160x160 over two waves is 5 tiles per wave, which no power-of-two stack of
+  # 2 or more can either own whole or fit inside, so the straddle guard rejects
+  # it and the tile falls back to a single wave.
+  #
+  # It is strictly worse for global reads -- a 1-tile bf16 strip is 32 B against
+  # a 128 B line -- so it fires only where the alternative is a reject, never as
+  # a preference.  Kept behind a flag so fp4, whose stacks are all reachable,
+  # cannot pick it up.
+  if allowUnitStack and wgSize is not None and stack > 1:
+    straddlesNow = _subtileWaveStraddlesStrip(
+        stack, _subtilePerWaveMTiles(mtTiles, stack, wgSize))
+    straddlesAtOne = _subtileWaveStraddlesStrip(
+        1, _subtilePerWaveMTiles(mtTiles, 1, wgSize))
+    if straddlesNow and not straddlesAtOne:
+      return 1
   return stack
 
 
@@ -1288,6 +1310,10 @@ class Solution(collections.abc.Mapping):
         if tlu:
           if dtype.isBFloat16() or dtype.isHalf():
             bpeTLU, stackGeometries = 2.0, _SUBTILE_TLU1_B16_STACKS
+            # Only bf16 needs the 1-tile fallback: its cache line caps the stack
+            # at 4, so an odd per-wave tile count has nowhere else to go.  fp4
+            # reaches 16 and is left alone, which also keeps its assembly fixed.
+            unitStackOk = True
           elif dtype.isFloat4():
             # Two fp4 share a byte, so an odd free-dim extent leaves the K
             # stride on a half byte and the elements-to-bytes shift truncates
@@ -1298,6 +1324,7 @@ class Solution(collections.abc.Mapping):
             # fp4 only: 6-bit shares this geometry's 0.5 bpe but neither
             # bank-conflict layout covers it, so it falls to the reject below.
             bpeTLU, stackGeometries = 0.5, _SUBTILE_TLU1_B4_STACKS
+            unitStackOk = False
           else:
             reject(state, printRejectionReason, f"No TLU=1 subtile geometry for dtype {dtype}")
             return
@@ -1306,7 +1333,8 @@ class Solution(collections.abc.Mapping):
           mtTiles = mtFree // state["MatrixInstM"]
           fullLine = _subtileStackFullLine(state["MatrixInstM"], bpeTLU)
           axisWaves = state["MIWaveGroup"][0 if tc == 'A' else 1]
-          stack = _subtileStackForTile(mtTiles, fullLine, axisWaves)
+          stack = _subtileStackForTile(mtTiles, fullLine, axisWaves,
+                                      allowUnitStack=unitStackOk)
 
           # The strips must tile the free dim: either the stack divides it, or a
           # single padded strip covers the whole thing.  Anything else leaves a

@@ -219,6 +219,19 @@ def _cpcOf(tileInfo) -> Optional[int]:
     return int(stack * instM * bpe) // 16
 
 
+def _isTLU1(tileInfo) -> bool:
+    """True when this operand takes the free-dim-contiguous (TLU=1) geometry.
+
+    _cpcOf keys only on the dtype, so it cannot tell a TLU=1 1-tile stack from a
+    TLU=0 bf16 operand: the latter is subtileShape (1, 2), which is also stack 1
+    and also cpc 2.  Only the TLU=1 one may take a col_scatter layout; handing
+    one to a row-major operand silently corrupts its LDS image.
+    """
+    geom = getattr(tileInfo, "geometry", None)
+    gr = getattr(geom, "gr", geom)
+    return bool(getattr(gr, "tlu", False))
+
+
 def selectTLUSwizzle(tileInfo) -> Optional[TLUSwizzle]:
     """Return the TLUSwizzle for this tile's stack, or None if unsupported.
 
@@ -251,13 +264,24 @@ def selectTLUColScatter(tileInfo) -> Optional[TLUColScatter]:
     cpc = _cpcOf(tileInfo)
     if cpc is None:
         return None
+    stack = int(tileInfo.subtileShape[0])
     # A shared strip rules out the XOR (see _sharedStrip), so every width falls
     # here; the bank model reaches 1-way across the range (the XOR wins
     # elsewhere only on VALU cost).
-    allowed = _COL_SCATTER_CPC_SHARED if _sharedStrip(tileInfo) else _COL_SCATTER_CPC
+    #
+    # A TLU=1 stack with no XOR entry falls here too, for the same reason:
+    # something has to lay it out, and unswizzled bf16 spends 74% of its LDS
+    # cycles on conflicts.  Gate on the missing entry rather than widening the
+    # cpc set -- bf16 1x1 and fp4 4x1 are both cpc 2, and fp4 4x1 already has a
+    # verified XOR layout that must keep emitting the same assembly.  The TLU=1
+    # test is not redundant: a TLU=0 bf16 operand is also stack 1 and cpc 2, and
+    # must keep getting no layout at all.
+    if _sharedStrip(tileInfo) or (_isTLU1(tileInfo) and stack not in _SWIZZLE_BY_STACK):
+        allowed = _COL_SCATTER_CPC_SHARED
+    else:
+        allowed = _COL_SCATTER_CPC
     if cpc not in allowed:
         return None
-    stack = int(tileInfo.subtileShape[0])
     instM = int(tileInfo.mmaTileShape[0])
     instK = int(tileInfo.mmaTileShape[1])
     waveSize = int(getattr(tileInfo, "waveSize", 0)) or 64
