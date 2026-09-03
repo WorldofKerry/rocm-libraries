@@ -1254,6 +1254,34 @@ class Solution(collections.abc.Mapping):
       if state["DepthU"] % duUnit != 0:
         reject(state, printRejectionReason, f"UseSubtileImpl=1 support only DepthU multiple of {numSubIterK} * MatrixInstK * LocalSplitU")
 
+      # A TLU=1 operand fetches one K window per MatrixInstK, and a window count
+      # divisible by five reads out of bounds for some K.  Measured on gfx950 NT
+      # at M=N=384, across both dtypes on the path:
+      #   bf16 (MatrixInstK 32):  DepthU 160/320/480 (5/10/15 windows) fault with
+      #                           hipErrorIllegalAddress or return wrong results;
+      #                           32/64/96/128/192/224/256 (1/2/3/4/6/7/8) are clean.
+      #   fp4  (MatrixInstK 128): DepthU 640 (5 windows) faults the same way;
+      #                           512 (4) and 768 (6) are clean.
+      # The trigger is the window count rather than DepthU: DepthU 160 at eight
+      # unrolled iterations and DepthU 320 at four behave identically at equal K.
+      # The DepthU rule above does not catch it -- DepthU 320 is a multiple of
+      # 2 * MatrixInstK, and fp4's 640 is a multiple of its own duUnit.
+      #
+      # MX fp4 cannot reach this: its duUnit is 2 * 128, so DepthU (capped at
+      # 1024) admits only 2/4/6/8 windows.  The guard is therefore inert for
+      # every shipped MX config and fires only on geometry that faults.
+      #
+      # This is an empirical guard, not a root cause -- rejecting the geometry
+      # beats emitting a kernel that faults.
+      tluAny = (state["ProblemType"].get("TLUA", False)
+                or state["ProblemType"].get("TLUB", False))
+      if tluAny:
+        kWindows = state["DepthU"] // state["MatrixInstK"]
+        if kWindows % 5 == 0:
+          reject(state, printRejectionReason,
+                 f"UseSubtileImpl=1 TLU=1 reads out of bounds when the K window count "
+                 f"({kWindows} = DepthU/MatrixInstK) is a multiple of five")
+
       for tc in ('A', 'B'):
         dtype = state["ProblemType"][f"DataType{tc}"]
         tlu = state["ProblemType"].get(f"TLU{tc}", False)
