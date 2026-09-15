@@ -236,20 +236,6 @@ _SUBTILE_STACK_MIN = 2
 _SUBTILE_LINE_BYTES = 128
 
 
-# TLU=1 subtile geometry per free-dim stack height, keyed by dtype family.  bf16
-# fills a cache line at 4 tiles, so it needs no taller stacks than that.
-_SUBTILE_TLU1_B4_STACKS = {
-  2:  "AB_B4_TLU1",
-  4:  "AB_B4_TLU1_4x1",
-  8:  "AB_B4_TLU1_8x1",
-  16: "AB_B4_TLU1_16x1",
-}
-_SUBTILE_TLU1_B16_STACKS = {
-  2: "AB_B16_TLU1",
-  4: "AB_B16_TLU1_4x1",
-}
-
-
 def _subtileStackFullLine(instM, bpe):
   """Free-dim MFMA-M tiles whose TLU=1 strip covers one cache line."""
   perTileBytes = int(instM) * float(bpe)
@@ -295,8 +281,8 @@ _SUBTILE_STRIP_SHARING_ISA = (9, 5, 0)
 def _subtileStripSharingReason(state, tc, mtTiles, stack):
   """Why tensor tc's waves cannot share a strip of `stack`, or None when they can.
 
-  These two rules hold for every subtile geometry, not just TLU=1 fp4, so they
-  stay separate from the fp4-only layout rules below.
+  These two rules hold for every subtile geometry, not just TLU=1, so they stay
+  separate from the TLU=1 layout rules below.
   """
   wgSize = state["MIWaveGroup"][0 if tc == 'A' else 1]
   perWaveMTiles = _subtilePerWaveMTiles(mtTiles, stack, wgSize)
@@ -352,10 +338,9 @@ def _subtileTLU1StackReason(state, tc, mtTiles, stack, bpe):
   # made, so the operand comes off memory more than once.  Test the slots, not
   # the tile shape -- a wide wavefront or a shallow DepthU reaches the same
   # shortage.
-  wgSize     = state["MIWaveGroup"][0 if tc == 'A' else 1]
   numWaves   = state["MIWaveGroup"][0] * state["MIWaveGroup"][1]
-  otherWaves = max(1, numWaves // wgSize)
-  perWave    = _subtilePerWaveMTiles(mtTiles, stack, wgSize)
+  otherWaves = max(1, numWaves // axisWaves)
+  perWave    = _subtilePerWaveMTiles(mtTiles, stack, axisWaves)
   fetchGroup = max(1, stack // perWave) * otherWaves
   stripBytes = stack * state["MatrixInstM"] * state["MatrixInstK"] * float(bpe)
   slots      = int(stripBytes // (state["WavefrontSize"] * 16)) \
@@ -1308,7 +1293,7 @@ class Solution(collections.abc.Mapping):
         tlu = state["ProblemType"][f"TLU{tc}"]
         if tlu:
           if dtype.isBFloat16() or dtype.isHalf():
-            bpeTLU, stackGeometries = 2.0, _SUBTILE_TLU1_B16_STACKS
+            bpeTLU = 2.0
           elif dtype.isFloat4():
             # Two fp4 share a byte, so an odd free-dim extent leaves the K
             # stride on a half byte and the elements-to-bytes shift truncates
@@ -1318,10 +1303,15 @@ class Solution(collections.abc.Mapping):
             state[key] = max(state[key], 2)
             # fp4 only: 6-bit shares this geometry's 0.5 bpe but neither
             # bank-conflict layout covers it, so it falls to the reject below.
-            bpeTLU, stackGeometries = 0.5, _SUBTILE_TLU1_B4_STACKS
+            bpeTLU = 0.5
           else:
             reject(state, printRejectionReason, f"No TLU=1 subtile geometry for dtype {dtype}")
             return
+
+          # Lazy import for the same reason as _validateSubtileGRKPartition:
+          # Components/Subtile at module scope deadlocks the package load.
+          from Tensile.Components.Subtile.Kernel import AB_TLU1_STACK_NAMES
+          stackGeometries = AB_TLU1_STACK_NAMES.get(bpeTLU, {})
 
           mtFree = state["MacroTile0"] if tc == 'A' else state["MacroTile1"]
           mtTiles = mtFree // state["MatrixInstM"]
