@@ -967,24 +967,58 @@ def _graTileAssignment_legacy(writer, kernel, useSwizzling=True):
   return module
 
 
-def _tluPadFreeExtent(kernel, tileInfo):
-  """Real free-dim element extent when the GR strip is padded, else None.
+def _tluFreeDimWaveChunks(writer, kernel, module, tileInfo, elemsPerChunk, dst):
+  """Write this wave's free-dim start, in chunks, to dst.  False if it is 0.
 
-  A padded stack fetches tiles that are never read, and the SRD limit cannot
-  exclude them (one linear bound over the K window), so the caller uses this
-  extent to push the pad lanes out of range.  Only a single strip pads, and
-  only at wave group 1 is m_chunk the absolute free-dim position.
+  _tluWaveAxisGlobalOffset folds a K-row term in for shared strips, so a bounds
+  test on the free dim needs this form instead.
   """
   tc = tileInfo.tc
-  wgIdx = 0 if tc == 'A' else 1
-  if int(kernel["MIWaveGroup"][wgIdx]) != 1:
-    return None
-  freeElems = int(kernel["MacroTile0" if tc == 'A' else "MacroTile1"])
-  mtTiles = freeElems // int(tileInfo.mmaTileShape[0])
-  stack = int(tileInfo.subtileShape[0])
-  if stack <= 0 or mtTiles % stack == 0:
-    return None
-  return freeElems
+  subtileM = int(tileInfo.subtileShape[0] * tileInfo.mmaTileShape[0])
+  chunksPerStrip = subtileM // int(elemsPerChunk)
+  if chunksPerStrip <= 0:
+    return False
+  if int(tileInfo.grWavesPerStrip) > 1:
+    # Waves sharing a strip step along the free dim by strip, not by axis id.
+    if not _tluStripIdx(writer, kernel, module, tc, tileInfo, dst):
+      return False
+    chunks = chunksPerStrip
+  else:
+    if not _tluWaveAxisId(writer, kernel, module, tc, dst):
+      return False
+    chunks = chunksPerStrip * int(tileInfo.localSubtileGrid[0])
+  tmpS = writer.sgprPool.checkOut(1, tag="_tluFreeDimWaveChunks_s_%s" % tc,
+                                  preventOverflow=False)
+  module.add(SMovB32(dst=sgpr(tmpS), src=hex(chunks),
+             comment="%s: free-dim chunks per axis-wave" % tc))
+  module.add(VMulLOU32(dst=vgpr(dst), src0=sgpr(tmpS), src1=vgpr(dst),
+             comment="%s: wave free-dim start in chunks" % tc))
+  writer.sgprPool.checkIn(tmpS)
+  return True
+
+
+def _tluFreeBoundChunks(writer, kernel, module, tileInfo, elemsPerChunk, dst):
+  """Emit the tile's real free-dim extent, in chunks, to sgpr dst.
+
+  min(size - wg*MT, MT) covers both the edge workgroup and the stack pad, since
+  an interior workgroup clamps to MT and the surplus lanes of a padded stack sit
+  past it either way.  Rounded up: without a free-dim element-multiple assert the
+  edge can fall inside a chunk, and that chunk still holds real elements.
+  """
+  tc = tileInfo.tc
+  mt = int(kernel["MacroTile0" if tc == 'A' else "MacroTile1"])
+  sizeSgpr = "SizeI" if tc == 'A' else "SizeJ"
+  wgSgpr = "WorkGroup0" if tc == 'A' else "WorkGroup1"
+  module.add(SMulI32(dst=sgpr(dst), src0=sgpr(wgSgpr), src1=hex(mt),
+             comment="%s: this tile's free-dim base = wg * %u" % (tc, mt)))
+  module.add(SSubI32(dst=sgpr(dst), src0=sgpr(sizeSgpr), src1=sgpr(dst),
+             comment="%s: elements from the tile base to the end of the operand" % tc))
+  module.add(SMinU32(dst=sgpr(dst), src0=sgpr(dst), src1=hex(mt),
+             comment="%s: an interior tile is full, so clamp to %u" % (tc, mt)))
+  module.add(SAddU32(dst=sgpr(dst), src0=sgpr(dst), src1=hex(int(elemsPerChunk) - 1),
+             comment="%s: round up, a straddling chunk still has real elements" % tc))
+  module.add(SLShiftRightB32(sgpr(dst), int(elemsPerChunk).bit_length() - 1, sgpr(dst),
+             comment="%s: elements -> chunks" % tc))
 
 
 def _graTileAssignment_tlu_colScatter(writer, kernel, tileInfo, module, laneId,
@@ -1043,29 +1077,40 @@ def _graTileAssignment_tlu_colScatter(writer, kernel, tileInfo, module, laneId,
   # col_group * N (load-independent K-column base).
   module.add(VLShiftLeftB32(dst=vgpr(cg), shiftHex=hex(N.bit_length() - 1), src=vgpr(cg),
              comment="%s: col_group * %u (= K-column at load 0)" % (tc, N)))
-  # A padded strip carries lanes whose free-dim chunk starts past the operand's
-  # real tiles.  Compare while mc is still a chunk index: the bound is then small
-  # enough to be an inline constant, where the element extent (192, 224) is not.
-  # m_chunk is load-independent, so one compare covers every load; the select has
-  # to come last though, after the per-wave offset is folded in, because the steps
-  # between would mangle an out-of-range value back into a valid address.
-  padFreeElems = _tluPadFreeExtent(kernel, tileInfo)
+  # Lanes can start past the operand's real elements, either because a padded
+  # strip is taller than the tile or because this is the edge workgroup.  The SRD
+  # limit is one linear bound over the K window and cannot exclude them, so they
+  # are sent out of range here instead.  Compare while mc is still a chunk index,
+  # which keeps the bound small.  The position is load-independent, so one compare
+  # covers every load; the select has to come last though, after the per-wave
+  # offset is folded in, because the steps between would mangle an out-of-range
+  # value back into a valid address.
   laneSGPRCount = writer.states.laneSGPRCount
-  with contextlib.ExitStack() as padStack:
-    padMaskSgpr = None
-    oobVgpr = None
-    if padFreeElems is not None:
-      padChunks = -(-padFreeElems // elemsPerChunk)
-      oobVgpr = writer.vgprPool.checkOut(1, tag="_graColScatter_oob")
-      module.add(VMovB32(dst=vgpr(oobVgpr), src="BufferOOB",
-                 comment="%s: offset that the buffer bound rejects" % tc))
-      padMaskSgpr = padStack.enter_context(
-          writer.allocTmpSgpr(laneSGPRCount, alignment=laneSGPRCount,
-                              tag="_graColScatter_padMask")).idx
-      module.add(VCmpLtI32(dst=sgpr(padMaskSgpr, laneSGPRCount), src0=vgpr(mc),
-                 src1=padChunks,
-                 comment="%s: m_chunk < %u, i.e. lane inside the real %u elements?"
-                         % (tc, padChunks, padFreeElems)))
+  with contextlib.ExitStack() as oobStack:
+    oobVgpr = writer.vgprPool.checkOut(1, tag="_graColScatter_oob")
+    # Srd+2 is this buffer's NumRecords, and the range check rejects an offset
+    # equal to it.  Unlike a large constant it cannot wrap back into range when
+    # an soffset is folded in, and the loop only moves the SRD base, so a lane
+    # parked here stays rejected for the whole kernel.
+    module.add(VMovB32(dst=vgpr(oobVgpr), src=sgpr("Srd%s+2" % tc),
+               comment="%s: the buffer's own limit, which its range check rejects" % tc))
+    boundSgpr = oobStack.enter_context(
+        writer.allocTmpSgpr(1, tag="_graColScatter_bound")).idx
+    _tluFreeBoundChunks(writer, kernel, module, tileInfo, elemsPerChunk, boundSgpr)
+    absChunk = writer.vgprPool.checkOut(1, tag="_graColScatter_absChunk")
+    if _tluFreeDimWaveChunks(writer, kernel, module, tileInfo, elemsPerChunk, absChunk):
+      module.add(VAddU32(dst=vgpr(absChunk), src0=vgpr(absChunk), src1=vgpr(mc),
+                 comment="%s: lane's free-dim chunk within the tile" % tc))
+    else:
+      module.add(VMovB32(dst=vgpr(absChunk), src=vgpr(mc),
+                 comment="%s: no free-dim wave step, so m_chunk is the tile position" % tc))
+    oobMaskSgpr = oobStack.enter_context(
+        writer.allocTmpSgpr(laneSGPRCount, alignment=laneSGPRCount,
+                            tag="_graColScatter_oobMask")).idx
+    module.add(VCmpLtI32(dst=sgpr(oobMaskSgpr, laneSGPRCount), src0=vgpr(absChunk),
+               src1=sgpr(boundSgpr),
+               comment="%s: does this lane start inside the operand?" % tc))
+    writer.vgprPool.checkIn(absChunk)
 
     # m_chunk * elemsPerChunk (free-dim element start, load-independent).
     module.add(VLShiftLeftB32(dst=vgpr(mc), shiftHex=hex(elemsPerChunk.bit_length() - 1),
@@ -1092,13 +1137,11 @@ def _graTileAssignment_tlu_colScatter(writer, kernel, tileInfo, module, laneId,
       if waveAxisOffVgpr is not None:
         module.add(VAddU32(dst=vgpr(out), src0=vgpr(out), src1=vgpr(waveAxisOffVgpr),
                    comment="%s: + per-wave free-dim (M/N) global offset" % tc))
-      if padMaskSgpr is not None:
-        module.add(VCndMaskB32(dst=vgpr(out), src0=vgpr(oobVgpr), src1=vgpr(out),
-                   src2=sgpr(padMaskSgpr, laneSGPRCount),
-                   comment="%s: pad lane -> BufferOOB, dropping its global read" % tc))
+      module.add(VCndMaskB32(dst=vgpr(out), src0=vgpr(oobVgpr), src1=vgpr(out),
+                 src2=sgpr(oobMaskSgpr, laneSGPRCount),
+                 comment="%s: lane past the operand -> out of range, dropping its read" % tc))
 
-    if oobVgpr is not None:
-      writer.vgprPool.checkIn(oobVgpr)
+    writer.vgprPool.checkIn(oobVgpr)
 
   if waveAxisOffVgpr is not None:
     writer.vgprPool.checkIn(waveAxisOffVgpr)
