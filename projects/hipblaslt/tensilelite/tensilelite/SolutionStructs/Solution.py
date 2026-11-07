@@ -2350,8 +2350,17 @@ class Solution(collections.abc.Mapping):
       mxBlockScaled = bool(state["ProblemType"]["MXBlockA"] or state["ProblemType"]["MXBlockB"])
       mxBlockScaleSgprFits = not (mxBlockScaled and bool(miwt) and len(miwt) == 2 and
                                   min(miwt[0], miwt[1]) <= 2 and max(miwt[0], miwt[1]) >= 16)
+      # TN only. The staged store addresses D from the TN global-read shape;
+      # NN/NT/TT reach the subtile path through a separate strided-K pointer
+      # update that it does not model and miscompare (see isMxf4SubtilePath).
+      # Reuse that predicate rather than re-deriving the layout test, so the two
+      # cannot drift. Without this the fused store computes an out-of-range D
+      # offset on non-TN and faults, because the D SRD's NumRecords (~4 GiB) is
+      # far larger than the real buffer and so never clamps it.
+      onMxf4SubtilePath = isMxf4SubtilePath(state)
       # Hard structural: the fused store literally cannot be emitted. ALWAYS enforced.
       structuralFail = ((not isFloat4)
+                        or (not onMxf4SubtilePath)
                         or (not state["UseSubtileImpl"])
                         or (not isgfx950)
                         or (not state["EnableMatrixInstruction"])
