@@ -11,6 +11,16 @@
 # Operands are expected pre-swizzled into the per-lane MFMA register order, with
 # scales as one E8M0 byte per lane in the same order; the canonical MX stream
 # produces wrong results.
+#
+# Selecting it from hipblaslt-bench needs both of
+#   HIPBLASLT_USE_ROCROLLER=0           MX F6 otherwise routes to rocRoller
+#   --uniform_summation_order off       the kernel makes no row-uniform guarantee
+#
+# The buffer descriptors leave num_records unbounded, so the K loop's round-up to
+# a multiple of UNROLL reads past a canonically sized allocation instead of
+# returning zeros. Supplying the padded pre-swizzled operands the kernel expects
+# avoids that; bounding the descriptors would need Tensile's shadow-limit
+# bookkeeping, since the bases advance every K step.
 
 TestParameters:
   marks: [skip-gfx900, skip-gfx906, skip-gfx908, skip-gfx90a, skip-gfx940, skip-gfx941, skip-gfx942, skip-gfx1010, skip-gfx1011, skip-gfx1012, skip-gfx1030, skip-gfx1100, skip-gfx1101, skip-gfx1102, skip-gfx1200, skip-gfx1201, skip-gfx1250, skip-gfx1250-strict] # gfx950 only
