@@ -22,6 +22,7 @@ external manifest.
 | `rocblas/`    | External: rocBLAS wvSpltK skinny-GEMM kernels.   |
 | `vllm/`       | External: vLLM wvSplitK skinny-GEMM kernels.     |
 | `rocroller/`  | External: rocRoller-sourced kernels.              |
+| `gfxjit/`     | External: gfxjit-sourced shape-specialised kernels. |
 | `wave/`       | External: Wave (handwritten) kernels.             |
 | `triton/`     | External: Triton-compiled GEMM kernels.           |
 

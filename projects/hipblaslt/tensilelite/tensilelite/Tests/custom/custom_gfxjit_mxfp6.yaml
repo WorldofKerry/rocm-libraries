@@ -1,0 +1,90 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+
+# gfxjit MXFP6 (E2M3 x E2M3 -> bf16) GEMM, gfx950.
+#
+# The kernel bakes M, N and K into the code object, so it serves exactly one
+# shape and the library type is Equality rather than GridBased. Its Tensile-side
+# interface lives in the kernel's own custom.config block; only the name is
+# needed here.
+#
+# Operands are expected pre-swizzled into the per-lane MFMA register order, with
+# scales as one E8M0 byte per lane in the same order; the canonical MX stream
+# produces wrong results.
+
+TestParameters:
+  marks: [skip-gfx900, skip-gfx906, skip-gfx908, skip-gfx90a, skip-gfx940, skip-gfx941, skip-gfx942, skip-gfx1010, skip-gfx1011, skip-gfx1012, skip-gfx1030, skip-gfx1100, skip-gfx1101, skip-gfx1102, skip-gfx1200, skip-gfx1201, skip-gfx1250, skip-gfx1250-strict] # gfx950 only
+
+GlobalParameters:
+  MinimumRequiredVersion: 5.0.0
+  SleepPercent: 50
+  NumElementsToValidate: 0
+  DataInitTypeBeta: 0
+  DataInitTypeAlpha: 1
+  DataInitTypeA: 3
+  DataInitTypeB: 3
+  CSVExportWinner: true
+  CSVMergeSameProblemID: true
+  Device: 0
+  ValidateMetadata: True
+  UniformSummationOrder: 0
+  ForceRedoLibraryLogic: True
+
+BenchmarkProblems:
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: F6
+      DataTypeA: F6
+      DataTypeB: F6
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: true
+      TransposeB: false
+      UseBeta: True
+      Batched: True
+      UseBias: 0
+      Activation: False
+      UseScaleAlphaVec: 0
+      MXBlockA: 32
+      MXBlockB: 32
+
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - CustomKernel:
+          - name: "gfxjit_mxfp6_gemm_256x256x128_w2x2_16x16x128_s3_4096x4096x65536_preswz"
+            # Slot order is the kernel's kernarg segment (c, a, b, sa, sb); the
+            # semantics name hipBLASLt's tensors. The kernel stores C row-major,
+            # so it runs with M and N exchanged and A/B swap with them.
+            args: [ { type: address, semantic: AddressD },
+                    { type: address, semantic: AddressB },
+                    { type: address, semantic: AddressA },
+                    { type: address, semantic: AddressMXScaleB },
+                    { type: address, semantic: AddressMXScaleA } ]
+            macrotile: [256, 256, 128]
+            threads: [256, 1, 1]
+            grid: [TilesXY, One, One]
+        - MatrixInstruction:
+          - [16, 16, 128, 1]
+        - PreloadKernArgs: [False]
+        - DepthU: [128]
+        - StaggerU: [0]
+        - WorkGroupMapping: [1]
+        - GlobalSplitU: [1]
+        - GlobalSplitUAlgorithm: ["MultipleBuffer"]
+        - StoreRemapVectorWidth: [0]
+        - NonTemporalA: [0]
+        - NonTemporalB: [0]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [4096, 4096, 1, 65536]
+
+LibraryLogic:
+    ScheduleName: "gfx950"
+    DeviceNames: ["Device 75a0", "Device 75a3"]
+    ArchitectureName: "gfx950"
+    LibraryType: "Equality"
