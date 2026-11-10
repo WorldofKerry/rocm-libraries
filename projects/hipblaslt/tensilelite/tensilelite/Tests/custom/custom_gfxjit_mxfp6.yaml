@@ -16,11 +16,15 @@
 #   HIPBLASLT_USE_ROCROLLER=0           MX F6 otherwise routes to rocRoller
 #   --uniform_summation_order off       the kernel makes no row-uniform guarantee
 #
-# The buffer descriptors leave num_records unbounded, so the K loop's round-up to
-# a multiple of UNROLL reads past a canonically sized allocation instead of
-# returning zeros. Supplying the padded pre-swizzled operands the kernel expects
-# avoids that; bounding the descriptors would need Tensile's shadow-limit
+# The buffer descriptors leave num_records unbounded, so the operands must also
+# carry the K loop's round-up to a multiple of UNROLL rather than being sized for
+# exactly K; a canonically sized allocation faults instead of reading zeros past
+# the end. Bounding the descriptors would need Tensile's shadow-limit
 # bookkeeping, since the bases advance every K step.
+#
+# hipblaslt-bench supplies neither the layout nor the padding, so it can only be
+# used to confirm dispatch. Calling hipblasLtMatmul directly with operands packed
+# this way verifies against a float64 reference at the bf16 half-ULP bound.
 
 TestParameters:
   marks: [skip-gfx900, skip-gfx906, skip-gfx908, skip-gfx90a, skip-gfx940, skip-gfx941, skip-gfx942, skip-gfx1010, skip-gfx1011, skip-gfx1012, skip-gfx1030, skip-gfx1100, skip-gfx1101, skip-gfx1102, skip-gfx1200, skip-gfx1201, skip-gfx1250, skip-gfx1250-strict] # gfx950 only

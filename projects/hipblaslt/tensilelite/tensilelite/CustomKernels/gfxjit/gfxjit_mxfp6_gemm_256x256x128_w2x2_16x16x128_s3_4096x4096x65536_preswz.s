@@ -4,8 +4,8 @@
 	.p2align	8
 	.type	gfxjit_mxfp6_gemm_256x256x128_w2x2_16x16x128_s3_4096x4096x65536_preswz,@function
 gfxjit_mxfp6_gemm_256x256x128_w2x2_16x16x128_s3_4096x4096x65536_preswz:
-	s_load_dwordx8 s[8:15], s[4:5], 0x0
-	s_load_dwordx2 s[16:17], s[4:5], 0x20
+	s_load_dwordx8 s[8:15], s[0:1], 0x0
+	s_load_dwordx2 s[16:17], s[0:1], 0x20
 	v_lshrrev_b32_e32 v2, 6, v0
 	v_and_b32_e32 v1, 63, v0
 	s_nop 4
@@ -13,8 +13,8 @@ gfxjit_mxfp6_gemm_256x256x128_w2x2_16x16x128_s3_4096x4096x65536_preswz:
 	s_nop 4
 	s_lshr_b32 s19, s18, 1
 	s_and_b32 s20, s18, 1
-	s_and_b32 s23, s6, 7
-	s_lshr_b32 s24, s6, 3
+	s_and_b32 s23, s2, 7
+	s_lshr_b32 s24, s2, 3
 	s_and_b32 s25, s23, 1
 	s_lshl_b32 s25, s25, 3
 	s_and_b32 s21, s24, 7
@@ -72,19 +72,23 @@ gfxjit_mxfp6_gemm_256x256x128_w2x2_16x16x128_s3_4096x4096x65536_preswz:
 	s_waitcnt lgkmcnt(0)
 	s_mov_b32 s36, s10
 	s_mov_b32 s37, s11
-	s_mov_b32 s38, -1
+	.long	0xBEA600FF
+	.long	0xFFFFFFFF
 	s_mov_b32 s39, 0x20000
 	s_mov_b32 s40, s12
 	s_mov_b32 s41, s13
-	s_mov_b32 s42, -1
+	.long	0xBEAA00FF
+	.long	0xFFFFFFFF
 	s_mov_b32 s43, 0x20000
 	s_mov_b32 s44, s14
 	s_mov_b32 s45, s15
-	s_mov_b32 s46, -1
+	.long	0xBEAE00FF
+	.long	0xFFFFFFFF
 	s_mov_b32 s47, 0x20000
 	s_mov_b32 s48, s16
 	s_mov_b32 s49, s17
-	s_mov_b32 s50, -1
+	.long	0xBEB200FF
+	.long	0xFFFFFFFF
 	s_mov_b32 s51, 0x20000
 	s_mul_i32 s23, s21, 0x6000
 	s_add_u32 s36, s36, s23
@@ -2642,6 +2646,8 @@ L_ed8:
 	s_waitcnt vmcnt(0)
 	s_endpgm
 
+	.section	.rodata,"a",@progbits
+	.p2align	6, 0x0
 .amdhsa_kernel gfxjit_mxfp6_gemm_256x256x128_w2x2_16x16x128_s3_4096x4096x65536_preswz
 	.amdhsa_group_segment_fixed_size 153600
 	.amdhsa_private_segment_fixed_size 0
