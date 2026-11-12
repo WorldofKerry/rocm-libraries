@@ -238,9 +238,9 @@ public:
     s_mul_i32(sgpr(34), sgpr(21), kMT * kC0TileStride);    // wm * 8192
     s_mul_i32(sgpr(35), sgpr(22), kNT * kC0TileStride);
     // c1 plane: lane * 8, wave base kC1Base + wm * kMT * 512
-    v_lshlrev_b32(vgpr(7), 3, vgpr(1));                 // lane * 8
-    s_mul_i32(sgpr(52), sgpr(21), kMT * kC1TileStride);    // wm * 4096
-    s_mul_i32(sgpr(53), sgpr(22), kNT * kC1TileStride);
+    v_lshlrev_b32(vgpr(9), 3, vgpr(1));                 // lane * 8
+    s_mul_i32(sgpr(58), sgpr(21), kMT * kC1TileStride);    // wm * 4096
+    s_mul_i32(sgpr(59), sgpr(22), kNT * kC1TileStride);
     // scales: the wave's 8 tiles are the 8 contiguous bytes at 512*wm + 8*lane
     v_lshlrev_b32(vgpr(6), 3, vgpr(1));                 // lane * 8 (scales)
     s_mul_i32(sgpr(56), sgpr(21), kTilesPerBlock / 2 * 64);  // wm * 512
@@ -251,9 +251,9 @@ public:
       v_add_u32(vgpr(vAaddr_ + st), base + kLdsA, vgpr(vAaddr_ + st));
       v_add_u32(vgpr(vBaddr_ + st), sgpr(35), vgpr(5));
       v_add_u32(vgpr(vBaddr_ + st), base + kLdsB, vgpr(vBaddr_ + st));
-      v_add_u32(vgpr(vA1addr_ + st), sgpr(52), vgpr(7));
+      v_add_u32(vgpr(vA1addr_ + st), sgpr(58), vgpr(9));
       v_add_u32(vgpr(vA1addr_ + st), base + kLdsA + kC1Base, vgpr(vA1addr_ + st));
-      v_add_u32(vgpr(vB1addr_ + st), sgpr(53), vgpr(7));
+      v_add_u32(vgpr(vB1addr_ + st), sgpr(59), vgpr(9));
       v_add_u32(vgpr(vB1addr_ + st), base + kLdsB + kC1Base, vgpr(vB1addr_ + st));
       v_add_u32(vgpr(vSAaddr_ + st), sgpr(56), vgpr(6));
       v_add_u32(vgpr(vSAaddr_ + st), base + kLdsSA, vgpr(vSAaddr_ + st));
@@ -563,14 +563,12 @@ private:
   }
 
   GemmShape s_;
-  // VGPR map: v0-v8 misc, v16-23 scales, v24-35 c0/scale LDS addresses,
-  // v36-39 dummy, v40-45 c1 LDS addresses, operands v48-95 / v96-143 (set 0)
-  // and v144-191 / v192-239 (set 1).
-  static constexpr int vAaddr_ = 24, vBaddr_ = 27;   // c0 plane, per stage
-  static constexpr int vSAaddr_ = 30, vSBaddr_ = 33;
-  static constexpr int vDummy_ = 36;  // vdata is ignored by the LDS-DMA form,
-                                      // but it is a 4-register tuple: v36-v39
-  static constexpr int vA1addr_ = 40, vB1addr_ = 43;  // c1 plane, per stage
+  // VGPR map: v0-v9 misc, v16-23 scales, v24-41 LDS addresses, v44-47 dummy,
+  // operands v48-95 / v96-143 (set 0) and v144-191 / v192-239 (set 1).
+  static constexpr int vAaddr_ = 24, vBaddr_ = 27;    // c0 plane, per stage
+  static constexpr int vA1addr_ = 30, vB1addr_ = 33;  // c1 plane, per stage
+  static constexpr int vSAaddr_ = 36, vSBaddr_ = 39;
+  static constexpr int vDummy_ = 44;  // vdata is ignored by the LDS-DMA form
 };
 
 // --------------------------------------------------------------- host side
@@ -684,7 +682,9 @@ int main(int argc, char **argv) {
             const int o = 64 * t + lane;
             const int row = b * kBM + t * 16 + lane % 16;
             const int kbase = ks * kBK + (lane / 16) * 32;
-            uint8_t frag[24];
+            // fp6_pack32 ORs into its destination, so the scratch fragment
+            // has to start zeroed.
+            uint8_t frag[24] = {};
             fp6_pack32(&src[(size_t)row * s.K + kbase], frag);
             memcpy(base + 16 * o, frag, 16);
             memcpy(base + kC1Base + 8 * o, frag + 16, 8);

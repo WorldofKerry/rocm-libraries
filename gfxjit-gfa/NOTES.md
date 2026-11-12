@@ -1,16 +1,17 @@
-# gfxjit MXFP6 kernel -> hipBLASLt GFA: work in progress
+# gfxjit MXFP6 kernel on hipBLASLt's operand layout
 
-## Layout analysis (done, conclusive)
+## Layout analysis
 
 hipBLASLt's `--swizzleA/--swizzleB` for FP6 (`HIPBLASLT_ORDER_COL256_R128_EXT`) and
 `--scaleA/B 1018` (`HIPBLASLT_MATMUL_MATRIX_SCALE_BLK32_UE8M0_128_4_EXT`) are implemented in
 `projects/hipblaslt/clients/common/include/mx_tile128x4.hpp` and are byte-for-byte rocKE's
 `pack_operand_c0c1` / `pack_scales_tile`. Both are also pinned as public API in
-`library/include/hipblaslt/hipblaslt.h` (scale byte formula at line 394, order enum 104).
+`library/include/hipblaslt/hipblaslt.h` (scale byte formula at line 394, order enum 104), so the
+host shuffle is not ours to change -- the kernel reads their layout.
 
-Per (256-row block, 128-K step) both hipBLASLt's image and the gfxjit kernel's private image are
-24576 B with the *same* block index `(row/256)*(K/128) + kstep` and the *same* 24-byte lane
-fragments. They differ only in placement inside the block, with tile `t` (0..15) and lane `l`:
+Per (256-row block, 128-K step) both images are 24576 B with the *same* block index
+`(row/256)*(K/128) + kstep` and the *same* 24-byte lane fragments. They differ only in placement
+inside the block, with tile `t` (0..15) and lane `l`:
 
     gfxjit private : 24 B contiguous at 3072*(t/2) + 48*l + 24*(t%2)
     hipBLASLt c0c1 : low 16 B at 16*(64t + l); high 8 B at 16384 + 8*(64t + l)
@@ -20,54 +21,56 @@ Scales, per (block, kstep), 1024 B:
     gfxjit private : byte 16*l + t
     hipBLASLt      : byte 512*(t/8) + 8*l + (t%8)
 
-Both are pure permutations. Consequences:
+Both are pure permutations, so:
 
-* The direct-to-LDS stream is unchanged -- both layouts are block-contiguous with identical block
-  ordering, so the 14 DTLs, LDS budget, barriers and grid all stay as they are.
-* The scale read stays exactly one `ds_read_b64` per operand: a wave's 8 tiles (t = 8*wm + 0..7)
-  are the 8 contiguous bytes at `512*wm + 8*l`. Only the address changes.
-* The fragment read changes class: the private image allows 3 x `ds_read_b128` per tile PAIR
-  (48 B contiguous per lane, 24 reads per K-step); c0c1 forces 1 x `ds_read_b128` (c0 -> 4 VGPRs)
-  + 1 x `ds_read_b64` (c1 -> 2 VGPRs) per tile, 32 + 2 = 34 reads per K-step. This is exactly
-  rocKE's own c0c1p -> c0c1 step; rocKE ships c0c1 in its fastest kernel (v4-v6).
+* the direct-to-LDS stream is unchanged -- same 14 DTLs, same 153600 B of LDS, same barriers,
+  same grid, because both layouts are block-contiguous with identical block ordering;
+* the scale read stays exactly one `ds_read_b64` per operand: a wave's 8 tiles (t = 8*wm + 0..7)
+  are the 8 contiguous bytes at `512*wm + 8*l`. Only the address changes;
+* only the fragment read changes class: 24 `ds_read_b128` per K-step becomes 16 `b128` (c0 -> the
+  low 4 of the operand's 6 VGPRs) + 16 `b64` (c1 -> the high 2), 34 LDS reads per K-step with the
+  two scale reads. This is rocKE's own c0c1p -> c0c1 step, and rocKE ships c0c1 in its fastest
+  kernel.
 
-Conclusion: consume hipBLASLt's layout. Do not change the host shuffle -- it is public API with a
-byte-exact published formula and rocKE depends on it.
+This two-region scheme is not new to this kernel: it is what `5ddfb36^` used before the paired
+48-byte layout superseded it, and that commit's own measurements put the paired layout only ~20
+TFLOP/s ahead. Measured here, the gap is smaller still (below).
 
-## Implementation state
+## Measured, 4096x4096x65536, MI355X GPU 7
 
-`mxfp6_gfa.cpp` is the gfxjit kernel rewritten to consume c0c1 + scale layout 1018:
+    paired private layout (baseline)  4332 4343 4366 4343 4370   median 4343
+    c0c1 (this kernel)                4328 4333 4339 4354 4336 4334 4335   median 4336
+
+About 0.16 % -- the hipBLASLt layout is essentially free. Correctness: PASS against the harness's
+CPU reference (max rel err 0.0039, bf16 output rounding).
+
+## What changed in the kernel
+
+`mxfp6_gfa.cpp` against `Examples/mxfp6_gemm.cpp`:
 
 * host `swizzle_ab` emits c0c1, `swizzle_sc` emits the 1018 scale order;
-* new per-stage c1 LDS address registers (`vA1addr_`/`vB1addr_`, v40-v45) alongside the existing
-  c0 ones, bases in s52/s53 (NB: s36-s51 are the four buffer descriptors, s58/s59 are fine but
-  s50/s51 are *not* -- they are the scale-B descriptor);
-* `ds_units` issues b128(c0) + b64(c1) per tile into the 6 consecutive VGPRs the MFMA wants.
+* `vA1addr_`/`vB1addr_` (v30-v35) hold the c1 plane address per stage alongside the c0 ones, with
+  the wave bases in s58/s59; `vSAaddr_`/`vSBaddr_` move to v36/v39 and `vDummy_` to v44, which is
+  the register map the two-region ancestor used;
+* `ds_units` issues `b128`(c0) + `b64`(c1) per tile into the 6 consecutive VGPRs the MFMA wants.
 
-**It does not validate yet.** Status of the investigation:
+Everything else -- XCD workgroup mapping, the walking-SRD direct-to-LDS fills, serpentine MFMA
+order, the acquire protocol -- is HEAD's and is untouched.
 
-Verified correct:
-* host image <-> kernel read-address mapping, by `chk.cpp` (standalone, reimplements both sides
-  and round-trips every (kstep, wm, tile, lane) fragment) -- reports OK;
-* the generated addresses, by disassembly: c0 base `wm*8192 + lane*16` + `t*1024`, c1 base
-  `16384 + wm*4096 + lane*8` + `t*512`, all three stage bases, all within the right LDS regions;
-* the MFMA encodings are bit-identical to the working kernel's (`v[48:53]`, `v[96:101]`, ...);
-* `buffer_load_dwordx4 ... lds` is verbatim (global image == LDS image), proved by feeding the
-  known-good original kernel a dword-planar-permuted image: it fails, as it must under verbatim.
+## Two traps worth keeping
 
-Ruled out:
-* not a scale-layout problem (fails identically with the old scale layout, and with all scales
-  pinned to 1.0);
-* not the c1 read (fails identically with the c1 halves replaced by `v_mov 0`);
-* not `ds_read_b128` VGPR alignment (fails identically with the b128 split into two b64);
-* not a race (fails identically with `s_waitcnt lgkmcnt(0)` after every single operand read);
-* not the opcode cache.
+* **`fp6_pack32` ORs into its destination and never clears it.** Packing into a scratch
+  `uint8_t frag[24]` requires `= {}`. Without it the swizzled image is garbage that still looks
+  structured, and the failure presents as a layout bug: wrong-but-deterministic results, operands
+  that decode outside the data's value range, and run-to-run variation from whatever the stack
+  held. This cost the bulk of the debugging. The address algebra checked out the whole time
+  precisely because the standalone checker zeroed its own buffer.
+* **s36-s51 are the four buffer descriptors** (`make_desc(36/40/44/48, ...)`), so s50/s51 are the
+  scale-B descriptor, not scratch. s52-s55 are free since the SRD walk replaced the soffsets.
 
-Symptom, from the structural probe (`mkprobe2.py`: A[row] = 1,2,3,4 by row%4, B all 1.0, scales
-1.0; the same probe on the original kernel prints the exact expected 512/1024/1536/2048):
-`C[m][0]` is a single constant (~18432) for every m, i.e. the A operand that reaches the MFMA is
-the same for every row and every tile, and is far outside the data's value range, so the B operand
-is garbage too. That is the behaviour of a read whose lane and tile components are not reaching
-the LDS data -- but the addresses in the disassembly do carry both. The contradiction is not yet
-resolved; the next step is a real LDS dump (store the operand VGPRs through the epilogue) rather
-than more inference.
+## Next
+
+Emit this as a standalone `.s` with a `custom.config` block, matching the GFA argument ABI
+(`AddressD, AddressB, AddressA, AddressMXScaleB, AddressMXScaleA` -- B before A, unlike our
+harness's c, a, b, sa, sb), drop it into `CustomKernels/`, and confirm by solution name that
+hipblaslt-bench selects it.
