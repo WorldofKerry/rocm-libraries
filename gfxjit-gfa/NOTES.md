@@ -1,76 +1,124 @@
-# gfxjit MXFP6 kernel on hipBLASLt's operand layout
+# gfxjit MXFP6 kernel dispatched through hipBLASLt's GFA path
 
-## Layout analysis
+Status: **working end to end.** Selected by name through `hipblaslt-bench --algo_method heuristic`,
+passes hipBLASLt's own `--verify_strict`, and is faster than rocKE on the same path.
 
-hipBLASLt's `--swizzleA/--swizzleB` for FP6 (`HIPBLASLT_ORDER_COL256_R128_EXT`) and
-`--scaleA/B 1018` (`HIPBLASLT_MATMUL_MATRIX_SCALE_BLK32_UE8M0_128_4_EXT`) are implemented in
+## Result
+
+Selected solution, from `--print_kernel_info`:
+
+    --Solution name:  gfxjit_gemm_mx_e2m3_e2m3_e8m0b32_f32acc_bf16_rcr_256x256x128_w2x2_16x16x128_s3_4096x4096x65536_c0c1
+
+Correctness: `--verify_strict` exit code 0, norm_error 3.99e-06 against atol 1e-06 / rtol 0.01,
+no failed checks.
+
+TFLOP/s at 4096x4096x65536, GPU 7, same box and session, 7 runs each, `-i 20 -j 20`:
+
+    gfxjit (this kernel)  4136 4166 4181 4184 4187 4211 4280   median 4184  max 4280
+    rocKE                 3518 4056 4145 4148 4148 4179 4189   median 4148  max 4189
+
++0.9 % median, +2.2 % max over rocKE. (rocKE's two low runs are the bimodal contention artifact
+documented in the standalone kernel's header; excluding them does not change its median.)
+
+Both arms sit well below their standalone harness numbers -- ours 4336, rocKE's own package
+reports 4529-4650 warm -- so that gap belongs to the hipblaslt-bench measurement path, not to this
+integration. It is common to both arms, which is what makes the comparison above the meaningful one.
+
+## The layout, and the asymmetry that bit
+
+hipBLASLt's `--swizzleA/--swizzleB` for FP6 (`HIPBLASLT_ORDER_COL256_R128_EXT`) and `--scaleA/B
+1018` (`HIPBLASLT_MATMUL_MATRIX_SCALE_BLK32_UE8M0_128_4_EXT`) live in
 `projects/hipblaslt/clients/common/include/mx_tile128x4.hpp` and are byte-for-byte rocKE's
-`pack_operand_c0c1` / `pack_scales_tile`. Both are also pinned as public API in
-`library/include/hipblaslt/hipblaslt.h` (scale byte formula at line 394, order enum 104), so the
-host shuffle is not ours to change -- the kernel reads their layout.
+`pack_operand_c0c1` / `pack_scales_tile`. Both are public API with published byte formulas
+(`hipblaslt.h:394`, order enum 104), so the kernel reads their layout rather than changing it.
 
-Per (256-row block, 128-K step) both images are 24576 B with the *same* block index
-`(row/256)*(K/128) + kstep` and the *same* 24-byte lane fragments. They differ only in placement
-inside the block, with tile `t` (0..15) and lane `l`:
+Operand image, per (256-row block, 128-K step), 24576 B, tile `t` (0..15) and lane `l`:
 
-    gfxjit private : 24 B contiguous at 3072*(t/2) + 48*l + 24*(t%2)
-    hipBLASLt c0c1 : low 16 B at 16*(64t + l); high 8 B at 16384 + 8*(64t + l)
+    c0: low 16 B at         16 * (64 t + l)
+    c1: high 8 B at 16384 +  8 * (64 t + l)
 
-Scales, per (block, kstep), 1024 B:
+Scale image, per (block, kstep), 1024 B: byte `512*(t/8) + 8*l + (t%8)`.
 
-    gfxjit private : byte 16*l + t
-    hipBLASLt      : byte 512*(t/8) + 8*l + (t%8)
+**The two images have OPPOSITE outer orderings, and this is easy to miss:**
 
-Both are pure permutations, so:
+    tiledGroupLowOffset : tile = (row / 256) * (K / 128) + kGroup / 4     <- row-block major
+    shuffledScaleOffset : tile = (kBlock / 4) * (rows / 128) + row / 128  <- K-STEP major
 
-* the direct-to-LDS stream is unchanged -- same 14 DTLs, same 153600 B of LDS, same barriers,
-  same grid, because both layouts are block-contiguous with identical block ordering;
-* the scale read stays exactly one `ds_read_b64` per operand: a wave's 8 tiles (t = 8*wm + 0..7)
-  are the 8 contiguous bytes at `512*wm + 8*l`. Only the address changes;
-* only the fragment read changes class: 24 `ds_read_b128` per K-step becomes 16 `b128` (c0 -> the
-  low 4 of the operand's 6 VGPRs) + 16 `b64` (c1 -> the high 2), 34 LDS reads per K-step with the
-  two scale reads. This is rocKE's own c0c1p -> c0c1 step, and rocKE ships c0c1 in its fastest
-  kernel.
+So a 256-row block's 1 KiB of scales sits at `kstep * (rows/128) * 512 + block * 1024`, and the
+scale descriptor's K stride is `rows * 4` bytes, not 1024. The operand descriptor keeps its
+`block * ksteps * 24576` base and 24576 stride.
 
-This two-region scheme is not new to this kernel: it is what `5ddfb36^` used before the paired
-48-byte layout superseded it, and that commit's own measurements put the paired layout only ~20
-TFLOP/s ahead. Measured here, the gap is smaller still (below).
+This cost a full build-and-measure cycle. It is invisible at one 256-row block, which is exactly
+what the standalone harness validates by default, so it passed locally and failed in hipBLASLt
+with norm_error 7.29. **Validate any layout change at a multi-block shape** (`-M 512 -N 512`), not
+just the default. `-M 768` is not a usable check: a non-power-of-two block count breaks the XCD
+workgroup mapping's mask, which fails identically on the unmodified kernel.
 
-## Measured, 4096x4096x65536, MI355X GPU 7
+## The ABI
 
-    paired private layout (baseline)  4332 4343 4366 4343 4370   median 4343
-    c0c1 (this kernel)                4328 4333 4339 4354 4336 4334 4335   median 4336
+GFA binds by semantic, so `custom.config` declares whatever the kernel's own kernarg order is --
+rocKE declares D *last*, the gfxjit reference declares it first. Ours is `(c, a, b, sa, sb)`, hence
 
-About 0.16 % -- the hipBLASLt layout is essentially free. Correctness: PASS against the harness's
-CPU reference (max rel err 0.0039, bf16 output rounding).
+    args: [ AddressD, AddressB, AddressA, AddressMXScaleB, AddressMXScaleA ]
 
-## What changed in the kernel
+The A/B exchange is required, not cosmetic: the kernel writes C row-major [M, N], which is the
+column-major D hipBLASLt wants only if the two operands are swapped. rocKE does the same and says
+so in its own config comment.
 
-`mxfp6_gfa.cpp` against `Examples/mxfp6_gemm.cpp`:
+The kernel also has to use the user-SGPR setup both working GFA kernels use -- `user_sgpr_count 2`,
+kernarg pointer at `s[0:1]`, workgroup id at `s2`, no hidden args. That is the `GFXJIT_GFA_ABI`
+build flag in `mxfp6_gfa.cpp`; the default build keeps the HIP launch path's hidden args.
 
-* host `swizzle_ab` emits c0c1, `swizzle_sc` emits the 1018 scale order;
-* `vA1addr_`/`vB1addr_` (v30-v35) hold the c1 plane address per stage alongside the c0 ones, with
-  the wave bases in s58/s59; `vSAaddr_`/`vSBaddr_` move to v36/v39 and `vDummy_` to v44, which is
-  the register map the two-region ancestor used;
-* `ds_units` issues `b128`(c0) + `b64`(c1) per tile into the 6 consecutive VGPRs the MFMA wants.
+## Producing the .s
 
-Everything else -- XCD workgroup mapping, the walking-SRD direct-to-LDS fills, serpentine MFMA
-order, the acquire protocol -- is HEAD's and is untouched.
+gfxjit has **no assembly emitter** -- it writes binary ELF only. `make_s.py` recovers the text with
+llvm-objdump and pairs it with a hand-written `.amdhsa_kernel` block and the metadata. The
+reconstruction is verified, not trusted:
 
-## Two traps worth keeping
+* assembled and linked independently, then loaded into the standalone harness in place of gfxjit's
+  own object: PASS against the CPU reference, same performance band;
+* `.text` compared byte for byte against gfxjit's object: the only differences are the `vdata`
+  field of the LDS-DMA `buffer_load`s, which llvm-objdump omits because the LDS form ignores it.
+  Both proven GFA kernels use that same omitted form.
 
-* **`fp6_pack32` ORs into its destination and never clears it.** Packing into a scratch
-  `uint8_t frag[24]` requires `= {}`. Without it the swizzled image is garbage that still looks
-  structured, and the failure presents as a layout bug: wrong-but-deterministic results, operands
-  that decode outside the data's value range, and run-to-run variation from whatever the stack
-  held. This cost the bulk of the debugging. The address algebra checked out the whole time
-  precisely because the standalone checker zeroed its own buffer.
-* **s36-s51 are the four buffer descriptors** (`make_desc(36/40/44/48, ...)`), so s50/s51 are the
-  scale-B descriptor, not scratch. s52-s55 are free since the SRD walk replaced the soffsets.
+`Tensile.ValidateMetadata` cannot run outside a built tree (it imports `rocisa`, a build artifact);
+`check_config.py` replicates its exact field checks and was run against the rocKE kernel as a
+control. The build runs the real validator via `Toolchain.Assembly.validateCustomKernelMetadataAtBuild`.
 
-## Next
+## Selection
 
-Emit this as a standalone `.s` with a `custom.config` block, matching the GFA argument ABI
-(`AddressD, AddressB, AddressA, AddressMXScaleB, AddressMXScaleA` -- B before A, unlike our
-harness's c, a, b, sa, sb), drop it into `CustomKernels/`, and confirm by solution name that
-hipblaslt-bench selects it.
+Dropping the `.s` into `CustomKernels/` is not sufficient -- the heuristic picks from a logic file.
+rocKE is reached through
+
+    Logic/asm_full/gfx950/gfx950_id75a3/Equality/gfx950_Cijk_Alik_Bljk_F6BS_MXAE8B32_MXBE8B32_STA_STB_H_UserArgs.yaml
+
+whose `ExactLogic` maps `[4096, 4096, 1, 65536]` to a solution index. Ours is added as
+`SolutionIndex: 2` and that entry repointed to it; rocKE stays as index 0, so changing that one
+number switches the arms back for a like-for-like A/B.
+
+## The gfxjit reference .s is not a usable model
+
+`/home/kerrwang/gfxjit_..._preswz.s` reads the PRIVATE paired layout (`v_mul_u32_u24 v2, 48, v1`,
+wave base `wm * 12288`), not c0c1, and its `custom.config` has no `SwizzleTensorA/B`, no
+`MXScaleFormat`, and none of the `AssertSize`/`AssertStride`/`AssertAlphaValue` pins. It could not
+be selected by the flags above and would compute garbage if it were. Model on rocKE's config.
+
+## Reproducing
+
+    cd <this worktree>/projects/hipblaslt
+    python3 -m venv .venv && .venv/bin/pip install -r tensilelite/requirements.txt
+    bash .../gfa/configure.sh && bash .../gfa/build.sh      # ~9 min at -j8
+    bash .../gfa/verify.sh                                  # correctness
+    bash .../gfa/perf.sh                                    # TFLOP/s, ours
+    bash .../gfa/perf_rocke.sh                              # TFLOP/s, rocKE control
+
+Standalone kernel: `gfxjit-gfa/mxfp6_gfa.cpp`, built with
+`hipcc -std=c++23 -I<gfxjit> -DGFXJIT_USE_OPCODE_CACHE=1 -w`, add `-DGFXJIT_GFA_ABI` for the
+code object the `.s` is generated from.
+
+## Traps recorded
+
+* `fp6_pack32` ORs into its destination and never clears it -- a scratch `uint8_t frag[24]` needs
+  `= {}`. Without it the swizzled image is structured garbage and the failure imitates a layout bug.
+* `s36-s51` are the four buffer descriptors, so `s50/s51` are the scale-B descriptor, not scratch.
+* The operand and scale images have opposite outer orderings (above).

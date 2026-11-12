@@ -125,6 +125,13 @@ constexpr int kLdsStage = kLdsSB + kSBytesPerStep;   // 0xc800 = 51200
 // pre-barrier wait is vmcnt((kStages-2)*kLoadsPerStage) = vmcnt(14).
 constexpr int kStages = 3;
 
+// User-SGPR layout, see the ABI note in the generator.
+#ifdef GFXJIT_GFA_ABI
+constexpr int kSKernarg = 0, kSWgId = 2;
+#else
+constexpr int kSKernarg = 4, kSWgId = 6;
+#endif
+
 // Per wave, per stage: A is 6144 B = 6 x buffer_load_dwordx4, same for B,
 // plus one dword scale load each.
 constexpr int kLoadsPerWaveAB = kABytesPerStep / 4 / 1024;  // 6
@@ -167,8 +174,15 @@ public:
     using agpr = gfxjit::operands::Accvgpr;
     using gfxjit::operands::matrix_fmt;
 
+    // GFA dispatches the kernel with the TensileLite user-SGPR setup that the
+    // rocKE custom kernel uses: kernarg pointer only (user_sgpr_count 2), so
+    // the kernarg pointer is s[0:1] and workgroup_id_x is s2, and no hidden
+    // args. Our own harness launches through HIP, which wants the hidden
+    // block/group args and the private segment buffer.
+#ifndef GFXJIT_GFA_ABI
     config_.use_hidden_args();
     config_.amdhsa_user_sgpr_private_segment_buffer(1);
+#endif
     config_.amdhsa_user_sgpr_kernarg_segment_ptr(1);
     config_.uniform_work_group_size_ = 1;
     config_.amdhsa_group_segment_fixed_size(kStages * kLdsStage);
@@ -183,12 +197,12 @@ public:
 
     const int ksteps = s_.k_steps();
 
-    // s[4:5] kernarg ptr, s6 workgroup_id_x
-    s_load_dwordx2(sgpr(8).dw(2), sgpr(4).dw(2), get_arg_offset(0));   // c
-    s_load_dwordx2(sgpr(10).dw(2), sgpr(4).dw(2), get_arg_offset(1));  // a
-    s_load_dwordx2(sgpr(12).dw(2), sgpr(4).dw(2), get_arg_offset(2));  // b
-    s_load_dwordx2(sgpr(14).dw(2), sgpr(4).dw(2), get_arg_offset(3));  // sa
-    s_load_dwordx2(sgpr(16).dw(2), sgpr(4).dw(2), get_arg_offset(4));  // sb
+    // kernarg ptr and workgroup_id_x, see the ABI note above
+    s_load_dwordx2(sgpr(8).dw(2), sgpr(kSKernarg).dw(2), get_arg_offset(0));   // c
+    s_load_dwordx2(sgpr(10).dw(2), sgpr(kSKernarg).dw(2), get_arg_offset(1));  // a
+    s_load_dwordx2(sgpr(12).dw(2), sgpr(kSKernarg).dw(2), get_arg_offset(2));  // b
+    s_load_dwordx2(sgpr(14).dw(2), sgpr(kSKernarg).dw(2), get_arg_offset(3));  // sa
+    s_load_dwordx2(sgpr(16).dw(2), sgpr(kSKernarg).dw(2), get_arg_offset(4));  // sb
 
     v_and_b32(vgpr(1), 63, vgpr(0));        // lane
     v_lshrrev_b32(vgpr(2), 6, vgpr(0));     // wave
@@ -216,9 +230,12 @@ public:
     make_desc(36, 10, 30, kABytesPerStep);
     s_mul_i32(sgpr(30), sgpr(24), (int)ab_blk);
     make_desc(40, 12, 30, kABytesPerStep);
-    s_mul_i32(sgpr(30), sgpr(23), (int)s_blk);
+    // The scale image is K-STEP major where the operand image is row-block
+    // major (hipBLASLt's shuffledScaleOffset vs tiledGroupLowOffset), so a
+    // block's 1 KiB sits at b * 1024 and the K stride is (rows / 128) * 512.
+    s_mul_i32(sgpr(30), sgpr(23), kSBytesPerStep);
     make_desc(44, 14, 30, kSBytesPerStep);
-    s_mul_i32(sgpr(30), sgpr(24), (int)s_blk);
+    s_mul_i32(sgpr(30), sgpr(24), kSBytesPerStep);
     make_desc(48, 16, 30, kSBytesPerStep);
 
     // per-wave LDS fill bases: A/B 6144 B per wave, scales 256 B per wave
@@ -477,20 +494,20 @@ private:
     // kXCDRows x kXCDCols patch per XCD.
     if (!pow2(bm) || !pow2(bn) || rb + cb + nx != LM + LN || rb > LM ||
         cb > LN || LN - cb > nx) {
-      s_and_b32(sgpr(23), sgpr(6), bm - 1);
-      s_lshr_b32(sgpr(24), sgpr(6), LM);
+      s_and_b32(sgpr(23), sgpr(kSWgId), bm - 1);
+      s_lshr_b32(sgpr(24), sgpr(kSWgId), LM);
       return;
     }
     // block_n = (wg >> (nx+rb)) & (CB-1) | (wg & (blocks_n/CB - 1)) << cb
-    s_lshr_b32(sgpr(24), sgpr(6), nx + rb);
+    s_lshr_b32(sgpr(24), sgpr(kSWgId), nx + rb);
     s_and_b32(sgpr(24), sgpr(24), kXCDCols - 1);
-    s_and_b32(sgpr(25), sgpr(6), (bn >> cb) - 1);
+    s_and_b32(sgpr(25), sgpr(kSWgId), (bn >> cb) - 1);
     s_lshl_b32(sgpr(25), sgpr(25), cb);
     s_or_b32(sgpr(24), sgpr(24), sgpr(25));
     // block_m = (wg >> nx) & (RB-1) | (wg >> (LN-cb)) << rb
-    s_lshr_b32(sgpr(23), sgpr(6), nx);
+    s_lshr_b32(sgpr(23), sgpr(kSWgId), nx);
     s_and_b32(sgpr(23), sgpr(23), kXCDRows - 1);
-    s_lshr_b32(sgpr(25), sgpr(6), LN - cb);
+    s_lshr_b32(sgpr(25), sgpr(kSWgId), LN - cb);
     s_and_b32(sgpr(25), sgpr(25), (1 << (nx - (LN - cb))) - 1);
     s_lshl_b32(sgpr(25), sgpr(25), rb);
     s_or_b32(sgpr(23), sgpr(23), sgpr(25));
@@ -544,16 +561,16 @@ private:
     };
     ab(36, base + kLdsA);
     ab(40, base + kLdsB);
-    auto sc = [&](int sdesc, int ldsoff) {
+    auto sc = [&](int sdesc, int ldsoff, int kstride) {
       u.push_back([=, this] {
         s_add_u32(m0_, sgpr(33), ldsoff);
         buffer_load_dword(vgpr(vDummy_), vgpr(4), sgpr(sdesc).dw(4), 0, 0,
                           {mbuf::offen, mbuf::lds});
       });
-      adv(sdesc, kSBytesPerStep);
+      adv(sdesc, kstride);
     };
-    sc(44, base + kLdsSA);
-    sc(48, base + kLdsSB);
+    sc(44, base + kLdsSA, s_.M * 4);
+    sc(48, base + kLdsSB, s_.N * 4);
     return u;
   }
 
@@ -655,9 +672,21 @@ int main(int argc, char **argv) {
   printf("stages=%d  LDS=%d bytes  k_steps=%d (%d x 6 + %d)\n", kStages,
          kStages * kLdsStage, s.k_steps(), s.k_steps() / 6, s.k_steps() % 6);
 
-  const std::string ker_name = "mxfp6_gemm_lds";
+  const char *env_name = getenv("GFXJIT_KERNEL_NAME");
+  const std::string ker_name = env_name ? env_name : "mxfp6_gemm_lds";
   Mxfp6GemmLds<gfxjit::GFXArch::gfx950> gen(s);
   std::vector<uint8_t> co = gen.get_code_obj(ker_name);
+  // Load an externally assembled code object instead, so the reconstructed
+  // GFA .s can be validated through this same harness.
+  if (const char *path = getenv("GFXJIT_LOAD_CO")) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { printf("cannot open %s\n", path); return 1; }
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    co.resize((size_t)n);
+    if (fread(co.data(), 1, (size_t)n, f) != (size_t)n) { printf("short read\n"); return 1; }
+    fclose(f);
+    printf("loaded external code object %s (%ld bytes)\n", path, n);
+  }
 
   const int kblocks = s.K / 32, ksteps = s.k_steps();
   std::vector<uint8_t> An((size_t)s.M * s.K), Bn((size_t)s.N * s.K);
@@ -702,7 +731,7 @@ int main(int argc, char **argv) {
             const int row = b * kBM + t * 16 + lane % 16;
             const int kblk = ks * 4 + lane / 16;
             // [t/8][lane(64)][t%8] bytes, matching scale type 1018
-            dst[((size_t)b * ksteps + ks) * kSBytesPerStep +
+            dst[(size_t)ks * (rows / 128) * 512 + (size_t)b * kSBytesPerStep +
                 (size_t)(t / 8) * 512 + (size_t)lane * 8 + (t % 8)] =
                 src[(size_t)row * kblocks + kblk];
           }
@@ -718,12 +747,15 @@ int main(int argc, char **argv) {
   // consumed by an MFMA, since the last K-step's ds_reads have no MFMA after
   // them.
   const size_t kPadAB = (size_t)kStages * kABytesPerStep;
-  const size_t kPadS = (size_t)kStages * kSBytesPerStep;
+  // The scale descriptors walk K with a stride of (rows / 128) * 512, so the
+  // overrun of the last prefetches is that much per stage, not one 1 KiB tile.
+  const size_t kPadSA = (size_t)kStages * (s.M / 128) * 512;
+  const size_t kPadSB = (size_t)kStages * (s.N / 128) * 512;
   void *d_a, *d_b, *d_sa, *d_sb, *d_c;
   (void)hipMalloc(&d_a, Asw.size() + kPadAB);
   (void)hipMalloc(&d_b, Bsw.size() + kPadAB);
-  (void)hipMalloc(&d_sa, SAsw.size() + kPadS);
-  (void)hipMalloc(&d_sb, SBsw.size() + kPadS);
+  (void)hipMalloc(&d_sa, SAsw.size() + kPadSA);
+  (void)hipMalloc(&d_sb, SBsw.size() + kPadSB);
   (void)hipMalloc(&d_c, (size_t)s.M * s.N * 2);
   (void)hipMemcpy(d_a, Asw.data(), Asw.size(), hipMemcpyHostToDevice);
   (void)hipMemcpy(d_b, Bsw.data(), Bsw.size(), hipMemcpyHostToDevice);
