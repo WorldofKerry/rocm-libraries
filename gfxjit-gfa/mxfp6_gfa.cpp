@@ -94,24 +94,24 @@ constexpr int kThreads = kWGM * kWGN * 64;
 constexpr int kTilesPerBlock = kBM / 16;              // 16
 constexpr int kABytesPerStep = kBM * kBK * 6 / 8;     // 24576
 
-// Operand image: hipBLASLt's HIPBLASLT_ORDER_COL256_R128_EXT ("c0c1"), so the
+// Operand image: hipBLASLt's HIPBLASLT_ORDER_COL256_R128_PAIRED_EXT, so the
 // stage image is byte-identical to what the library hands a GFA kernel and the
-// direct-to-LDS copy stays a flat 24576 B stream. A fragment (tile t, lane l)
-// is split across two regions of the stage:
-//   c0: bytes 0..15  at        16 * (64 t + l)
-//   c1: bytes 16..23 at 16384 + 8 * (64 t + l)
-// so a lane reads one ds_read_b128 (c0 -> 4 VGPRs) + one ds_read_b64 (c1 -> 2
-// VGPRs) per tile into the 6 consecutive VGPRs the MFMA wants: 34 ds_reads per
-// K-step against 26 for the private [pair][lane][48 B] image this kernel used
-// before. Both regions are conflict free (16- and 8-byte lane strides).
+// direct-to-LDS copy stays a flat 24576 B stream. A lane's slot holds a PAIR
+// of tiles back to back, 24 B + 24 B = 48 B, so the fragment of (tile t, lane
+// l) is the 24 contiguous bytes at
+//   3072 * (t/2) + 48 * l + 24 * (t%2)
+// and three ds_read_b128 fill 12 consecutive VGPRs: tile 2p in the low 6, tile
+// 2p+1 in the high 6, which is exactly vA(r) + tile*6, so the MFMA operand map
+// is unchanged. That is 26 ds_reads per K-step against 34 for the c0c1 order's
+// two-region b128 + b64 scheme.
 //
-// Do NOT "simplify" this to a flat [tile][lane][24 B] image read as b128 + b64
-// at +16. It validates, but the b128 lands 8-byte misaligned at a 24-byte lane
-// stride: 6*lane mod 32 has gcd 2 with the bank count, so the 64 lanes cover
-// only half the banks and the read serializes. That measured 1841 TFLOP/s.
-constexpr int kC1Base = kBM * (kBK / 32) * 16;        // 16384
-constexpr int kC0TileStride = 64 * 16;                // 1024
-constexpr int kC1TileStride = 64 * 8;                 // 512
+// The 48-byte lane stride is conflict free: 12*lane mod 32 cycles through 8
+// distinct 4-bank groups. Do NOT "simplify" this to a flat [tile][lane][24 B]
+// image read as b128 + b64 at +16. It validates, but the b128 lands 8-byte
+// misaligned at a 24-byte lane stride: 6*lane mod 32 has gcd 2 with the bank
+// count, so the 64 lanes cover only half the banks and the read serializes.
+// That measured 1841 TFLOP/s against 4247.
+constexpr int kPairStride = 64 * 48;                  // 3072 B per tile pair
 constexpr int kSBytesPerStep = kBM * (kBK / 32);      // 1024
 
 // LDS offsets within one stage
@@ -250,14 +250,10 @@ public:
     v_add_u32(vgpr(4), sgpr(33), vgpr(4));              // + wave * 256
 
     // ---- LDS read addresses, one set per stage
-    // c0 plane: lane * 16, wave base wm * kMT * 1024
-    v_lshlrev_b32(vgpr(5), 4, vgpr(1));                 // lane * 16
-    s_mul_i32(sgpr(34), sgpr(21), kMT * kC0TileStride);    // wm * 8192
-    s_mul_i32(sgpr(35), sgpr(22), kNT * kC0TileStride);
-    // c1 plane: lane * 8, wave base kC1Base + wm * kMT * 512
-    v_lshlrev_b32(vgpr(9), 3, vgpr(1));                 // lane * 8
-    s_mul_i32(sgpr(58), sgpr(21), kMT * kC1TileStride);    // wm * 4096
-    s_mul_i32(sgpr(59), sgpr(22), kNT * kC1TileStride);
+    // operands: lane * 48, wave base wm * (kMT/2) * 3072
+    v_mul_u32_u24(vgpr(5), 48, vgpr(1));                // lane * 48
+    s_mul_i32(sgpr(34), sgpr(21), kMT / 2 * kPairStride);  // wm * 12288
+    s_mul_i32(sgpr(35), sgpr(22), kNT / 2 * kPairStride);
     // scales: the wave's 8 tiles are the 8 contiguous bytes at 512*wm + 8*lane
     v_lshlrev_b32(vgpr(6), 3, vgpr(1));                 // lane * 8 (scales)
     s_mul_i32(sgpr(56), sgpr(21), kTilesPerBlock / 2 * 64);  // wm * 512
@@ -268,10 +264,6 @@ public:
       v_add_u32(vgpr(vAaddr_ + st), base + kLdsA, vgpr(vAaddr_ + st));
       v_add_u32(vgpr(vBaddr_ + st), sgpr(35), vgpr(5));
       v_add_u32(vgpr(vBaddr_ + st), base + kLdsB, vgpr(vBaddr_ + st));
-      v_add_u32(vgpr(vA1addr_ + st), sgpr(58), vgpr(9));
-      v_add_u32(vgpr(vA1addr_ + st), base + kLdsA + kC1Base, vgpr(vA1addr_ + st));
-      v_add_u32(vgpr(vB1addr_ + st), sgpr(59), vgpr(9));
-      v_add_u32(vgpr(vB1addr_ + st), base + kLdsB + kC1Base, vgpr(vB1addr_ + st));
       v_add_u32(vgpr(vSAaddr_ + st), sgpr(56), vgpr(6));
       v_add_u32(vgpr(vSAaddr_ + st), base + kLdsSA, vgpr(vSAaddr_ + st));
       v_add_u32(vgpr(vSBaddr_ + st), sgpr(57), vgpr(6));
@@ -280,33 +272,26 @@ public:
 
     for (int i = 0; i < kMT * kNT * 4; ++i) v_accvgpr_write_b32(agpr(i), 0);
 
-    // One K-step's 34 ds_reads, as independently schedulable units, reading
-    // LDS stage `st` into operand register set `r`. Each operand is 24 B:
-    // b128 at the tile base, b64 at +16.
+    // One K-step's 26 ds_reads, as independently schedulable units, reading
+    // LDS stage `st` into operand register set `r`.
     auto ds_units = [&](int st, int r) {
       std::vector<std::function<void()>> u;
       u.push_back([=] { ds_read_b64(vgpr(vSA(r)).dw(2), vgpr(vSAaddr_ + st), 0); });
       u.push_back([=] { ds_read_b64(vgpr(vSB(r)).dw(2), vgpr(vSBaddr_ + st), 0); });
-      // Per tile: b128 of the c0 plane into the low 4 of the operand's 6
-      // VGPRs, b64 of the c1 plane into the high 2.
-      for (int t = 0; t < kMT; ++t) {
-        u.push_back([=] {
-          ds_read_b128(vgpr(vA(r) + t * 6).dw(4), vgpr(vAaddr_ + st),
-                       t * kC0TileStride);
-        });
-        u.push_back([=] {
-          ds_read_b64(vgpr(vA(r) + t * 6 + 4).dw(2), vgpr(vA1addr_ + st),
-                      t * kC1TileStride);
-        });
-        u.push_back([=] {
-          ds_read_b128(vgpr(vB(r) + t * 6).dw(4), vgpr(vBaddr_ + st),
-                       t * kC0TileStride);
-        });
-        u.push_back([=] {
-          ds_read_b64(vgpr(vB(r) + t * 6 + 4).dw(2), vgpr(vB1addr_ + st),
-                      t * kC1TileStride);
-        });
-      }
+      // 3 x b128 per tile pair fills 12 consecutive VGPRs; tile 2p occupies
+      // registers [0:5] of the tuple and tile 2p+1 registers [6:11], which is
+      // exactly vA(r) + tile*6, so the MFMA operand map is unchanged.
+      for (int p = 0; p < kMT / 2; ++p)
+        for (int w = 0; w < 3; ++w) {
+          u.push_back([=] {
+            ds_read_b128(vgpr(vA(r) + p * 12 + w * 4).dw(4), vgpr(vAaddr_ + st),
+                         p * kPairStride + w * 16);
+          });
+          u.push_back([=] {
+            ds_read_b128(vgpr(vB(r) + p * 12 + w * 4).dw(4), vgpr(vBaddr_ + st),
+                         p * kPairStride + w * 16);
+          });
+        }
       return u;
     };
 
@@ -375,18 +360,28 @@ public:
       // merging them is worse again (4211). The difference from the reference
       // is most likely the 2x3 b128 per pair: an operand is not complete until
       // its third read lands, so spreading them is what keeps the LDS pipe fed.
-      std::vector<std::function<void()>> units;
-      size_t fi = 0;
-      for (size_t i = 0; i < ds.size(); ++i) {
-        while (fi * ds.size() < i * fl.size()) units.push_back(fl[fi++]);
-        units.push_back(ds[i]);
-      }
-      while (fi < fl.size()) units.push_back(fl[fi++]);
+      // The ds_reads feed the NEXT K-step and are waited on at the very next
+      // acquire, so with a proportional merge the last one is issued a few
+      // instructions before its own lgkmcnt(0) and pays full LDS latency. The
+      // DTL fills feed a stage further out and carry vmcnt slack, so they stay
+      // spread across all 64 MFMAs while the reads finish inside the first
+      // DS_WIN. Ported from the standalone kernel, where this cut the lgkmcnt
+      // stall ~9x. DS_WIN=64 reproduces the old proportional merge.
+      const char *dw = getenv("DS_WIN");
+      const int ds_win = dw ? atoi(dw) : 34;
 
-      size_t next = 0;
+      std::vector<std::vector<std::function<void()>>> slot(kMT * kNT);
+      for (size_t i = 0; i < ds.size(); ++i) {
+        const int t = (int)((i * (size_t)ds_win) / ds.size());
+        slot[t < kMT * kNT ? t : kMT * kNT - 1].push_back(ds[i]);
+      }
+      for (size_t i = 0; i < fl.size(); ++i) {
+        const int t = (int)((i * 64) / fl.size());
+        slot[t].push_back(fl[i]);
+      }
+
       for (int t = 0; t < kMT * kNT; ++t) {
-        const size_t due = ((size_t)t * units.size() + 63) / 64;
-        while (next < due) units[next++]();
+        for (auto &f : slot[t]) f();
         // Serpentine: the inner direction flips on alternate outer rows, so
         // consecutive MFMAs share an operand at every row boundary instead of
         // jumping from (i,7) back to (i+1,0).
@@ -403,7 +398,6 @@ public:
             agpr(acc).dw(4).opsel_hi(0),
             vgpr(vSA(r) + i / 4), vgpr(vSB(r) + j / 4));
       }
-      while (next < units.size()) units[next++]();
     };
 
     const int unroll = kStages * 2;  // 6
@@ -582,8 +576,7 @@ private:
   GemmShape s_;
   // VGPR map: v0-v9 misc, v16-23 scales, v24-41 LDS addresses, v44-47 dummy,
   // operands v48-95 / v96-143 (set 0) and v144-191 / v192-239 (set 1).
-  static constexpr int vAaddr_ = 24, vBaddr_ = 27;    // c0 plane, per stage
-  static constexpr int vA1addr_ = 30, vB1addr_ = 33;  // c1 plane, per stage
+  static constexpr int vAaddr_ = 24, vBaddr_ = 27;    // operands, per stage
   static constexpr int vSAaddr_ = 36, vSBaddr_ = 39;
   static constexpr int vDummy_ = 44;  // vdata is ignored by the LDS-DMA form
 };
@@ -697,7 +690,7 @@ int main(int argc, char **argv) {
   for (auto &x : SA) x = 124 + (rand() % 7);
   for (auto &x : SB) x = 124 + (rand() % 7);
 
-  // ---- swizzle: per (block, k_step) a 24576 B image [tile(16)][lane(64)][24B]
+  // ---- swizzle: per (block, k_step) a 24576 B image [pair(8)][lane(64)][48B]
   auto swizzle_ab = [&](const std::vector<uint8_t> &src, int rows) {
     const int blocks = rows / kBM;
     std::vector<uint8_t> dst((size_t)blocks * ksteps * kABytesPerStep, 0);
@@ -705,18 +698,14 @@ int main(int argc, char **argv) {
       for (int ks = 0; ks < ksteps; ++ks)
         for (int t = 0; t < kTilesPerBlock; ++t)
           for (int lane = 0; lane < 64; ++lane) {
-            // c0c1: the fragment's bytes 0..15 go to 16*(64t+lane) and bytes
-            // 16..23 to kC1Base + 8*(64t+lane) of the 24576 B stage image.
-            uint8_t *base = &dst[((size_t)b * ksteps + ks) * kABytesPerStep];
-            const int o = 64 * t + lane;
+            // tile t lives in pair t/2, at the (t%2)*24 byte half of the
+            // lane's 48-byte slot
+            uint8_t *o = &dst[((size_t)b * ksteps + ks) * kABytesPerStep +
+                              (size_t)(t / 2) * kPairStride + (size_t)lane * 48 +
+                              (size_t)(t % 2) * 24];
             const int row = b * kBM + t * 16 + lane % 16;
             const int kbase = ks * kBK + (lane / 16) * 32;
-            // fp6_pack32 ORs into its destination, so the scratch fragment
-            // has to start zeroed.
-            uint8_t frag[24] = {};
-            fp6_pack32(&src[(size_t)row * s.K + kbase], frag);
-            memcpy(base + 16 * o, frag, 16);
-            memcpy(base + kC1Base + 8 * o, frag + 16, 8);
+            fp6_pack32(&src[(size_t)row * s.K + kbase], o);
           }
     return dst;
   };

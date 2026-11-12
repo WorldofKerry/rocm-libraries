@@ -137,8 +137,16 @@ Solutions:
   MIWaveTile: [8, 8]
   MIInputPerThread: 32
   MXScaleFormat: HostPreSwizzle128x4
+# REQUIRES THE PAIRED OPERAND LAYOUT. This solution reads a 24-byte group as 24
+# CONTIGUOUS bytes at 3072*(t/2) + 48*lane + 24*(t%2); it does NOT read the published
+# HIPBLASLT_ORDER_COL256_R128_EXT ("c0c1") two-plane layout, and handed c0c1 data it
+# computes silently-wrong results at full speed rather than failing. In this worktree
+# clients/common/include/mx_tile128x4.hpp has been changed to emit the paired layout for
+# order 104, which is what makes this solution correct here and rocKE's wrong.
+# SwizzleTensorA/B are plain booleans end to end, so nothing in hipBLASLt checks this
+# pairing -- it holds only because the packer and this entry are changed together.
 - SolutionIndex: 2
-  CustomKernelName: gfxjit_gemm_mx_e2m3_e2m3_e8m0b32_f32acc_bf16_rcr_256x256x128_w2x2_16x16x128_s3_4096x4096x65536_c0c1
+  CustomKernelName: gfxjit_gemm_mx_e2m3_e2m3_e8m0b32_f32acc_bf16_rcr_256x256x128_w2x2_16x16x128_s3_4096x4096x65536_paired
   KernelLanguage: Assembly
   Valid: true
   EnableMatrixInstruction: true
@@ -155,6 +163,10 @@ Solutions:
   MXScaleFormat: HostPreSwizzle128x4
 IndexOrder: [2, 3, 0, 1]
 ExactLogic:
+# 4096x4096x65536 is mapped to SolutionIndex 2, the gfxjit paired-layout kernel. Index 0
+# is rocKE's c0c1 kernel: switching this one number switches the arms, but the operand
+# packer in clients/common/include/mx_tile128x4.hpp must be switched to match or the
+# selected kernel reads the wrong layout and is silently wrong.
 - - [4096, 4096, 1, 65536]
   - [2, 4152080.0]
 - - [4096, 4096, 1, 131584]

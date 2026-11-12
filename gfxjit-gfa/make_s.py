@@ -15,7 +15,7 @@ import sys
 OBJDUMP = "/opt/rocm/lib/llvm/bin/llvm-objdump"
 
 NAME = ("gfxjit_gemm_mx_e2m3_e2m3_e8m0b32_f32acc_bf16_rcr_"
-        "256x256x128_w2x2_16x16x128_s3_4096x4096x65536_c0c1")
+        "256x256x128_w2x2_16x16x128_s3_4096x4096x65536_paired")
 
 M, N, K = 4096, 4096, 65536
 
@@ -99,6 +99,13 @@ custom.config:
     UseBias: 0
     Activation: False
     UseScaleAlphaVec: 0
+    # SwizzleTensorA/B are plain booleans: they say THAT the operands are swizzled, not
+    # WHICH layout. This kernel requires the PAIRED layout -- a 24-byte group stored as 24
+    # contiguous bytes at 3072*(t/2) + 48*lane + 24*(t%2) -- and NOT the published
+    # HIPBLASLT_ORDER_COL256_R128_EXT ("c0c1") two-plane layout. Given c0c1 data it is
+    # silently wrong at full speed. The matching host packer is tileFp6Data in
+    # clients/common/include/mx_tile128x4.hpp, which this worktree replaced in place;
+    # the two must be changed together.
     SwizzleTensorA: True
     SwizzleTensorB: True
     MXBlockA: 32
