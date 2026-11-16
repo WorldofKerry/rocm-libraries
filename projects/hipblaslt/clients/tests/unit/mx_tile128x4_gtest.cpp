@@ -19,17 +19,15 @@
 namespace
 {
     // The layouts as the kernels read them, written out per element rather than
-    // through the helpers' tile arithmetic.
-    size_t expectedLowOffset(size_t r, size_t k, size_t K)
+    // through the helpers' tile arithmetic. The data layout here is the PAIRED one, not
+    // the published order-104 formula: this worktree replaced the FP6 packer in place.
+    // See the divergence notice at the top of mx_tile128x4.hpp.
+    size_t expectedGroupOffset(size_t r, size_t k, size_t K)
     {
-        size_t const o = 64 * ((r % 256) / 16) + 16 * ((k % 128) / 32) + r % 16;
-        return ((r / 256) * (K / 128) + k / 128) * 24576 + 16 * o;
-    }
-
-    size_t expectedHighOffset(size_t r, size_t k, size_t K)
-    {
-        size_t const o = 64 * ((r % 256) / 16) + 16 * ((k % 128) / 32) + r % 16;
-        return ((r / 256) * (K / 128) + k / 128) * 24576 + 16384 + 8 * o;
+        size_t const t    = (r % 256) / 16;
+        size_t const lane = 16 * ((k % 128) / 32) + r % 16;
+        return ((r / 256) * (K / 128) + k / 128) * 24576 + 3072 * (t / 2) + 48 * lane
+               + 24 * (t % 2);
     }
 
     size_t expectedScaleOffset(size_t r, size_t kb, size_t R)
@@ -49,11 +47,8 @@ TEST(HostUnitMXTile128x4, smoke_DataGroupsLandWhereTheKernelReadsThem)
             {
                 for(size_t k = 0; k < K; k += (K > 512 ? 4096 + 32 : 32))
                 {
-                    EXPECT_EQ(mx_tile128x4::tiledGroupLowOffset(r, k / 32, K),
-                              expectedLowOffset(r, k, K))
-                        << "R=" << R << " K=" << K << " r=" << r << " k=" << k;
-                    EXPECT_EQ(mx_tile128x4::tiledGroupHighOffset(r, k / 32, K),
-                              expectedHighOffset(r, k, K))
+                    EXPECT_EQ(mx_tile128x4::tiledGroupOffset(r, k / 32, K),
+                              expectedGroupOffset(r, k, K))
                         << "R=" << R << " K=" << K << " r=" << r << " k=" << k;
                 }
             }
@@ -61,7 +56,7 @@ TEST(HostUnitMXTile128x4, smoke_DataGroupsLandWhereTheKernelReadsThem)
     }
 }
 
-// Every source byte lands on exactly one destination byte, in its group's planes.
+// Every source byte lands on exactly one destination byte, its group staying contiguous.
 TEST(HostUnitMXTile128x4, smoke_DataTilingIsAPermutationOfTheRows)
 {
     size_t const         R = 512, K = 256, rowBytes = K * 6 / 8;
@@ -75,18 +70,12 @@ TEST(HostUnitMXTile128x4, smoke_DataTilingIsAPermutationOfTheRows)
     {
         for(size_t g = 0; g < K / 32; ++g)
         {
-            size_t const   low   = expectedLowOffset(r, g * 32, K);
-            size_t const   high  = expectedHighOffset(r, g * 32, K);
+            size_t const   off   = expectedGroupOffset(r, g * 32, K);
             uint8_t const* group = src.data() + r * rowBytes + g * 24;
-            for(size_t j = 0; j < 16; ++j)
+            for(size_t j = 0; j < 24; ++j)
             {
-                ASSERT_EQ(dst[low + j], group[j]) << "r=" << r << " g=" << g << " j=" << j;
-                ++hits[low + j];
-            }
-            for(size_t j = 0; j < 8; ++j)
-            {
-                ASSERT_EQ(dst[high + j], group[16 + j]) << "r=" << r << " g=" << g << " j=" << j;
-                ++hits[high + j];
+                ASSERT_EQ(dst[off + j], group[j]) << "r=" << r << " g=" << g << " j=" << j;
+                ++hits[off + j];
             }
         }
     }
@@ -128,8 +117,8 @@ TEST(HostUnitMXTile128x4, smoke_RowBlockPitch)
     for(auto const [K, pitch] :
         {std::pair<size_t, size_t>{65536, 0xC00000}, std::pair<size_t, size_t>{131584, 0x1818000}})
     {
-        EXPECT_EQ(mx_tile128x4::tiledGroupLowOffset(256, 0, K), pitch) << "K=" << K;
-        EXPECT_EQ(mx_tile128x4::tiledGroupLowOffset(4095, K / 32 - 1, K) / pitch, 15u) << "K=" << K;
+        EXPECT_EQ(mx_tile128x4::tiledGroupOffset(256, 0, K), pitch) << "K=" << K;
+        EXPECT_EQ(mx_tile128x4::tiledGroupOffset(4095, K / 32 - 1, K) / pitch, 15u) << "K=" << K;
     }
     EXPECT_EQ(mx_tile128x4::shuffledScaleOffset(0, 4, 4096), size_t(32) * 512);
 }
