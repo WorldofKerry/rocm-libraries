@@ -106,23 +106,7 @@ ProblemType:
   isMixMode: false
 Solutions:
 - SolutionIndex: 0
-  CustomKernelName: rocke_gemm_mx_e2m3_e2m3_e8m0b32_f32acc_bf16_rcr_256x256x128_w2x2_16x16x128_s3_4096x4096x65536_c0c1_k4b371438f4
-  KernelLanguage: Assembly
-  Valid: true
-  EnableMatrixInstruction: true
-  ISA: [9, 5, 0]
-  MatrixInstM: 16
-  MatrixInstN: 16
-  MatrixInstK: 128
-  MatrixInstB: 1
-  MatrixInstBM: 1
-  MIBlock: [16, 16, 128, 1, 1, 1]
-  MIWaveGroup: [2, 2]
-  MIWaveTile: [8, 8]
-  MIInputPerThread: 32
-  MXScaleFormat: HostPreSwizzle128x4
-- SolutionIndex: 1
-  CustomKernelName: rocke_gemm_mx_e2m3_e2m3_e8m0b32_f32acc_bf16_rcr_256x256x128_w2x2_16x16x128_s3_4096x4096x131584_c0c1
+  CustomKernelName: gfxjit_gemm_mx_e2m3_e2m3_e8m0b32_f32acc_bf16_rcr_256x256x128_w2x2_16x16x128_s3_4096x4096x65536_paired
   KernelLanguage: Assembly
   Valid: true
   EnableMatrixInstruction: true
@@ -139,10 +123,12 @@ Solutions:
   MXScaleFormat: HostPreSwizzle128x4
 IndexOrder: [2, 3, 0, 1]
 ExactLogic:
+# 4096x4096x65536 is mapped to SolutionIndex 0, the gfxjit paired-layout kernel, which
+# is now the only solution in this file. The operand packer in
+# clients/common/include/mx_tile128x4.hpp must stay paired with this entry: nothing in
+# hipBLASLt checks that pairing, and a mismatch is silently wrong rather than an error.
 - - [4096, 4096, 1, 65536]
   - [0, 4152080.0]
-- - [4096, 4096, 1, 131584]
-  - [1, 4057250.0]
 RangeLogic: null
 TileSelectionIndices: null
 PerfMetric: DeviceEfficiency
